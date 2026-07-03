@@ -141,6 +141,7 @@ public:
     // only (cheap, per-edit).
     void set_env(const EnvMap* env);
     void set_env_params(float intensity, float yaw_norm);
+    void set_env_nee(bool on);   // Session H: NEE+MIS vs brute force
 
     // Bridged id<MTLDevice>, for CAMetalLayer.device.
     void* metal_device() const;

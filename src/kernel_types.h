@@ -55,6 +55,9 @@ struct PassUniforms {
     // (pixel, pass), so the accumulated result is bit-identical no matter
     // how work is sliced.
     pt_uint row_offset;
+    // Session H: 1 = env NEE+MIS, 0 = brute-force ground truth.
+    pt_uint env_nee;
+    pt_uint pad_h0, pad_h1, pad_h2;
 };
 
 struct ResolveUniforms {
@@ -101,7 +104,7 @@ struct MeshUniforms {
 static_assert(sizeof(pt_float3) == 12, "pt_float3 must be 12 bytes");
 static_assert(sizeof(GPUSphere) == 64, "GPUSphere must be one cacheline");
 static_assert(sizeof(GPUCamera) == 48, "GPUCamera layout drifted");
-static_assert(sizeof(PassUniforms) == 96, "PassUniforms layout drifted");
+static_assert(sizeof(PassUniforms) == 112, "PassUniforms layout drifted");
 static_assert(sizeof(ResolveUniforms) == 24, "ResolveUniforms layout drifted");
 static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");
 static_assert(sizeof(GPUTriangle) == 144, "GPUTriangle must be nine 16B rows");

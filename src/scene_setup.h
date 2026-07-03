@@ -41,8 +41,9 @@ struct SceneDesc {
     float env_yaw_deg = 0.0f;
 };
 
-inline EnvLookup env_lookup(const SceneDesc& desc) {
+inline EnvLookup env_lookup(const SceneDesc& desc, bool nee = true) {
     EnvLookup e;
+    e.nee = nee;
     if (desc.env && desc.env->valid()) {
         e.texels = desc.env->texels.data();
         e.w = desc.env->w;

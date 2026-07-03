@@ -101,10 +101,83 @@ inline vec3 sample_vndf(const vec3& vt, float alpha, float u1, float u2) {
 // (absorbed / degenerate-grazing sample); the integrator has already
 // collected any emission before calling this. `attenuation` is the full
 // estimator weight f·cosθ/pdf for the sampled direction.
+// Session H (NEE/MIS): evaluate the BSDF value and the MIXED pdf that
+// scatter() below would assign to an ARBITRARY light direction l. This is
+// a textual factoring of scatter()'s evaluation half — the two MUST stay
+// in sync expression-for-expression (parity + the MIS energy checks are
+// the drift detectors). Delta glass evaluates to zero (no finite density).
+inline color eval_bsdf(const Material& mat, const HitRecord& rec,
+                       const vec3& v, const vec3& l, float& pdf) {
+    pdf = 0.0f;
+    if (mat.transmission > 0.5f) return color(0.0f, 0.0f, 0.0f);
+
+    const vec3 n = rec.normal;
+    const float nv = dot(n, v);
+    if (nv <= 1e-4f) return color(0.0f, 0.0f, 0.0f);
+
+    const float alpha =
+        std::fmax(1e-4f, mat.roughness * mat.roughness);
+    const float a2 = alpha * alpha;
+    const float f0d_s = (mat.ior - 1.0f) / (mat.ior + 1.0f);
+    const float f0_diel = f0d_s * f0d_s;
+    const color f0((1.0f - mat.metallic) * f0_diel +
+                       mat.metallic * mat.base_color.x,
+                   (1.0f - mat.metallic) * f0_diel +
+                       mat.metallic * mat.base_color.y,
+                   (1.0f - mat.metallic) * f0_diel +
+                       mat.metallic * mat.base_color.z);
+    const color diffuse_albedo = (1.0f - mat.metallic) * mat.base_color;
+
+    const float spec_lum = luminance(schlick_color(f0, nv));
+    const float diff_lum = luminance(diffuse_albedo);
+    float p_spec = 1.0f;
+    if (diff_lum > 0.0f) {
+        p_spec = spec_lum / (spec_lum + diff_lum);
+        p_spec = std::fmin(std::fmax(p_spec, 0.1f), 0.9f);
+    }
+
+    vec3 t, b;
+    build_onb(n, t, b);
+    const vec3 vt(dot(v, t), dot(v, b), nv);
+    const vec3 lt(dot(l, t), dot(l, b), dot(l, n));
+    const float nl = lt.z;
+    if (nl <= 1e-6f) return color(0.0f, 0.0f, 0.0f);
+
+    const vec3 h = normalize(vt + lt);
+    const float nh = std::fmax(0.0f, h.z);
+    const float vh = std::fmax(1e-6f, dot(vt, h));
+
+    const float D = ggx_d(nh, a2);
+    const float Lv = smith_lambda(nv, a2);
+    const float Ll = smith_lambda(nl, a2);
+    const float G2 = 1.0f / (1.0f + Lv + Ll);
+    const float G1v = 1.0f / (1.0f + Lv);
+
+    const color F = schlick_color(f0, vh);
+    const float F_diel = schlick_scalar(f0_diel, vh);
+
+    const float spec_k = D * G2 / (4.0f * nv * nl);
+    const color f_spec = spec_k * F;
+    const color f_diff = (1.0f - F_diel) * (1.0f / 3.14159265358979f) *
+                         diffuse_albedo;
+
+    const float pdf_spec = G1v * D / (4.0f * nv);
+    const float pdf_diff = nl * (1.0f / 3.14159265358979f);
+    pdf = p_spec * pdf_spec + (1.0f - p_spec) * pdf_diff;
+    return f_spec + f_diff;
+}
+
+// out_pdf/out_delta (Session H): the mixed pdf of the sampled direction
+// and whether this was a delta interaction — needed for the MIS weight
+// when the continuation ray reaches the environment.
 inline bool scatter(const Material& mat, const Ray& in, const HitRecord& rec,
-                    RNG& rng, color& attenuation, Ray& scattered) {
+                    RNG& rng, color& attenuation, Ray& scattered,
+                    float& out_pdf, bool& out_delta) {
     // ---- glass: delta dielectric, unchanged from the original model ----
+    out_pdf = 0.0f;
+    out_delta = false;
     if (mat.transmission > 0.5f) {
+        out_delta = true;
         attenuation = color(1.0f, 1.0f, 1.0f);
         const float eta = rec.front_face ? 1.0f / mat.ior : mat.ior;
         const vec3 unit = normalize(in.dir);
@@ -201,5 +274,6 @@ inline bool scatter(const Material& mat, const Ray& in, const HitRecord& rec,
 
     attenuation = (f_spec + f_diff) * (nl / pdf);
     scattered = Ray(rec.p, t * lt.x + b * lt.y + n * lt.z);
+    out_pdf = pdf;
     return true;
 }

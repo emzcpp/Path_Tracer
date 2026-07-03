@@ -48,6 +48,11 @@ struct RenderSettings {
     float gpu_budget_ms       = 10.0f;
     float gpu_budget_ms_final = 24.0f;
 
+    // Session H: environment light sampling. 1 = NEE+MIS (default),
+    // 0 = brute force — kept as the ground-truth reference: both must
+    // converge to the same image, NEE just gets there far cleaner.
+    int env_nee = 1;
+
     // Execution
     int thread_count = 0;         // 0 = use all hardware threads
 

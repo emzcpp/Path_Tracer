@@ -376,11 +376,79 @@ inline EvalMat eval_mesh_material(device const ushort* tex_base,
 
 // Full estimator weight f·cosθ/pdf for the sampled direction — mirror of
 // material.h's scatter, line for line.
+// Session H (NEE/MIS): evaluate the BSDF value and the MIXED pdf that
+// scatter() below would assign to an ARBITRARY light direction l. Textual
+// factoring of scatter()'s evaluation half — MUST stay in sync with it
+// and with integrator.h. Delta glass evaluates to zero.
+inline float3 eval_bsdf(thread const EvalMat& mat, float3 normal, float3 v,
+                        float3 l, thread float& pdf) {
+    pdf = 0.0f;
+    if (mat.transmission > 0.5f) return float3(0.0f);
+
+    const float3 n = normal;
+    const float nv = dot(n, v);
+    if (nv <= 1e-4f) return float3(0.0f);
+
+    const float alpha = fmax(1e-4f, mat.roughness * mat.roughness);
+    const float a2 = alpha * alpha;
+    const float f0d_s = (mat.ior - 1.0f) / (mat.ior + 1.0f);
+    const float f0_diel = f0d_s * f0d_s;
+    const float3 f0 = float3((1.0f - mat.metallic) * f0_diel +
+                                 mat.metallic * mat.base_color.x,
+                             (1.0f - mat.metallic) * f0_diel +
+                                 mat.metallic * mat.base_color.y,
+                             (1.0f - mat.metallic) * f0_diel +
+                                 mat.metallic * mat.base_color.z);
+    const float3 diffuse_albedo = (1.0f - mat.metallic) * mat.base_color;
+
+    const float spec_lum = luminance(schlick_color(f0, nv));
+    const float diff_lum = luminance(diffuse_albedo);
+    float p_spec = 1.0f;
+    if (diff_lum > 0.0f) {
+        p_spec = spec_lum / (spec_lum + diff_lum);
+        p_spec = fmin(fmax(p_spec, 0.1f), 0.9f);
+    }
+
+    float3 t, b;
+    build_onb(n, t, b);
+    const float3 vt = float3(dot(v, t), dot(v, b), nv);
+    const float3 lt = float3(dot(l, t), dot(l, b), dot(l, n));
+    const float nl = lt.z;
+    if (nl <= 1e-6f) return float3(0.0f);
+
+    const float3 h = normalize(vt + lt);
+    const float nh = fmax(0.0f, h.z);
+    const float vh = fmax(1e-6f, dot(vt, h));
+
+    const float D = ggx_d(nh, a2);
+    const float Lv = smith_lambda(nv, a2);
+    const float Ll = smith_lambda(nl, a2);
+    const float G2 = 1.0f / (1.0f + Lv + Ll);
+    const float G1v = 1.0f / (1.0f + Lv);
+
+    const float3 F = schlick_color(f0, vh);
+    const float F_diel = schlick_scalar(f0_diel, vh);
+
+    const float spec_k = D * G2 / (4.0f * nv * nl);
+    const float3 f_spec = spec_k * F;
+    const float3 f_diff = (1.0f - F_diel) * (1.0f / 3.14159265358979f) *
+                          diffuse_albedo;
+
+    const float pdf_spec = G1v * D / (4.0f * nv);
+    const float pdf_diff = nl * (1.0f / 3.14159265358979f);
+    pdf = p_spec * pdf_spec + (1.0f - p_spec) * pdf_diff;
+    return f_spec + f_diff;
+}
+
 inline bool scatter(thread const EvalMat& mat, float3 in_dir, float3 normal,
                     bool front_face, thread PRNG& rng,
-                    thread float3& attenuation, thread float3& out_dir) {
+                    thread float3& attenuation, thread float3& out_dir,
+                    thread float& out_pdf, thread bool& out_delta) {
+    out_pdf = 0.0f;
+    out_delta = false;
     // ---- glass: delta dielectric ----
     if (mat.transmission > 0.5f) {
+        out_delta = true;
         attenuation = float3(1.0f);
         const float eta = front_face ? 1.0f / mat.ior : mat.ior;
         const float3 unit = normalize(in_dir);
@@ -472,7 +540,53 @@ inline bool scatter(thread const EvalMat& mat, float3 in_dir, float3 normal,
 
     attenuation = (f_spec + f_diff) * (nl / pdf);
     out_dir = t * lt.x + b * lt.y + n * lt.z;
+    out_pdf = pdf;
     return true;
+}
+
+// Session H shadow rays: any-hit occlusion, mirrors mesh.h/scene.h.
+inline bool bvh_occluded(device const BVHNode* nodes,
+                         device const GPUTriangle* tris, float3 ro, float3 rd,
+                         float t_min, float t_max) {
+    const float3 inv = float3(1.0f / rd.x, 1.0f / rd.y, 1.0f / rd.z);
+    float tn;
+    if (!hit_aabb(nodes[0].mn, nodes[0].mx, ro, inv, t_min, t_max, tn))
+        return false;
+    uint stack[32];
+    int sp = 0;
+    stack[sp++] = 0u;
+    while (sp > 0) {
+        const BVHNode node = nodes[stack[--sp]];
+        if (node.tri_count > 0u) {
+            for (uint i = 0; i < node.tri_count; ++i) {
+                TriHit th;
+                if (hit_tri(tris[node.left_or_first + i], ro, rd, t_min,
+                            t_max, th))
+                    return true;
+            }
+            continue;
+        }
+        const uint l = node.left_or_first, r = l + 1u;
+        if (hit_aabb(nodes[l].mn, nodes[l].mx, ro, inv, t_min, t_max, tn))
+            stack[sp++] = l;
+        if (hit_aabb(nodes[r].mn, nodes[r].mx, ro, inv, t_min, t_max, tn))
+            stack[sp++] = r;
+    }
+    return false;
+}
+
+inline bool occluded_scene(float3 ro, float3 rd, constant GPUSphere* spheres,
+                           uint n, device const BVHNode* nodes,
+                           device const GPUTriangle* tris,
+                           constant MeshUniforms& MU) {
+    for (uint i = 0; i < n; ++i) {
+        HitRec tmp;
+        if (hit_sphere(spheres[i], ro, rd, 1e-3f, INFINITY, tmp)) return true;
+    }
+    if (MU.has_mesh != 0u) {
+        return bvh_occluded(nodes, tris, ro, rd, 1e-3f, INFINITY);
+    }
+    return false;
 }
 
 // ----------------------------------------------------------- integrator
@@ -517,6 +631,70 @@ inline float3 sample_env_bilinear(device const float* tex, uint W, uint H,
            (1.0f - ax) * ay * c01 + ax * ay * c11;
 }
 
+// ---- Session H: env importance sampling (mirror of integrator.h) ----
+
+// First index whose cdf value exceeds u. Identical loop on both backends.
+inline int cdf_find(device const float* cdf, int n, float u) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (cdf[mid] > u) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+
+inline float3 env_sample(device const float* row_cdf,
+                         device const float* cond_cdf, int W, int H,
+                         float yaw_norm, float u1, float u2,
+                         thread float& pdf_sa) {
+    const int y = cdf_find(row_cdf, H, u1);
+    device const float* crow = cond_cdf + ulong(y) * W;
+    const int x = cdf_find(crow, W, u2);
+    const float row_lo = y > 0 ? row_cdf[y - 1] : 0.0f;
+    const float row_w = row_cdf[y] - row_lo;
+    const float col_lo = x > 0 ? crow[x - 1] : 0.0f;
+    const float col_w = crow[x] - col_lo;
+    // Continuous inversion inside the chosen texel (keeps stratification).
+    const float fy = row_w > 0.0f ? (u1 - row_lo) / row_w : 0.5f;
+    const float fx = col_w > 0.0f ? (u2 - col_lo) / col_w : 0.5f;
+    const float u = (float(x) + fx) / float(W);
+    const float v = (float(y) + fy) / float(H);
+    // UV -> direction: exact inverse of the miss mapping, yaw included.
+    const float phi = (u - 0.5f - yaw_norm) * 6.28318530717958648f;
+    const float theta = v * 3.14159265358979f;
+    const float st = sin(theta);
+    const float3 d = float3(st * cos(phi), cos(theta), st * sin(phi));
+    const float p_uv = row_w * col_w * float(W) * float(H);
+    pdf_sa = st > 1e-6f
+                 ? p_uv / (2.0f * 3.14159265358979f * 3.14159265358979f * st)
+                 : 0.0f;
+    return d;
+}
+
+inline float env_pdf(device const float* row_cdf,
+                     device const float* cond_cdf, int W, int H,
+                     float yaw_norm, float3 dir) {
+    const float3 d = normalize(dir);
+    float u = atan2(d.z, d.x) * 0.15915494309189533577f + 0.5f + yaw_norm;
+    u = u - floor(u);
+    const float v = acos(fmin(fmax(d.y, -1.0f), 1.0f)) *
+                    0.31830988618379067154f;
+    int x = int(u * float(W));
+    int y = int(v * float(H));
+    if (x >= W) x = W - 1;
+    if (y >= H) y = H - 1;
+    device const float* crow = cond_cdf + ulong(y) * W;
+    const float row_lo = y > 0 ? row_cdf[y - 1] : 0.0f;
+    const float row_w = row_cdf[y] - row_lo;
+    const float col_lo = x > 0 ? crow[x - 1] : 0.0f;
+    const float col_w = crow[x] - col_lo;
+    const float st = sqrt(fmax(0.0f, 1.0f - d.y * d.y));
+    if (st <= 1e-6f) return 0.0f;
+    return row_w * col_w * float(W) * float(H) /
+           (2.0f * 3.14159265358979f * 3.14159265358979f * st);
+}
+
 inline float3 miss_radiance(device const float* env_texels, uint env_w,
                             uint env_h, float intensity, float yaw_norm,
                             float3 rd) {
@@ -544,10 +722,13 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     device const ushort* tex_emis,
                     device const ushort* tex_norm,
                     device const float* env_texels,
+                    device const float* env_row_cdf,
+                    device const float* env_cond_cdf,
                     constant MeshUniforms& MU, constant PassUniforms& U,
                     thread PRNG& rng, uint max_depth) {
     float3 radiance = float3(0.0f);
     float3 throughput = float3(1.0f);
+    bool prev_nee = false;   // env NEE ran at the previous path vertex
 
     for (uint depth = 0; depth < max_depth; ++depth) {
         // Closest hit: spheres first, then the mesh BVH seeded with the
@@ -562,13 +743,20 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             hit_m = bvh_hit(nodes, tris, ro, rd, 1e-3f, closest, th);
         }
         if (!hit_s && !hit_m) {
-            const float3 c = throughput *
-                             miss_radiance(env_texels, U.env_w, U.env_h,
-                                           U.env_intensity, U.env_yaw_norm,
-                                           rd);
-            return radiance + (depth == 0u
-                                   ? c
-                                   : clamp_contribution(c, U.clamp_indirect));
+            // NEE double-count rule: a vertex that ran env NEE already
+            // collected the environment's direct term, so its continuation
+            // miss must not add it again. Camera rays and delta/glass
+            // continuations (no NEE there) still see the env in full.
+            if (!prev_nee) {
+                const float3 c =
+                    throughput * miss_radiance(env_texels, U.env_w, U.env_h,
+                                               U.env_intensity,
+                                               U.env_yaw_norm, rd);
+                radiance +=
+                    (depth == 0u ? c
+                                 : clamp_contribution(c, U.clamp_indirect));
+            }
+            return radiance;
         }
 
         EvalMat mat;
@@ -621,8 +809,47 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                             : clamp_contribution(c, U.clamp_indirect);
         }
 
+        // ---- Session H: next-event estimation toward the environment.
+        // Deliberately sample the env distribution (the sun), evaluate the
+        // BSDF for that direction, and add the contribution if the shadow
+        // ray escapes. Delta glass is skipped — BSDF sampling owns it.
+        // Near-specular skip — mirror of integrator.h.
+        const bool can_nee = U.env_nee != 0u && U.env_w != 0u &&
+                             mat.transmission <= 0.5f &&
+                             mat.roughness >= 0.1f;
+        if (can_nee) {
+            const float u1 = pcg_next_float(rng);
+            const float u2 = pcg_next_float(rng);
+            float pdf_env = 0.0f;
+            const float3 ldir =
+                env_sample(env_row_cdf, env_cond_cdf, int(U.env_w),
+                           int(U.env_h), U.env_yaw_norm, u1, u2, pdf_env);
+            if (pdf_env > 1e-12f) {
+                float pdf_b = 0.0f;
+                const float3 vdir = -normalize(rd);
+                const float3 f = eval_bsdf(mat, hn, vdir, ldir, pdf_b);
+                const float nl = dot(hn, ldir);
+                if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
+                    if (!occluded_scene(hp, ldir, spheres, n, nodes, tris,
+                                        MU)) {
+                        const float3 c =
+                            throughput * f * nl *
+                            miss_radiance(env_texels, U.env_w, U.env_h,
+                                          U.env_intensity, U.env_yaw_norm,
+                                          ldir) /
+                            pdf_env;
+                        radiance += clamp_contribution(c, U.clamp_indirect);
+                    }
+                }
+            }
+        }
+        prev_nee = can_nee;
+
         float3 attenuation, new_dir;
-        if (!scatter(mat, rd, hn, front, rng, attenuation, new_dir)) {
+        float scatter_pdf = 0.0f;
+        bool scatter_delta = false;
+        if (!scatter(mat, rd, hn, front, rng, attenuation, new_dir,
+                     scatter_pdf, scatter_delta)) {
             return radiance;
         }
         throughput *= attenuation;
@@ -660,6 +887,8 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                        constant MeshUniforms& MU       [[buffer(8)]],
                        device const ushort* tex_norm   [[buffer(9)]],
                        device const float* env_texels  [[buffer(10)]],
+                       device const float* env_row_cdf [[buffer(11)]],
+                       device const float* env_cond_cdf [[buffer(12)]],
                        uint2 gid [[thread_position_in_grid]]) {
     // The dispatch may cover a row slice [row_offset, row_offset+rows);
     // everything below keys off the FRAME pixel, so slicing is invisible
@@ -682,8 +911,8 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                           v * c3(U.cam.vertical) - ro;
 
         total += trace(ro, rd, spheres, U.sphere_count, nodes, tris, tex_base,
-                       tex_mr, tex_emis, tex_norm, env_texels, MU, U, rng,
-                       U.max_depth);
+                       tex_mr, tex_emis, tex_norm, env_texels, env_row_cdf,
+                       env_cond_cdf, MU, U, rng, U.max_depth);
     }
     accum[px] += float4(total, 0.0f);
 }

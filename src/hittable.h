@@ -57,4 +57,11 @@ class Hittable {
 public:
     virtual ~Hittable() = default;
     virtual bool hit(const Ray& r, float t_min, float t_max, HitRecord& rec) const = 0;
+
+    // Session H (NEE shadow rays): any-hit occlusion. Default falls back
+    // to closest-hit; Mesh overrides with an early-out BVH traversal.
+    virtual bool occluded(const Ray& r, float t_min, float t_max) const {
+        HitRecord tmp;
+        return hit(r, t_min, t_max, tmp);
+    }
 };

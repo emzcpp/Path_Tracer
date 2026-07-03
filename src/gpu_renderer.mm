@@ -129,6 +129,8 @@ struct GpuRenderer::Impl {
     MeshUniforms mesh_u{};   // has_mesh = 0 by default
     // Session F: HDRI environment (env_w == 0 -> gradient fallback).
     id<MTLBuffer> env_texels;
+    id<MTLBuffer> env_row_cdf;
+    id<MTLBuffer> env_cond_cdf;
     pt_uint env_w = 0, env_h = 0;
     float env_intensity = 1.0f, env_yaw_norm = 0.0f;
     // BVH register pressure can lower maxTotalThreadsPerThreadgroup below
@@ -190,6 +192,7 @@ struct GpuRenderer::Impl {
         u.env_intensity = env_intensity;
         u.env_yaw_norm = env_yaw_norm;
         u.clamp_indirect = settings.clamp_indirect;
+        u.env_nee = pt_uint(settings.env_nee != 0 ? 1 : 0);
 
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:accumulate_pso];
@@ -204,6 +207,8 @@ struct GpuRenderer::Impl {
         [enc setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
         [enc setBuffer:tex_norm offset:0 atIndex:9];
         [enc setBuffer:env_texels offset:0 atIndex:10];
+        [enc setBuffer:env_row_cdf offset:0 atIndex:11];
+        [enc setBuffer:env_cond_cdf offset:0 atIndex:12];
         [enc dispatchThreads:MTLSizeMake(w, slice ? row_count : h, 1)
             threadsPerThreadgroup:tg_accum];
         [enc endEncoding];
@@ -418,6 +423,8 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
 
     im.upload_mesh(mesh);
     im.env_texels = im.upload(nullptr, 0);   // gradient until set_env
+    im.env_row_cdf = im.upload(nullptr, 0);
+    im.env_cond_cdf = im.upload(nullptr, 0);
     im.w = settings.width;
     im.h = settings.height;
     return r;
@@ -428,10 +435,18 @@ void GpuRenderer::set_env(const EnvMap* env) {
         impl_->env_texels =
             impl_->upload(env->texels.data(),
                           env->texels.size() * sizeof(float));
+        impl_->env_row_cdf =
+            impl_->upload(env->row_cdf.data(),
+                          env->row_cdf.size() * sizeof(float));
+        impl_->env_cond_cdf =
+            impl_->upload(env->cond_cdf.data(),
+                          env->cond_cdf.size() * sizeof(float));
         impl_->env_w = pt_uint(env->w);
         impl_->env_h = pt_uint(env->h);
     } else {
         impl_->env_texels = impl_->upload(nullptr, 0);
+        impl_->env_row_cdf = impl_->upload(nullptr, 0);
+        impl_->env_cond_cdf = impl_->upload(nullptr, 0);
         impl_->env_w = 0;
         impl_->env_h = 0;
     }
@@ -665,6 +680,10 @@ void GpuRenderer::set_max_depth(int depth) {
 
 void GpuRenderer::set_clamp_indirect(float clamp) {
     impl_->settings.clamp_indirect = clamp;
+}
+
+void GpuRenderer::set_env_nee(bool on) {
+    impl_->settings.env_nee = on ? 1 : 0;
 }
 
 void GpuRenderer::update_spheres(const std::vector<GPUSphere>& spheres) {

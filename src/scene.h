@@ -30,6 +30,13 @@ public:
         return hit_anything;
     }
 
+    bool occluded(const Ray& r, float t_min, float t_max) const override {
+        for (const auto& o : objects_) {
+            if (o->occluded(r, t_min, t_max)) return true;
+        }
+        return false;
+    }
+
 private:
     std::vector<std::unique_ptr<Hittable>> objects_;
 };

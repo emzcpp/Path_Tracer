@@ -163,6 +163,7 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                    const EnvLookup& env, float clamp_indirect) {
     color radiance(0.0f);      // light collected so far
     color throughput(1.0f);    // fraction of it that survives back to the eye
+    bool prev_nee = false;     // env NEE ran at the previous path vertex
 
     for (int depth = 0; depth < max_depth; ++depth) {
         HitRecord rec;
@@ -170,9 +171,16 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
         // put its origin a hair inside, and t_min=0 would let it re-hit the
         // same surface at t≈0 ("shadow acne" — dark speckles everywhere).
         if (!world.hit(ray, 1e-3f, std::numeric_limits<float>::infinity(), rec)) {
-            const color c = throughput * miss_radiance(env, ray);
-            return radiance +
-                   (depth == 0 ? c : clamp_contribution(c, clamp_indirect));
+            // NEE double-count rule: a vertex that ran env NEE already
+            // collected the environment's direct term, so its continuation
+            // miss must not add it again. Camera rays and delta/glass
+            // continuations (no NEE there) still see the env in full.
+            if (!prev_nee) {
+                const color c = throughput * miss_radiance(env, ray);
+                radiance +=
+                    (depth == 0 ? c : clamp_contribution(c, clamp_indirect));
+            }
+            return radiance;
         }
 
         // Collect whatever this surface emits (zero for non-lights), THEN
@@ -184,9 +192,49 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                 depth == 0 ? c : clamp_contribution(c, clamp_indirect);
         }
 
+        // ---- Session H: next-event estimation toward the environment.
+        // Deliberately sample the env distribution (the sun), evaluate the
+        // BSDF for that direction, and add the contribution if the shadow
+        // ray escapes. Delta glass is skipped — BSDF sampling owns it.
+        // Near-specular skip (glass is delta; a roughness-0.02 metal's
+        // lobe is spiked enough that env-sampling it produces jackpot
+        // noise while suppressing the clean BSDF mirror estimator) —
+        // those vertices rely on BSDF sampling. MIS (Stage 3) weights,
+        // rather than gates, this trade.
+        const bool can_nee = env.nee && env.row_cdf != nullptr &&
+                             rec.mat.transmission <= 0.5f &&
+                             rec.mat.roughness >= 0.1f;
+        if (can_nee) {
+            const float u1 = rng.next_float();
+            const float u2 = rng.next_float();
+            float pdf_env = 0.0f;
+            const vec3 ldir = env_sample(env, u1, u2, pdf_env);
+            if (pdf_env > 1e-12f) {
+                float pdf_b = 0.0f;
+                const vec3 vdir = -normalize(ray.dir);
+                const color f = eval_bsdf(rec.mat, rec, vdir, ldir, pdf_b);
+                const float nl = dot(rec.normal, ldir);
+                if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
+                    const Ray shadow(rec.p, ldir);
+                    if (!world.occluded(
+                            shadow, 1e-3f,
+                            std::numeric_limits<float>::infinity())) {
+                        const color c = throughput * f * nl *
+                                        miss_radiance(env, shadow) /
+                                        pdf_env;
+                        radiance += clamp_contribution(c, clamp_indirect);
+                    }
+                }
+            }
+        }
+        prev_nee = can_nee;
+
         color attenuation;
         Ray scattered;
-        if (!scatter(rec.mat, ray, rec, rng, attenuation, scattered)) {
+        float scatter_pdf = 0.0f;
+        bool scatter_delta = false;
+        if (!scatter(rec.mat, ray, rec, rng, attenuation, scattered,
+                     scatter_pdf, scatter_delta)) {
             return radiance;                         // light hit, or absorbed
         }
         throughput *= attenuation;

@@ -110,7 +110,7 @@ int run_parity(const RenderSettings& settings, int spp,
     const Scene scene = make_scene(desc);
     ProgressiveRenderer cpu(scene, settings,
                             std::max(1u, std::thread::hardware_concurrency()),
-                            env_lookup(desc));
+                            env_lookup(desc, settings.env_nee != 0));
     t0 = Clock::now();
     for (int s = 0; s < spp; ++s) cpu.render_pass(camera);
     const double cpu_s = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -231,6 +231,7 @@ int main(int argc, char** argv) {
     bool no_model = false;
     bool grid = false;
     bool nan_check = false;
+    bool brute = false;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--offline") == 0) {
@@ -249,6 +250,8 @@ int main(int argc, char** argv) {
             env_path = argv[++i];
         } else if (std::strcmp(argv[i], "--nan-check") == 0) {
             nan_check = true;
+        } else if (std::strcmp(argv[i], "--brute") == 0) {
+            brute = true;
         } else if (std::strcmp(argv[i], "--grid") == 0) {
             grid = true;   // GGX validation: roughness x metallic array
         } else if (std::strcmp(argv[i], "--gpu-check") == 0) {
@@ -297,6 +300,10 @@ int main(int argc, char** argv) {
     SceneDesc desc =
         grid ? build_grid_desc() : build_scene_desc(std::move(mesh));
     if (desc.mesh) desc.mesh_source_path = resolved_model;
+    if (brute) {
+        settings.env_nee = 0;
+        std::printf("lighting: brute force (ground-truth mode)\n");
+    }
     if (!env_path.empty()) {
         std::string err;
         auto env = load_hdr(env_path, err);
@@ -337,7 +344,7 @@ int main(int argc, char** argv) {
         const Scene scene = make_scene(desc);
         ProgressiveRenderer cpu(scene, settings,
                                 std::max(1u, std::thread::hardware_concurrency()),
-                                env_lookup(desc));
+                                env_lookup(desc, settings.env_nee != 0));
         const Camera camera(settings.cam_pos, settings.cam_look_at,
                             settings.cam_up, settings.vfov_deg,
                             settings.aspect());
@@ -392,7 +399,7 @@ int main(int argc, char** argv) {
     const Scene scene = make_scene(desc);
     ProgressiveRenderer renderer(scene, settings,
                                  std::max(1u, std::thread::hardware_concurrency()),
-                                 env_lookup(desc));
+                                 env_lookup(desc, settings.env_nee != 0));
 
     std::printf("rendering %dx%d @ %d spp, max depth %d\n", settings.width,
                 settings.height, settings.samples_per_pixel, settings.max_depth);

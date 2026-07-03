@@ -775,7 +775,7 @@ void render_thread_main(ViewerCore& core) {
     cpu_settings.clamp_indirect =
         core.preview_clamp_on ? core.preview_clamp_value : 0.0f;
     ProgressiveRenderer renderer(core.scene, cpu_settings, hw - 1,
-                                 env_lookup(core.desc));
+                                 env_lookup(core.desc, core.settings.env_nee != 0));
 
     const auto settle =
         std::chrono::duration<float, std::milli>(core.settings.settle_ms);
@@ -1896,6 +1896,20 @@ void render_thread_main(ViewerCore& core) {
     if (ImGui::SliderInt("max bounces", &s.max_depth, 1, 32)) {
         gpu.set_max_depth(s.max_depth);   // renderer holds its own copy
         dirty = true;
+    }
+    {
+        bool nee = s.env_nee != 0;
+        if (ImGui::Checkbox("env importance sampling (NEE)", &nee)) {
+            s.env_nee = nee ? 1 : 0;
+            gpu.set_env_nee(nee);
+            dirty = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Samples the HDRI's bright regions (the sun) directly with\n"
+                "shadow rays every bounce — same converged image as brute\n"
+                "force, far less speckle. Off = brute-force ground truth.");
+        }
     }
     ImGui::Checkbox("firefly clamp (preview only)", &core_->preview_clamp_on);
     if (ImGui::IsItemHovered()) {

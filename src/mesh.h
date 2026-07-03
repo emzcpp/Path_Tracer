@@ -68,6 +68,39 @@ inline bool hit_aabb(const pt_float3& mn, const pt_float3& mx, const vec3& ro,
     return t0 <= t1 && t0 <= t_max && t1 >= t_min;
 }
 
+// Any-hit traversal for shadow rays (Session H): no ordering, no closest
+// tracking — the first intersection in range terminates.
+inline bool bvh_occluded(const std::vector<BVHNode>& nodes,
+                         const std::vector<GPUTriangle>& tris, const vec3& ro,
+                         const vec3& rd, float t_min, float t_max) {
+    if (nodes.empty()) return false;
+    const vec3 inv(1.0f / rd.x, 1.0f / rd.y, 1.0f / rd.z);
+    float tn;
+    if (!hit_aabb(nodes[0].mn, nodes[0].mx, ro, inv, t_min, t_max, tn))
+        return false;
+    unsigned stack[32];
+    int sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        const BVHNode& node = nodes[stack[--sp]];
+        if (node.tri_count > 0) {
+            for (unsigned i = 0; i < node.tri_count; ++i) {
+                TriHit th;
+                if (hit_tri(tris[node.left_or_first + i], ro, rd, t_min,
+                            t_max, th))
+                    return true;
+            }
+            continue;
+        }
+        const unsigned l = node.left_or_first, r = l + 1;
+        if (hit_aabb(nodes[l].mn, nodes[l].mx, ro, inv, t_min, t_max, tn))
+            stack[sp++] = l;
+        if (hit_aabb(nodes[r].mn, nodes[r].mx, ro, inv, t_min, t_max, tn))
+            stack[sp++] = r;
+    }
+    return false;
+}
+
 // Ordered BVH traversal: parent tests both children, near child first
 // (deterministic tie -> left), plain uint stack. Depth cap 30 at build
 // makes stack[32] a guarantee.
@@ -197,5 +230,10 @@ public:
     }
 
 private:
+    bool occluded(const Ray& r, float t_min, float t_max) const override {
+        return bvh_occluded(data_->nodes, data_->tris, r.origin, r.dir,
+                            t_min, t_max);
+    }
+
     std::shared_ptr<const MeshData> data_;
 };
