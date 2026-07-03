@@ -92,12 +92,30 @@ struct GPUTriangle {
 };
 
 // Separate from PassUniforms so the sphere path's layout stays untouched.
+// Session I: per-set texture dims moved into GPUMaterialArgs.
 struct MeshUniforms {
-    pt_uint has_mesh, tri_count, node_count, pad0;
-    pt_uint base_w, base_h, mr_w, mr_h;
-    pt_uint emis_w, emis_h, norm_w, norm_h;   // norm_w==0: no normal map
+    pt_uint has_mesh, tri_count, node_count, mat_count;
     float   emissive_scale;
-    pt_uint pad1, pad2, pad3;
+    pt_uint pad0, pad1, pad2;
+};
+
+// Session I: one material's texture set, as an entry in the bindless
+// argument-buffer table. The MSL side holds device pointers; the C++ side
+// writes the buffers' gpuAddress values (Metal 3) into the same 8-byte
+// slots. Addressing changes, FILTERING does not: the kernel dereferences
+// these exactly like the old single-set bindings, so the hand-matched
+// bilinear/color-space code is untouched. A dim of 0 marks an absent map.
+struct GPUMaterialArgs {
+#ifdef __METAL_VERSION__
+    device const ushort* base;
+    device const ushort* mr;
+    device const ushort* emis;
+    device const ushort* norm;
+#else
+    unsigned long long base, mr, emis, norm;   // MTLBuffer.gpuAddress
+#endif
+    pt_uint base_w, base_h, mr_w, mr_h;
+    pt_uint emis_w, emis_h, norm_w, norm_h;
 };
 
 #ifndef __METAL_VERSION__
@@ -108,7 +126,9 @@ static_assert(sizeof(PassUniforms) == 112, "PassUniforms layout drifted");
 static_assert(sizeof(ResolveUniforms) == 24, "ResolveUniforms layout drifted");
 static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");
 static_assert(sizeof(GPUTriangle) == 144, "GPUTriangle must be nine 16B rows");
-static_assert(sizeof(MeshUniforms) == 64, "MeshUniforms layout drifted");
+static_assert(sizeof(MeshUniforms) == 32, "MeshUniforms layout drifted");
+static_assert(sizeof(GPUMaterialArgs) == 64,
+              "GPUMaterialArgs must be four 8B pointers + eight uints");
 #endif
 
 #endif // PT_KERNEL_TYPES_H

@@ -352,18 +352,18 @@ inline EvalMat eval_sphere(constant GPUSphere& s) {
 
 // Mirror of mesh.h's eval_mesh_material: glTF metallic-roughness textures
 // feed the BSDF continuously — no threshold.
-inline EvalMat eval_mesh_material(device const ushort* tex_base,
-                                  device const ushort* tex_mr,
-                                  device const ushort* tex_emis,
-                                  constant MeshUniforms& MU,
-                                  float u, float v) {
-    const float3 base = sample_bilinear(tex_base, MU.base_w, MU.base_h, u, v);
-    const float3 mr = MU.mr_w != 0u
-                          ? sample_bilinear(tex_mr, MU.mr_w, MU.mr_h, u, v)
-                          : float3(0.0f, 1.0f, 0.0f);
+inline EvalMat eval_mesh_material(device const GPUMaterialArgs* mats,
+                                  uint mat_id,
+                                  constant MeshUniforms& MU, float u,
+                                  float v) {
+    device const GPUMaterialArgs& M = mats[mat_id];
+    const float3 base = sample_bilinear(M.base, M.base_w, M.base_h, u, v);
+    const float3 mr =
+        M.mr_w != 0u ? sample_bilinear(M.mr, M.mr_w, M.mr_h, u, v)
+                     : float3(0.0f, 1.0f, 0.0f);
     const float3 emis =
-        MU.emis_w != 0u ? sample_bilinear(tex_emis, MU.emis_w, MU.emis_h, u, v)
-                        : float3(0.0f);
+        M.emis_w != 0u ? sample_bilinear(M.emis, M.emis_w, M.emis_h, u, v)
+                       : float3(0.0f);
     EvalMat m;
     m.base_color = base;
     m.emission = emis * MU.emissive_scale;
@@ -717,10 +717,8 @@ inline float3 clamp_contribution(float3 c, float m) {
 inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     uint n, device const BVHNode* nodes,
                     device const GPUTriangle* tris,
-                    device const ushort* tex_base,
-                    device const ushort* tex_mr,
-                    device const ushort* tex_emis,
-                    device const ushort* tex_norm,
+                    device const GPUMaterialArgs* materials,
+                    device const uint* tri_mat,
                     device const float* env_texels,
                     device const float* env_row_cdf,
                     device const float* env_cond_cdf,
@@ -781,12 +779,14 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                                   th.v * c3(T.n2));
             const float u = w * T.u0 + th.u * T.u1 + th.v * T.u2;
             const float v = w * T.v0 + th.u * T.v1 + th.v * T.v2;
+            const uint mid = tri_mat[th.tri];
             // Tangent-space normal mapping — mirror of mesh.h. glTF:
             // LINEAR texels, +Y up, [0,1] -> [-1,1]; bitangent takes the
             // .w handedness sign.
-            if (MU.norm_w != 0u) {
+            device const GPUMaterialArgs& NM = materials[mid];
+            if (NM.norm_w != 0u) {
                 const float3 tn =
-                    sample_bilinear(tex_norm, MU.norm_w, MU.norm_h, u, v);
+                    sample_bilinear(NM.norm, NM.norm_w, NM.norm_h, u, v);
                 const float3 tN = float3(2.0f * tn.x - 1.0f,
                                          2.0f * tn.y - 1.0f,
                                          2.0f * tn.z - 1.0f);
@@ -801,7 +801,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                 }
             }
             hn = front ? ns : -ns;
-            mat = eval_mesh_material(tex_base, tex_mr, tex_emis, MU, u, v);
+            mat = eval_mesh_material(materials, mid, MU, u, v);
         } else {
             hp = rec.p;
             hn = rec.normal;
@@ -894,11 +894,9 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                        constant PassUniforms& U        [[buffer(2)]],
                        device const BVHNode* nodes     [[buffer(3)]],
                        device const GPUTriangle* tris  [[buffer(4)]],
-                       device const ushort* tex_base   [[buffer(5)]],
-                       device const ushort* tex_mr     [[buffer(6)]],
-                       device const ushort* tex_emis   [[buffer(7)]],
+                       device const GPUMaterialArgs* materials [[buffer(5)]],
+                       device const uint* tri_mat      [[buffer(6)]],
                        constant MeshUniforms& MU       [[buffer(8)]],
-                       device const ushort* tex_norm   [[buffer(9)]],
                        device const float* env_texels  [[buffer(10)]],
                        device const float* env_row_cdf [[buffer(11)]],
                        device const float* env_cond_cdf [[buffer(12)]],
@@ -923,8 +921,8 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
         const float3 rd = c3(U.cam.lower_left) + u * c3(U.cam.horizontal) +
                           v * c3(U.cam.vertical) - ro;
 
-        total += trace(ro, rd, spheres, U.sphere_count, nodes, tris, tex_base,
-                       tex_mr, tex_emis, tex_norm, env_texels, env_row_cdf,
+        total += trace(ro, rd, spheres, U.sphere_count, nodes, tris,
+                       materials, tri_mat, env_texels, env_row_cdf,
                        env_cond_cdf, MU, U, rng, U.max_depth);
     }
     accum[px] += float4(total, 0.0f);

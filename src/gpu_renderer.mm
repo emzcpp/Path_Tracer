@@ -123,10 +123,13 @@ struct GpuRenderer::Impl {
     id<MTLBuffer> bvh_nodes;
     id<MTLBuffer> tris;
     id<MTLBuffer> tri_mat;   // per-triangle material id, leaf order
-    id<MTLBuffer> tex_base;
-    id<MTLBuffer> tex_mr;
-    id<MTLBuffer> tex_emis;
-    id<MTLBuffer> tex_norm;
+    // Session I bindless: one raw ushort buffer per texture, referenced
+    // from the GPUMaterialArgs table by gpuAddress. Kept in this vector so
+    // (a) ARC retains them and (b) encode marks them resident
+    // (useResource) — indirectly-addressed resources aren't tracked
+    // automatically.
+    std::vector<id<MTLBuffer>> mat_textures;
+    id<MTLBuffer> mat_table;
     MeshUniforms mesh_u{};   // has_mesh = 0 by default
     // Session F: HDRI environment (env_w == 0 -> gradient fallback).
     id<MTLBuffer> env_texels;
@@ -202,11 +205,14 @@ struct GpuRenderer::Impl {
         [enc setBytes:&u length:sizeof u atIndex:2];
         [enc setBuffer:bvh_nodes offset:0 atIndex:3];
         [enc setBuffer:tris offset:0 atIndex:4];
-        [enc setBuffer:tex_base offset:0 atIndex:5];
-        [enc setBuffer:tex_mr offset:0 atIndex:6];
-        [enc setBuffer:tex_emis offset:0 atIndex:7];
+        [enc setBuffer:mat_table offset:0 atIndex:5];
+        [enc setBuffer:tri_mat offset:0 atIndex:6];
         [enc setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
-        [enc setBuffer:tex_norm offset:0 atIndex:9];
+        // Bindless residency: buffers reached via gpuAddress are invisible
+        // to Metal's automatic hazard/residency tracking.
+        for (id<MTLBuffer> t : mat_textures) {
+            [enc useResource:t usage:MTLResourceUsageRead];
+        }
         [enc setBuffer:env_texels offset:0 atIndex:10];
         [enc setBuffer:env_row_cdf offset:0 atIndex:11];
         [enc setBuffer:env_cond_cdf offset:0 atIndex:12];
@@ -287,10 +293,8 @@ struct GpuRenderer::Impl {
             bvh_nodes = upload(nullptr, 0);
             tris = upload(nullptr, 0);
             tri_mat = upload(nullptr, 0);
-            tex_base = upload(nullptr, 0);
-            tex_mr = upload(nullptr, 0);
-            tex_emis = upload(nullptr, 0);
-            tex_norm = upload(nullptr, 0);
+            mat_textures.clear();
+            mat_table = upload(nullptr, 0);
             return;
         }
         bvh_nodes = upload(mesh->nodes.data(),
@@ -299,28 +303,44 @@ struct GpuRenderer::Impl {
                       mesh->tris.size() * sizeof(GPUTriangle));
         tri_mat = upload(mesh->tri_mat.data(),
                          mesh->tri_mat.size() * sizeof(std::uint32_t));
-        // Stage 1 interim: bind materials[0] through the legacy single-set
-        // path; Stage 2 replaces this with the bindless material table.
-        const MeshMaterial& m0 = mesh->materials[0];
-        tex_base = upload(m0.base.texels.data(),
-                          m0.base.texels.size() * sizeof(std::uint16_t));
-        tex_mr = upload(m0.mr.texels.data(),
-                        m0.mr.texels.size() * sizeof(std::uint16_t));
-        tex_emis = upload(m0.emissive.texels.data(),
-                          m0.emissive.texels.size() * sizeof(std::uint16_t));
-        tex_norm = upload(m0.normal.texels.data(),
-                          m0.normal.texels.size() * sizeof(std::uint16_t));
+
+        // Bindless material table: raw ushort buffers per channel, their
+        // Metal-3 gpuAddress written into GPUMaterialArgs entries. New
+        // buffers + new table on every (re)upload — the buffer-swap
+        // discipline: in-flight command buffers retain the old ones.
+        mat_textures.clear();
+        std::vector<GPUMaterialArgs> table;
+        table.reserve(mesh->materials.size());
+        const auto tex_addr = [&](const Texture16& t) -> unsigned long long {
+            id<MTLBuffer> buf =
+                upload(t.texels.empty() ? nullptr : t.texels.data(),
+                       t.texels.size() * sizeof(std::uint16_t));
+            mat_textures.push_back(buf);
+            return buf.gpuAddress;
+        };
+        for (const MeshMaterial& m : mesh->materials) {
+            GPUMaterialArgs e{};
+            e.base = tex_addr(m.base);
+            e.mr = tex_addr(m.mr);
+            e.emis = tex_addr(m.emissive);
+            e.norm = tex_addr(m.normal);
+            e.base_w = pt_uint(m.base.w);
+            e.base_h = pt_uint(m.base.h);
+            e.mr_w = pt_uint(m.mr.w);
+            e.mr_h = pt_uint(m.mr.h);
+            e.emis_w = pt_uint(m.emissive.w);
+            e.emis_h = pt_uint(m.emissive.h);
+            e.norm_w = pt_uint(m.normal.w);
+            e.norm_h = pt_uint(m.normal.h);
+            table.push_back(e);
+        }
+        mat_table =
+            upload(table.data(), table.size() * sizeof(GPUMaterialArgs));
+
         mesh_u.has_mesh = 1;
         mesh_u.tri_count = pt_uint(mesh->tris.size());
         mesh_u.node_count = pt_uint(mesh->nodes.size());
-        mesh_u.base_w = pt_uint(m0.base.w);
-        mesh_u.base_h = pt_uint(m0.base.h);
-        mesh_u.mr_w = pt_uint(m0.mr.w);
-        mesh_u.mr_h = pt_uint(m0.mr.h);
-        mesh_u.emis_w = pt_uint(m0.emissive.w);
-        mesh_u.emis_h = pt_uint(m0.emissive.h);
-        mesh_u.norm_w = pt_uint(m0.normal.w);
-        mesh_u.norm_h = pt_uint(m0.normal.h);
+        mesh_u.mat_count = pt_uint(mesh->materials.size());
         mesh_u.emissive_scale = mesh->emissive_scale;
     }
 
