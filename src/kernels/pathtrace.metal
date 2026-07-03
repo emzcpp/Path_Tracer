@@ -632,6 +632,10 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
         if (depth >= 3) {
             const float p = fmin(
                 fmax(throughput.x, fmax(throughput.y, throughput.z)), 0.95f);
+            // p == 0 (all-black throughput) must terminate BEFORE the rng
+            // test: next_float() can return exactly 0.0, and 0/0 would put
+            // a NaN in the accumulator.
+            if (p <= 0.0f) break;
             if (pcg_next_float(rng) > p) break;
             throughput /= p;
         }

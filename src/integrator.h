@@ -123,6 +123,10 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
             const float p = std::fmin(
                 std::fmax(throughput.x, std::fmax(throughput.y, throughput.z)),
                 0.95f);
+            // p == 0 (all-black throughput) must terminate BEFORE the rng
+            // test: next_float() can return exactly 0.0, and 0/0 would put
+            // a NaN in the accumulator.
+            if (p <= 0.0f) break;
             if (rng.next_float() > p) break;
             throughput /= p;
         }

@@ -105,6 +105,12 @@ struct ViewerCore {
     bool snap_enabled = false;
     float snap_translate = 0.5f, snap_rotate_deg = 15.0f, snap_scale = 0.1f;
 
+    // Stage-0 firefly policy: the clamp is PREVIEW-ONLY (biased). Applied
+    // per-tick in interactive mode; FINAL renders always run unclamped
+    // (settings.clamp_indirect stays 0 there, as do offline/parity).
+    bool preview_clamp_on = true;
+    float preview_clamp_value = 10.0f;
+
     // Session E: fast-nav raster preview. 0 = off, 1 = solid, 2 = wire.
     // Auto-handoff by design: raster only while the camera moves, traced
     // when still (the settle machinery already reconverges on handback).
@@ -618,7 +624,8 @@ SceneSnapshot snapshot_from_core(const ViewerCore& core) {
     s.final_target_spp = core.settings.final_target_spp;
     s.max_depth = core.settings.max_depth;
     s.gpu_passes_per_tick = core.settings.gpu_passes_per_tick;
-    s.clamp_indirect = core.settings.clamp_indirect;
+    s.clamp_indirect =
+        core.preview_clamp_on ? core.preview_clamp_value : 0.0f;
     return s;
 }
 
@@ -713,11 +720,11 @@ bool apply_snapshot(ViewerCore& core, SceneSnapshot&& snap,
     core.settings.final_target_spp = snap.final_target_spp;
     core.settings.max_depth = snap.max_depth;
     core.settings.gpu_passes_per_tick = snap.gpu_passes_per_tick;
-    core.settings.clamp_indirect = snap.clamp_indirect;
-    if (core.gpu) {
-        core.gpu->set_max_depth(snap.max_depth);
-        core.gpu->set_clamp_indirect(snap.clamp_indirect);
-    }
+    core.preview_clamp_on = snap.clamp_indirect > 0.0f;
+    core.preview_clamp_value =
+        snap.clamp_indirect > 0.0f ? snap.clamp_indirect : 10.0f;
+    if (core.gpu) core.gpu->set_max_depth(snap.max_depth);
+    // The per-tick policy block pushes the effective clamp + reset.
 
     core.selection = Selection{};   // stale indices must not survive a load
     core.mark_scene_dirty();
@@ -750,7 +757,11 @@ void print_selection(const ViewerCore& core) {
 void render_thread_main(ViewerCore& core) {
     // Leave one core for the UI thread so event handling stays snappy.
     const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
-    ProgressiveRenderer renderer(core.scene, core.settings, hw - 1,
+    RenderSettings cpu_settings = core.settings;
+    // The CPU viewer is a preview context: same preview-only clamp policy.
+    cpu_settings.clamp_indirect =
+        core.preview_clamp_on ? core.preview_clamp_value : 0.0f;
+    ProgressiveRenderer renderer(core.scene, cpu_settings, hw - 1,
                                  env_lookup(core.desc));
 
     const auto settle =
@@ -1345,6 +1356,21 @@ void render_thread_main(ViewerCore& core) {
     // camera moves, a rasterized frame replaces tracing entirely; movement
     // keeps bumping the generation, so on settle the tracer reconverges
     // from the current pose through the normal reset machinery.
+    // Firefly clamp policy: preview-only. The effective value changes
+    // exactly when mode/toggle changes, and every change routes through
+    // the central reset so an accumulation is never a clamped/unclamped
+    // mixture.
+    {
+        const float eff = (!final_mode && core_->preview_clamp_on)
+                              ? core_->preview_clamp_value
+                              : 0.0f;
+        if (eff != core_->settings.clamp_indirect) {
+            core_->settings.clamp_indirect = eff;
+            gpu.set_clamp_indirect(eff);
+            core_->mark_scene_dirty();
+        }
+    }
+
     // Session G budget controller: learn the cost of a pixel-pass from
     // completed command buffers, then size each tick's work to a GPU-time
     // budget. Cheap frames run K full passes exactly as before; expensive
@@ -1858,16 +1884,17 @@ void render_thread_main(ViewerCore& core) {
         gpu.set_max_depth(s.max_depth);   // renderer holds its own copy
         dirty = true;
     }
-    if (ImGui::SliderFloat("clamp indirect", &s.clamp_indirect, 0.0f, 100.0f,
-                           s.clamp_indirect <= 0.0f ? "off" : "%.1f",
-                           ImGuiSliderFlags_Logarithmic)) {
-        gpu.set_clamp_indirect(s.clamp_indirect);
-        dirty = true;
-    }
+    ImGui::Checkbox("firefly clamp (preview only)", &core_->preview_clamp_on);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Firefly control: caps indirect bounce spikes\n"
-                          "(HDRI suns). Direct light is never clamped.\n"
-                          "0 = off (unbiased).");
+        ImGui::SetTooltip(
+            "Caps indirect bounce spikes (HDRI suns) in the INTERACTIVE\n"
+            "preview. Biased, so FINAL, --offline, and --parity always\n"
+            "render unclamped ground truth. Applied via the central reset.");
+    }
+    if (core_->preview_clamp_on) {
+        ImGui::SliderFloat("clamp threshold", &core_->preview_clamp_value,
+                           1.0f, 100.0f, "%.1f",
+                           ImGuiSliderFlags_Logarithmic);
     }
     if (dirty) {
         core_->final_saved = false;   // settings changed: re-arm the export

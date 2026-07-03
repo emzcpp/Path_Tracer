@@ -1,6 +1,7 @@
 #include "gltf_loader.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -401,12 +402,23 @@ std::shared_ptr<const EnvMap> load_hdr(const std::string& path,
     env->w = w;
     env->h = h;
     env->texels.resize(std::size_t(w) * h * 4);
+    // Radiance files can technically encode Inf/NaN; one bad texel would
+    // poison the accumulator forever. Screen at load (host-only).
+    std::size_t bad = 0;
     for (std::size_t i = 0, count = std::size_t(w) * h; i < count; ++i) {
-        env->texels[i * 4 + 0] = data[i * 3 + 0];   // linear radiance,
-        env->texels[i * 4 + 1] = data[i * 3 + 1];   // stored untouched
-        env->texels[i * 4 + 2] = data[i * 3 + 2];
+        for (int c = 0; c < 3; ++c) {
+            float v = data[i * 3 + c];   // linear radiance, stored untouched
+            if (!std::isfinite(v)) {
+                v = 0.0f;
+                ++bad;
+            }
+            env->texels[i * 4 + c] = v;
+        }
         env->texels[i * 4 + 3] = 1.0f;
     }
+    if (bad > 0)
+        std::fprintf(stderr, "load_hdr: sanitized %zu non-finite texels\n",
+                     bad);
     stbi_image_free(data);
     return env;
 }

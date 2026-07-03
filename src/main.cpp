@@ -230,6 +230,7 @@ int main(int argc, char** argv) {
     std::string env_path;
     bool no_model = false;
     bool grid = false;
+    bool nan_check = false;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--offline") == 0) {
@@ -246,6 +247,8 @@ int main(int argc, char** argv) {
             no_model = true;
         } else if (std::strcmp(argv[i], "--env") == 0 && i + 1 < argc) {
             env_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--nan-check") == 0) {
+            nan_check = true;
         } else if (std::strcmp(argv[i], "--grid") == 0) {
             grid = true;   // GGX validation: roughness x metallic array
         } else if (std::strcmp(argv[i], "--gpu-check") == 0) {
@@ -312,6 +315,59 @@ int main(int argc, char** argv) {
         settings.cam_look_at = point3(0.0f, 0.0f, 0.2f);
         std::printf("grid: roughness 0->1 left to right, "
                     "metallic 0->1 front to back\n");
+    }
+
+    // Stage-0 diagnostics: render both backends and count non-finite
+    // values that reached the accumulators. Any nonzero count is a bug by
+    // definition (NaN/Inf never averages out), not Monte Carlo noise.
+    if (nan_check) {
+        const int spp = spp_override > 0 ? spp_override : 64;
+        const size_t n = size_t(settings.width) * settings.height;
+        const auto scan = [](const float* p, size_t floats) {
+            size_t bad = 0;
+            for (size_t i = 0; i < floats; ++i)
+                if (!std::isfinite(p[i])) ++bad;
+            return bad;
+        };
+        std::printf("nan-check: %dx%d @ %d spp, clamp_indirect=%.1f%s\n",
+                    settings.width, settings.height, spp,
+                    settings.clamp_indirect,
+                    desc.env ? ", HDRI env" : ", gradient env");
+
+        const Scene scene = make_scene(desc);
+        ProgressiveRenderer cpu(scene, settings,
+                                std::max(1u, std::thread::hardware_concurrency()),
+                                env_lookup(desc));
+        const Camera camera(settings.cam_pos, settings.cam_look_at,
+                            settings.cam_up, settings.vfov_deg,
+                            settings.aspect());
+        for (int i = 0; i < spp; ++i) cpu.render_pass(camera);
+        const size_t cpu_bad =
+            scan(reinterpret_cast<const float*>(cpu.accum().data()), n * 3);
+        std::printf("  CPU accumulator: %zu non-finite of %zu floats\n",
+                    cpu_bad, n * 3);
+
+        size_t gpu_bad = 0;
+        bool gpu_ran = false;
+#ifdef PT_HAVE_METAL
+        std::string err;
+        if (auto gpu = GpuRenderer::create(settings, flatten_scene(desc),
+                                           desc.mesh.get(), err)) {
+            gpu->set_env(desc.env.get());
+            gpu->set_env_params(desc.env_intensity, desc.env_yaw_deg / 360.0f);
+            gpu->render_passes_blocking(to_gpu_camera(camera), spp);
+            gpu_bad = scan(gpu->accum_data(), n * 4);
+            gpu_ran = true;
+            std::printf("  GPU accumulator: %zu non-finite of %zu floats\n",
+                        gpu_bad, n * 4);
+        } else {
+            std::fprintf(stderr, "  GPU unavailable: %s\n", err.c_str());
+        }
+#endif
+        const bool pass = cpu_bad == 0 && (!gpu_ran || gpu_bad == 0);
+        std::printf("  %s\n", pass ? "PASS (zero non-finite values)"
+                                    : "FAIL — NaN/Inf reached an accumulator");
+        return pass ? 0 : 1;
     }
 
     if (mode == Mode::Parity) {

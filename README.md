@@ -94,7 +94,12 @@ panel's Environment section: load/clear, intensity, yaw — all persisted in
 scene files as a relative path). Radiance data stays linear (never
 sRGB-decoded), missed rays sample it with the same hand-written bilinear
 as material textures (u wraps, v clamps), and with no HDRI loaded the
-original gradient dome remains. Environment importance sampling / NEE is
+original gradient dome remains. Fireflies from bright HDRI suns are
+legitimate brute-force variance; the indirect clamp that calms them is
+PREVIEW-ONLY (toggle + threshold in the panel, default 10) — FINAL,
+`--offline`, and `--parity` always render unclamped ground truth, since
+clamping is biased. `--nan-check [spp]` renders both backends and counts
+non-finite accumulator values (must be zero). Environment importance sampling / NEE is
 deliberately not implemented yet — bright suns converge slowly for now.
 
 Fast-nav (V) rasterizes the scene (flat-lit solid or wireframe) at full

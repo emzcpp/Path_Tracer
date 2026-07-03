@@ -28,9 +28,12 @@ struct RenderSettings {
                                      // then auto-export a PNG
     // Firefly control (Cycles-style "clamp indirect"): cap the per-sample
     // contribution of indirect bounces. Direct hits (visible sun/lights/
-    // background) are never clamped. 0 = off. Biased but standard — HDRI
-    // suns otherwise leave white speckle that outlives any sample count.
-    float clamp_indirect = 10.0f;
+    // background) are never clamped. Clamping is BIASED, so the default is
+    // 0 = OFF: FINAL, --offline, and --parity render ground truth unless
+    // explicitly overridden. The viewer applies its own preview-only clamp
+    // in interactive mode (see ViewerCore) — HDRI suns otherwise leave
+    // white speckle in the preview that outlives any sample count.
+    float clamp_indirect = 0.0f;
 
     // GPU backend: passes encoded per 60 Hz tick (per command buffer).
     // These are CAPS; the budget controller below decides the actual work.
