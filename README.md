@@ -94,7 +94,15 @@ panel's Environment section: load/clear, intensity, yaw — all persisted in
 scene files as a relative path). Radiance data stays linear (never
 sRGB-decoded), missed rays sample it with the same hand-written bilinear
 as material textures (u wraps, v clamps), and with no HDRI loaded the
-original gradient dome remains. Fireflies from bright HDRI suns are
+original gradient dome remains. Environment lighting uses NEE + MIS
+(Session H): a luminance x sin(theta) distribution over the HDRI drives
+shadow rays at every non-delta bounce, combined with BSDF sampling by the
+power heuristic — the sun's energy arrives every sample instead of by
+lottery, unbiased (verified to converge to brute force within MC noise on
+the image mean and per-band energy). `--brute` (or the panel checkbox)
+switches back to brute-force ground truth. Residual sparse speckle from
+sun-through-glass caustic paths is inherent (delta chains can't be
+shadow-rayed) — the preview clamp still covers those. Fireflies from bright HDRI suns are
 legitimate brute-force variance; the indirect clamp that calms them is
 PREVIEW-ONLY (toggle + threshold in the panel, default 10) — FINAL,
 `--offline`, and `--parity` always render unclamped ground truth, since
