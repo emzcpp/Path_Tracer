@@ -80,6 +80,7 @@ systematic bug visible at a glance.
 | `Tab` / `Shift+Tab` | cycle selection through the outliner |
 | `1` / `2` / `3` | gizmo mode: move / rotate / scale the selection |
 | `Backspace` | delete the selected object |
+| `V` | fast-nav: cycle Off / Solid / Wireframe raster preview |
 | `?` / `F1` | keyboard-shortcut overlay |
 | `Esc` / `Cmd-Q` | close overlay / quit |
 
@@ -87,6 +88,11 @@ The tool panel exposes live render settings (reconverging through the
 central reset hook), the selection readout, and scene Save/Load (JSON;
 geometry stored by reference — sphere parameters and a relative mesh path,
 never vertex data).
+
+Fast-nav (V) rasterizes the scene (flat-lit solid or wireframe) at full
+framerate while the camera moves — same camera matrices as the tracer, so
+it registers exactly — and hands back to path tracing on settle. The
+selected object always shows a wireframe overlay, in both modes.
 
 While the camera moves the renderer drops to a half-resolution preview;
 once you stop for ~150 ms it switches back to full resolution and

@@ -2,7 +2,9 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <vector>
 
 #include "gpu_renderer.h"
 #include "image.h"
@@ -65,6 +67,46 @@ id<MTLComputePipelineState> make_pipeline(id<MTLDevice> device,
     return pso;
 }
 
+// C++ mirror of the MSL RasterUniforms (float4x4 = 16 floats col-major).
+struct RasterUniformsGPU {
+    float vp[16];
+    float cam_pos[4];
+    std::uint32_t misc[4];
+};
+static_assert(sizeof(RasterUniformsGPU) == 96, "raster uniforms drifted");
+
+// c = a * b, column-major 4x4.
+void mat_mul4(const float* a, const float* b, float* c) {
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            float v = 0.0f;
+            for (int k = 0; k < 4; ++k) v += a[k * 4 + row] * b[col * 4 + k];
+            c[col * 4 + row] = v;
+        }
+    }
+}
+
+// Unit UV-sphere triangle list (positions only; the position IS the
+// normal on a unit sphere). Proxy geometry for the nav preview.
+std::vector<float> make_unit_sphere(int slices, int stacks) {
+    std::vector<float> v;
+    const float PI = 3.14159265358979f;
+    auto pt = [&](int sl, int st) {
+        const float phi = 2.0f * PI * float(sl) / float(slices);
+        const float theta = PI * float(st) / float(stacks);
+        v.push_back(std::sin(theta) * std::cos(phi));
+        v.push_back(std::cos(theta));
+        v.push_back(std::sin(theta) * std::sin(phi));
+    };
+    for (int st = 0; st < stacks; ++st) {
+        for (int sl = 0; sl < slices; ++sl) {
+            pt(sl, st);     pt(sl + 1, st);     pt(sl, st + 1);
+            pt(sl + 1, st); pt(sl + 1, st + 1); pt(sl, st + 1);
+        }
+    }
+    return v;
+}
+
 } // namespace
 
 struct GpuRenderer::Impl {
@@ -88,6 +130,15 @@ struct GpuRenderer::Impl {
     // a hardcoded 16x16=256, which would FAIL dispatch at runtime — pick
     // the threadgroup shape per pipeline at creation instead.
     MTLSize tg_accum, tg_resolve;
+
+    // Session E: raster nav preview. Preview-only — never touches accum.
+    id<MTLRenderPipelineState> raster_mesh_pso;
+    id<MTLRenderPipelineState> raster_sphere_pso;
+    id<MTLDepthStencilState> depth_less;
+    id<MTLDepthStencilState> depth_always;   // selection overlay
+    id<MTLTexture> raster_depth;
+    id<MTLBuffer> sphere_proxy;
+    int sphere_proxy_verts = 0;
     id<MTLCommandBuffer> last_cb;
     pt_uint sphere_count = 0;
     int w = 0, h = 0;        // current accumulation dims
@@ -134,6 +185,50 @@ struct GpuRenderer::Impl {
             threadsPerThreadgroup:tg_accum];
         [enc endEncoding];
         passes += count;
+    }
+
+    void ensure_raster_depth(id<MTLTexture> target) {
+        if (raster_depth && raster_depth.width == target.width &&
+            raster_depth.height == target.height)
+            return;
+        MTLTextureDescriptor* d = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                         width:target.width
+                                        height:target.height
+                                     mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget;
+        d.storageMode = MTLStorageModePrivate;
+        raster_depth = [device newTextureWithDescriptor:d];
+    }
+
+    // kind: 0 = whole scene, 1 = one sphere (index), 2 = mesh only.
+    void draw_raster(id<MTLRenderCommandEncoder> enc,
+                     const RasterUniformsGPU& u, bool wireframe, int kind,
+                     int index) {
+        [enc setTriangleFillMode:wireframe ? MTLTriangleFillModeLines
+                                           : MTLTriangleFillModeFill];
+        [enc setCullMode:MTLCullModeNone];
+        if ((kind == 0 || kind == 2) && mesh_u.has_mesh) {
+            [enc setRenderPipelineState:raster_mesh_pso];
+            [enc setVertexBuffer:tris offset:0 atIndex:0];
+            [enc setVertexBytes:&u length:sizeof u atIndex:1];
+            [enc setFragmentBytes:&u length:sizeof u atIndex:1];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                     vertexStart:0
+                     vertexCount:NSUInteger(mesh_u.tri_count) * 3];
+        }
+        if (kind == 0 || kind == 1) {
+            [enc setRenderPipelineState:raster_sphere_pso];
+            [enc setVertexBuffer:sphere_proxy offset:0 atIndex:0];
+            [enc setVertexBytes:&u length:sizeof u atIndex:1];
+            [enc setVertexBuffer:spheres offset:0 atIndex:2];
+            [enc setFragmentBytes:&u length:sizeof u atIndex:1];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                     vertexStart:0
+                     vertexCount:NSUInteger(sphere_proxy_verts)
+                   instanceCount:kind == 1 ? 1 : sphere_count
+                    baseInstance:kind == 1 ? NSUInteger(index) : 0];
+        }
     }
 
     id<MTLBuffer> upload(const void* data, size_t len) {
@@ -228,6 +323,29 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
     im.resolve_pso = make_pipeline(device, lib, @"resolve", error);
     if (!im.accumulate_pso || !im.resolve_pso) return nullptr;
 
+    // Raster nav-preview pipelines (color = drawable format, depth32).
+    const auto make_raster_pso = [&](NSString* vs_name,
+                                     std::string& e) -> id<MTLRenderPipelineState> {
+        id<MTLFunction> vs = [lib newFunctionWithName:vs_name];
+        id<MTLFunction> fs = [lib newFunctionWithName:@"raster_fs"];
+        if (!vs || !fs) {
+            e = "raster shader missing";
+            return nil;
+        }
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = vs;
+        d.fragmentFunction = fs;
+        d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        NSError* nserr = nil;
+        id<MTLRenderPipelineState> pso =
+            [device newRenderPipelineStateWithDescriptor:d error:&nserr];
+        if (!pso)
+            e = std::string("raster pipeline: ") +
+                (nserr ? nserr.localizedDescription.UTF8String : "?");
+        return pso;
+    };
+
     const auto pick_tg = [](id<MTLComputePipelineState> pso) {
         return pso.maxTotalThreadsPerThreadgroup >= 256
                    ? MTLSizeMake(16, 16, 1)
@@ -235,6 +353,27 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
     };
     im.tg_accum = pick_tg(im.accumulate_pso);
     im.tg_resolve = pick_tg(im.resolve_pso);
+
+    im.raster_mesh_pso = make_raster_pso(@"raster_mesh_vs", error);
+    im.raster_sphere_pso = make_raster_pso(@"raster_sphere_vs", error);
+    if (!im.raster_mesh_pso || !im.raster_sphere_pso) return nullptr;
+    {
+        MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionLess;
+        dd.depthWriteEnabled = YES;
+        im.depth_less = [device newDepthStencilStateWithDescriptor:dd];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = NO;
+        im.depth_always = [device newDepthStencilStateWithDescriptor:dd];
+    }
+    {
+        const std::vector<float> proxy = make_unit_sphere(24, 16);
+        im.sphere_proxy =
+            [device newBufferWithBytes:proxy.data()
+                                length:proxy.size() * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+        im.sphere_proxy_verts = int(proxy.size() / 3);
+    }
 
     im.accum = [device
         newBufferWithLength:size_t(settings.width) * settings.height *
@@ -310,9 +449,70 @@ bool GpuRenderer::save_png(const std::string& path) const {
     return img.write_png(path);
 }
 
+namespace {
+RasterUniformsGPU raster_uniforms(const GpuRenderer::RasterParams& p,
+                                  bool overlay_tint) {
+    RasterUniformsGPU u{};
+    mat_mul4(p.proj, p.view, u.vp);
+    u.cam_pos[0] = p.cam_pos[0];
+    u.cam_pos[1] = p.cam_pos[1];
+    u.cam_pos[2] = p.cam_pos[2];
+    u.cam_pos[3] = 1.0f;
+    u.misc[0] = overlay_tint ? 1u : 0u;
+    return u;
+}
+} // namespace
+
+void GpuRenderer::encode_raster_frame(const RasterParams& params, void* layer,
+                                      std::function<void()> on_complete,
+                                      const UiEncoder& ui) {
+    CAMetalLayer* metal_layer = (__bridge CAMetalLayer*)layer;
+    id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = [metal_layer nextDrawable];
+        if (drawable) {
+            impl_->ensure_raster_depth(drawable.texture);
+            MTLRenderPassDescriptor* rpd =
+                [MTLRenderPassDescriptor renderPassDescriptor];
+            rpd.colorAttachments[0].texture = drawable.texture;
+            rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rpd.colorAttachments[0].clearColor =
+                MTLClearColorMake(0.16, 0.17, 0.20, 1.0);
+            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+            rpd.depthAttachment.texture = impl_->raster_depth;
+            rpd.depthAttachment.loadAction = MTLLoadActionClear;
+            rpd.depthAttachment.clearDepth = 1.0;
+            rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+
+            id<MTLRenderCommandEncoder> enc =
+                [cb renderCommandEncoderWithDescriptor:rpd];
+            [enc setDepthStencilState:impl_->depth_less];
+            const RasterUniformsGPU u = raster_uniforms(params, false);
+            impl_->draw_raster(enc, u, params.wireframe, 0, 0);
+            // Selection stays visible while navigating too.
+            if (params.overlay_kind != 0) {
+                [enc setDepthStencilState:impl_->depth_always];
+                const RasterUniformsGPU ou = raster_uniforms(params, true);
+                impl_->draw_raster(enc, ou, true, params.overlay_kind,
+                                   params.overlay_index);
+            }
+            [enc endEncoding];
+
+            if (ui) ui((__bridge void*)cb, (__bridge void*)drawable.texture);
+            [cb presentDrawable:drawable];
+        }
+    }
+    if (on_complete) {
+        [cb addCompletedHandler:^(id<MTLCommandBuffer>) { on_complete(); }];
+    }
+    [cb commit];
+    impl_->last_cb = cb;
+}
+
 void GpuRenderer::encode_frame(const GPUCamera& cam, int count, void* layer,
                                std::function<void()> on_complete,
-                               const UiEncoder& ui) {
+                               const UiEncoder& ui,
+                               const RasterParams* overlay) {
     CAMetalLayer* metal_layer = (__bridge CAMetalLayer*)layer;
     id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
     impl_->encode_clear_if_needed(cb);
@@ -325,6 +525,25 @@ void GpuRenderer::encode_frame(const GPUCamera& cam, int count, void* layer,
         id<CAMetalDrawable> drawable = [metal_layer nextDrawable];
         if (drawable) {
             impl_->encode_resolve(cb, drawable.texture);
+            if (overlay && overlay->overlay_kind != 0) {
+                impl_->ensure_raster_depth(drawable.texture);
+                MTLRenderPassDescriptor* rpd =
+                    [MTLRenderPassDescriptor renderPassDescriptor];
+                rpd.colorAttachments[0].texture = drawable.texture;
+                rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rpd.depthAttachment.texture = impl_->raster_depth;
+                rpd.depthAttachment.loadAction = MTLLoadActionClear;
+                rpd.depthAttachment.clearDepth = 1.0;
+                rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+                id<MTLRenderCommandEncoder> enc =
+                    [cb renderCommandEncoderWithDescriptor:rpd];
+                [enc setDepthStencilState:impl_->depth_always];
+                const RasterUniformsGPU ou = raster_uniforms(*overlay, true);
+                impl_->draw_raster(enc, ou, true, overlay->overlay_kind,
+                                   overlay->overlay_index);
+                [enc endEncoding];
+            }
             if (ui) ui((__bridge void*)cb, (__bridge void*)drawable.texture);
             [cb presentDrawable:drawable];
         }

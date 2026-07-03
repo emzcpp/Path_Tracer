@@ -60,15 +60,37 @@ public:
     using UiEncoder = std::function<void(void* command_buffer,
                                          void* target_texture)>;
 
+    // Session E: raster navigation preview + selection overlay.
+    struct RasterParams {
+        float view[16];          // the SAME matrices ImGuizmo uses —
+        float proj[16];          // verified vs get_ray to ~1e-6
+        float cam_pos[3];
+        bool wireframe = false;
+        // Selection overlay: 0 = none, 1 = sphere (overlay_index), 2 = mesh.
+        int overlay_kind = 0;
+        int overlay_index = 0;
+    };
+
     // Viewer path: encode [clear if pending +] `count` passes + resolve
     // into the CAMetalLayer's next drawable + present. `count` may be 0:
     // a present-only frame (resolve + UI) that keeps the overlay live
     // while accumulation is parked. Non-blocking; on_complete fires on an
     // arbitrary thread when the GPU finishes. `layer` is a CAMetalLayer*
-    // passed as void* to keep this header ObjC-free.
+    // passed as void* to keep this header ObjC-free. When `overlay` is
+    // non-null, the selected object's wireframe is drawn over the traced
+    // image (registration guaranteed: same camera matrices).
     void encode_frame(const GPUCamera& cam, int count, void* layer,
                       std::function<void()> on_complete,
-                      const UiEncoder& ui = {});
+                      const UiEncoder& ui = {},
+                      const RasterParams* overlay = nullptr);
+
+    // Fast-nav: a rasterized preview frame INSTEAD of tracing — used while
+    // the camera moves so navigation stays at full framerate. Never touches
+    // the accumulation buffer; the tracer reconverges on settle via the
+    // existing generation/reset machinery.
+    void encode_raster_frame(const RasterParams& params, void* layer,
+                             std::function<void()> on_complete,
+                             const UiEncoder& ui = {});
 
     // Live-tunable from the UI (the renderer holds its own settings copy).
     void set_max_depth(int depth);

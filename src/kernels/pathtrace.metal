@@ -633,3 +633,85 @@ kernel void resolve(device const float4* accum         [[buffer(0)]],
     float3 c = pow(fmax(sum.xyz * inv_n, 0.0f), float3(1.0f / 2.2f));
     out.write(float4(saturate(c), 1.0f), gid);
 }
+
+
+// ================= Session E: raster navigation preview =================
+// Preview-only pipeline for fast navigation. Deliberately independent of
+// the tracing kernels above: it reads the SAME GPUTriangle/GPUSphere
+// buffers the tracer consumes (no duplicated geometry) but never touches
+// the accumulation buffer or the resolve path, so tracing correctness and
+// parity are structurally unaffected.
+
+struct RasterUniforms {          // mirrored in gpu_renderer.mm
+    float4x4 vp;                 // GL-style clip; z remapped below
+    float4 cam_pos;              // xyz = camera position (headlight)
+    uint4 misc;                  // x: 1 = overlay tint
+};
+
+struct RasterOut {
+    float4 pos [[position]];
+    float3 world;
+    float3 normal;
+    float3 albedo;
+};
+
+// GL clip -> Metal NDC depth ([-w,w] -> [0,w]); x/y untouched so the
+// preview registers with the traced image to sub-pixel.
+inline float4 to_metal_clip(float4 clip) {
+    clip.z = (clip.z + clip.w) * 0.5f;
+    return clip;
+}
+
+// Meshes: fetch straight from the tracer's triangle records.
+vertex RasterOut raster_mesh_vs(uint vid [[vertex_id]],
+                                device const GPUTriangle* tris [[buffer(0)]],
+                                constant RasterUniforms& U [[buffer(1)]]) {
+    const uint t = vid / 3u;
+    const uint c = vid % 3u;
+    const GPUTriangle T = tris[t];
+    float3 p = c3(T.p0);
+    if (c == 1u) p += c3(T.e1);
+    if (c == 2u) p += c3(T.e2);
+    const float3 n = c == 0u ? c3(T.n0) : (c == 1u ? c3(T.n1) : c3(T.n2));
+
+    RasterOut o;
+    o.pos = to_metal_clip(U.vp * float4(p, 1.0f));
+    o.world = p;
+    o.normal = n;
+    o.albedo = float3(0.72f);   // neutral read of form; nav aid, not beauty
+    return o;
+}
+
+// Spheres: one unit-sphere proxy, instanced over the tracer's sphere
+// buffer (center + radius + color per instance).
+vertex RasterOut raster_sphere_vs(uint vid [[vertex_id]],
+                                  uint iid [[instance_id]],
+                                  device const float* unit [[buffer(0)]],
+                                  constant RasterUniforms& U [[buffer(1)]],
+                                  constant GPUSphere* spheres [[buffer(2)]]) {
+    const float3 up = float3(unit[vid * 3u], unit[vid * 3u + 1u],
+                             unit[vid * 3u + 2u]);
+    constant GPUSphere& s = spheres[iid];
+    const float3 p = c3(s.center) + s.radius * up;
+
+    RasterOut o;
+    o.pos = to_metal_clip(U.vp * float4(p, 1.0f));
+    o.world = p;
+    o.normal = up;
+    // Emissive spheres read as bright so lights stay identifiable.
+    const float3 e = c3(s.emission);
+    o.albedo = c3(s.base_color) + min(float3(1.0f), e);
+    return o;
+}
+
+fragment float4 raster_fs(RasterOut in [[stage_in]],
+                          constant RasterUniforms& U [[buffer(1)]]) {
+    if (U.misc.x == 1u) {
+        return float4(1.0f, 0.55f, 0.1f, 1.0f);   // selection overlay tint
+    }
+    const float3 L = normalize(U.cam_pos.xyz - in.world);
+    const float ndl = fmax(0.25f, fabs(dot(normalize(in.normal), L)));
+    // Same display gamma as the traced path so brightness feels consistent.
+    const float3 c = pow(in.albedo * ndl, float3(1.0f / 2.2f));
+    return float4(saturate(c), 1.0f);
+}

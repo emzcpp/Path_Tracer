@@ -100,6 +100,11 @@ struct ViewerCore {
     bool snap_enabled = false;
     float snap_translate = 0.5f, snap_rotate_deg = 15.0f, snap_scale = 0.1f;
 
+    // Session E: fast-nav raster preview. 0 = off, 1 = solid, 2 = wire.
+    // Auto-handoff by design: raster only while the camera moves, traced
+    // when still (the settle machinery already reconverges on handback).
+    int fastnav = 0;
+
     // Phase 5.2 viewport/render QoL (main-thread only).
     float interactive_scale = 1.0f;    // interactive-mode resolution scale
     bool paused = false;               // freeze accumulation (UI stays live)
@@ -830,6 +835,15 @@ void render_thread_main(ViewerCore& core) {
         frame_selected(*self.core);
         return;
     }
+    if (event.keyCode == 9) {    // V — cycle fast-nav: off / solid / wire
+        if (self.core->use_gpu) {
+            self.core->fastnav = (self.core->fastnav + 1) % 3;
+            const char* names[3] = {"off", "solid", "wireframe"};
+            std::printf("fast-nav: %s\n", names[self.core->fastnav]);
+            std::fflush(stdout);
+        }
+        return;
+    }
     if (event.keyCode == 48) {   // Tab / Shift+Tab — cycle selection
         cycle_selection(*self.core, shift);
         return;
@@ -1205,24 +1219,58 @@ void render_thread_main(ViewerCore& core) {
     const int target = final_mode ? core_->settings.final_target_spp
                                   : (moving ? INT_MAX
                                             : core_->settings.max_accum_passes);
+    // Session E: shared camera/selection params for the raster preview and
+    // the selection overlay — the SAME matrices ImGuizmo uses, so both
+    // register with the traced image to sub-pixel.
+    GpuRenderer::RasterParams rp{};
+    mat_look_at(core_->fly.pos, core_->fly.pos + core_->fly.forward(),
+                vec3(0.0f, 1.0f, 0.0f), rp.view);
+    mat_perspective(core_->settings.vfov_deg, core_->settings.aspect(), 0.1f,
+                    500.0f, rp.proj);
+    rp.cam_pos[0] = core_->fly.pos.x;
+    rp.cam_pos[1] = core_->fly.pos.y;
+    rp.cam_pos[2] = core_->fly.pos.z;
+    rp.wireframe = core_->fastnav == 2;
+    if (!final_mode) {
+        if (core_->selection.kind == Selection::Kind::Sphere) {
+            rp.overlay_kind = 1;
+            rp.overlay_index = core_->selection.index;
+        } else if (core_->selection.kind == Selection::Kind::Mesh) {
+            rp.overlay_kind = 2;
+        }
+    }
+    const bool nav_active =
+        core_->fastnav != 0 && moving && !final_mode && !core_->paused;
+
     // Encode every tick — with 0 passes once converged or while paused —
     // so the UI overlay stays live and responsive. A 0-pass frame is just
-    // resolve + UI: trivial GPU cost.
+    // resolve + UI: trivial GPU cost. While fast-nav is active and the
+    // camera moves, a rasterized frame replaces tracing entirely; movement
+    // keeps bumping the generation, so on settle the tracer reconverges
+    // from the current pose through the normal reset machinery.
     if (dispatch_semaphore_wait(gpuInflight_, DISPATCH_TIME_NOW) == 0) {
-        int k = 0;
-        if (gpu.passes() < target && !core_->paused) {
-            k = moving ? core_->settings.gpu_passes_per_tick_preview
-                       : core_->settings.gpu_passes_per_tick;
-            if (target != INT_MAX) k = std::min(k, target - gpu.passes());
-        }
-        const Camera cam = core_->fly.make_camera(core_->settings.vfov_deg,
-                                                  core_->settings.aspect());
         dispatch_semaphore_t sem = gpuInflight_;
-        gpu.encode_frame(to_gpu_camera(cam), k, (__bridge void*)metalLayer_,
-                         [sem] { dispatch_semaphore_signal(sem); },
-                         [self](void* cb, void* tex) {
-                             [self encodeUIOn:cb texture:tex];
-                         });
+        const auto ui_enc = [self](void* cb, void* tex) {
+            [self encodeUIOn:cb texture:tex];
+        };
+        if (nav_active) {
+            gpu.encode_raster_frame(rp, (__bridge void*)metalLayer_,
+                                    [sem] { dispatch_semaphore_signal(sem); },
+                                    ui_enc);
+        } else {
+            int k = 0;
+            if (gpu.passes() < target && !core_->paused) {
+                k = moving ? core_->settings.gpu_passes_per_tick_preview
+                           : core_->settings.gpu_passes_per_tick;
+                if (target != INT_MAX) k = std::min(k, target - gpu.passes());
+            }
+            const Camera cam = core_->fly.make_camera(
+                core_->settings.vfov_deg, core_->settings.aspect());
+            gpu.encode_frame(to_gpu_camera(cam), k,
+                             (__bridge void*)metalLayer_,
+                             [sem] { dispatch_semaphore_signal(sem); }, ui_enc,
+                             rp.overlay_kind != 0 ? &rp : nullptr);
+        }
     }
 
     // FINAL mode: export once when the target is reached (save_png waits
@@ -1593,6 +1641,16 @@ void render_thread_main(ViewerCore& core) {
     ImGui::TextDisabled("F frames selection · shift sprints");
 
     ImGui::SeparatorText("Render");
+    ImGui::Text("Fast nav (V):");
+    ImGui::SameLine();
+    ImGui::RadioButton("Off", &core_->fastnav, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Solid", &core_->fastnav, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("Wire", &core_->fastnav, 2);
+    if (core_->fastnav != 0) {
+        ImGui::TextDisabled("rasterized while moving; traces on settle");
+    }
     if (ImGui::SliderFloat("resolution", &core_->interactive_scale, 0.25f,
                            4.0f, "%.2fx")) {
         core_->interactive_scale =
@@ -1676,8 +1734,9 @@ void render_thread_main(ViewerCore& core) {
                      ImGuiWindowFlags_NoFocusOnAppearing |
                      ImGuiWindowFlags_NoBringToFrontOnFocus |
                      ImGuiWindowFlags_NoNav);
-    ImGui::Text("%s  |  %.0f fps  |  %d spp%s  |  %s",
-                core_->final_mode ? "FINAL" : "Interactive", io.Framerate,
+    ImGui::Text("%s%s  |  %.0f fps  |  %d spp%s  |  %s",
+                core_->final_mode ? "FINAL" : "Interactive",
+                core_->fastnav != 0 ? " [nav]" : "", io.Framerate,
                 core_->gpu ? core_->gpu->passes() : 0,
                 core_->paused ? " (paused)" : "",
                 display_name(*core_, core_->selection).c_str());
