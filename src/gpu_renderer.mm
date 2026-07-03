@@ -260,7 +260,7 @@ struct GpuRenderer::Impl {
                      vertexStart:0
                      vertexCount:NSUInteger(mesh_u.tri_count) * 3];
         }
-        if (kind == 0 || kind == 1) {
+        if ((kind == 0 || kind == 1) && sphere_count > 0) {
             [enc setRenderPipelineState:raster_sphere_pso];
             [enc setVertexBuffer:sphere_proxy offset:0 atIndex:0];
             [enc setVertexBytes:&u length:sizeof u atIndex:1];
@@ -443,9 +443,10 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
         newBufferWithLength:size_t(settings.width) * settings.height *
                             sizeof(float) * 4
                     options:MTLResourceStorageModeShared];
-    im.spheres = [device newBufferWithBytes:spheres.data()
-                                     length:spheres.size() * sizeof(GPUSphere)
-                                    options:MTLResourceStorageModeShared];
+    // Guarded like update_spheres: --only-model scenes have no spheres,
+    // and a zero-length newBufferWithBytes returns NIL (unbound buffer(1)).
+    im.spheres = im.upload(spheres.empty() ? nullptr : spheres.data(),
+                           spheres.size() * sizeof(GPUSphere));
     im.sphere_count = pt_uint(spheres.size());
 
     im.upload_mesh(mesh);
@@ -714,10 +715,12 @@ void GpuRenderer::set_env_nee(bool on) {
 }
 
 void GpuRenderer::update_spheres(const std::vector<GPUSphere>& spheres) {
-    impl_->spheres =
-        [impl_->device newBufferWithBytes:spheres.data()
-                                   length:spheres.size() * sizeof(GPUSphere)
-                                  options:MTLResourceStorageModeShared];
+    // upload() guards the empty case (--only-model scenes): a zero-length
+    // newBufferWithBytes returns NIL, which would leave the kernel's
+    // declared buffer(1) unbound.
+    impl_->spheres = impl_->upload(
+        spheres.empty() ? nullptr : spheres.data(),
+        spheres.size() * sizeof(GPUSphere));
     impl_->sphere_count = pt_uint(spheres.size());
 }
 

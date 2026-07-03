@@ -40,6 +40,8 @@ metallic-roughness BSDF, including tangent-space normal mapping; baseColor
 and emissive textures are sRGB-decoded to linear at load, while
 metallicRoughness and normal maps stay linear.
 
+Meshes are multi-material (Session I): every glTF material's texture set is loaded (shared images decoded once), each triangle carries a material index (permuted with the BVH, including through gizmo re-bakes), and the Metal kernel reaches all texture sets through a bindless argument-buffer table of Metal-3 gpuAddress pointers — same raw ushort buffers, same hand-matched bilinear filtering, no hardware samplers, residency via useResource. Building-scale assets work via --model-height / --model-yaw / --only-model (e.g. Sponza: 262k triangles, 25 materials, ~576 MB of decoded ushort4 textures on unified memory). Known limitation: alphaMode MASK cutouts (Sponza foliage) render opaque.
+
 What the import pipeline does: bakes the node transform + placement into
 world-space triangles at load, decodes textures to linear ushort4 (sRGB via
 pure pow-2.2, matching the display encode), builds a midpoint-split BVH

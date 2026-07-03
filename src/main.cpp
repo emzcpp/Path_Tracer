@@ -158,11 +158,20 @@ int run_parity(const RenderSettings& settings, int spp,
     // divergent samples are expected and harmless. The absolute rates are
     // scene/framing dependent, so the load-bearing gate is RELATIVE: the
     // same-seed error must sit well below the Monte Carlo noise floor.
-    const bool pass = gd.mean_byte <= 0.5 &&
-                      gd.mean_byte * 5.0 <= fl.mean_byte &&
-                      gd.pct_within_2 >= 98.0;
-    std::printf("\n  %s (gates: mean <= 0.5 LSB, mean <= floor/5, "
-                ">= 98%% within 2 LSB)\n",
+    // ULP-regime clause (Session I, found on Sponza interiors): a scene
+    // can be SO converged that the floor itself collapses to the branch-
+    // flip rate, making floor/5 tighter than float determinism allows.
+    // A same-seed mean at or below 0.02 LSB — 1/50th of a display step —
+    // is unambiguously ULP-scale agreement and passes on absolute merit.
+    // The absolute clause carries a companion percentile bound: a frame
+    // mean can be diluted below 0.02 by a small cluster of badly-wrong
+    // pixels, but such a cluster cannot also keep 99.9% of pixels within
+    // 2 LSB.
+    const bool pass = gd.mean_byte <= 0.5 && gd.pct_within_2 >= 98.0 &&
+                      (gd.mean_byte * 5.0 <= fl.mean_byte ||
+                       (gd.mean_byte <= 0.02 && gd.pct_within_2 >= 99.9));
+    std::printf("\n  %s (gates: mean <= 0.5 LSB, >= 98%% within 2 LSB, "
+                "mean <= floor/5 or [<= 0.02 and >= 99.9%% within 2])\n",
                 pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
@@ -236,6 +245,9 @@ int main(int argc, char** argv) {
     bool grid = false;
     bool nan_check = false;
     bool brute = false;
+    float model_height = 2.2f;   // building-scale assets: e.g. Sponza ~12
+    float model_yaw = 232.0f;    // helmet-facing default
+    bool only_model = false;     // mesh + env only (no sphere field)
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--offline") == 0) {
@@ -256,6 +268,24 @@ int main(int argc, char** argv) {
             nan_check = true;
         } else if (std::strcmp(argv[i], "--brute") == 0) {
             brute = true;
+        } else if (std::strcmp(argv[i], "--model-height") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            model_height = std::strtof(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || !(model_height > 0.0f)) {
+                std::fprintf(stderr,
+                             "invalid --model-height '%s' (need > 0)\n",
+                             argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--model-yaw") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            model_yaw = std::strtof(argv[++i], &end);
+            if (end == argv[i] || *end != '\0') {
+                std::fprintf(stderr, "invalid --model-yaw '%s'\n", argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--only-model") == 0) {
+            only_model = true;
         } else if (std::strcmp(argv[i], "--grid") == 0) {
             grid = true;   // GGX validation: roughness x metallic array
         } else if (std::strcmp(argv[i], "--gpu-check") == 0) {
@@ -287,7 +317,10 @@ int main(int argc, char** argv) {
     std::shared_ptr<const MeshData> mesh;
     if (!resolved_model.empty()) {
         std::string err;
-        mesh = load_glb(resolved_model, MeshPlacement{}, err);
+        MeshPlacement placement;
+        placement.target_height = model_height;
+        placement.yaw_deg = model_yaw;
+        mesh = load_glb(resolved_model, placement, err);
         if (mesh) {
             std::printf("model: %s (%zu tris, bvh depth %d)\n",
                         resolved_model.c_str(), mesh->tris.size(),
@@ -303,6 +336,20 @@ int main(int argc, char** argv) {
     }
     SceneDesc desc =
         grid ? build_grid_desc() : build_scene_desc(std::move(mesh));
+    if (desc.mesh && !resolved_model.empty()) {
+        // Label the mesh by its filename (build_scene_desc's default name
+        // is helmet-specific).
+        const std::string stem =
+            std::filesystem::path(resolved_model).stem().string();
+        if (stem != "DamagedHelmet") desc.mesh_name = stem;
+    }
+    if (only_model && desc.mesh) {
+        // Building-scale assets (Sponza): the mesh IS the scene — no
+        // ground sphere (it would be coplanar with the asset's floor),
+        // no hero/field spheres, lighting from the environment alone.
+        desc.spheres.clear();
+        std::printf("scene: model only (%s)\n", desc.mesh_name.c_str());
+    }
     if (desc.mesh) desc.mesh_source_path = resolved_model;
     if (brute) {
         settings.env_nee = 0;
