@@ -203,9 +203,13 @@ int run_mesh_info(const std::string& path) {
                 mesh->tris.size(), i.vert_count, i.index_count);
     std::printf("uv range:   u [%.4f, %.4f]  v [%.4f, %.4f]\n", i.uv_min[0],
                 i.uv_max[0], i.uv_min[1], i.uv_max[1]);
-    std::printf("textures:   base %dx%d  mr %dx%d  emissive %dx%d\n",
-                mesh->base.w, mesh->base.h, mesh->mr.w, mesh->mr.h,
-                mesh->emissive.w, mesh->emissive.h);
+    std::printf("materials:  %zu (%.1f MB decoded ushort4 textures)\n",
+                i.material_count,
+                double(i.texture_bytes) / (1024.0 * 1024.0));
+    std::printf("textures:   base %dx%d  mr %dx%d  emissive %dx%d (mat 0)\n",
+                mesh->materials[0].base.w, mesh->materials[0].base.h,
+                mesh->materials[0].mr.w, mesh->materials[0].mr.h,
+                mesh->materials[0].emissive.w, mesh->materials[0].emissive.h);
     std::printf("mesh bbox:  (%.3f %.3f %.3f) .. (%.3f %.3f %.3f)\n",
                 i.pre_min[0], i.pre_min[1], i.pre_min[2], i.pre_max[0],
                 i.pre_max[1], i.pre_max[2]);

@@ -32,18 +32,31 @@ struct MeshPlacement {
     float yaw_deg = 232.0f;
 };
 
-struct MeshData {
-    std::vector<GPUTriangle> tris;   // world space, BVH leaf order
-    std::vector<BVHNode> nodes;
+// Session I: one glTF material's texture set. Every channel keeps the
+// established color-space rules (base/emissive sRGB-decoded at load via
+// pure pow-2.2; mr and normal LINEAR, untouched) and factor baking.
+struct MeshMaterial {
     Texture16 base;       // linear (sRGB-decoded), factors baked in
     Texture16 mr;         // linear: G = roughness, B = metallic
     Texture16 emissive;   // linear (sRGB-decoded), emissiveFactor baked in
     Texture16 normal;     // LINEAR tangent-space normal map (never sRGB)
+};
+
+struct MeshData {
+    std::vector<GPUTriangle> tris;   // world space, BVH leaf order
+    std::vector<BVHNode> nodes;
+    // Session I (multi-material): flat material table + a per-triangle
+    // index into it, kept in BVH LEAF ORDER alongside tris (build_bvh
+    // permutes both together — including on every gizmo re-bake).
+    std::vector<MeshMaterial> materials;
+    std::vector<std::uint32_t> tri_mat;
     float emissive_scale = 1.0f;   // user knob on top of the baked factor
 
     struct Info {           // --mesh-info diagnostics
         std::size_t vert_count = 0;
         std::size_t index_count = 0;
+        std::size_t material_count = 0;
+        std::size_t texture_bytes = 0;   // decoded ushort4 payload
         float uv_min[2]{}, uv_max[2]{};
         float pre_min[3]{}, pre_max[3]{};     // mesh space
         float post_min[3]{}, post_max[3]{};   // world space, after placement

@@ -122,6 +122,7 @@ struct GpuRenderer::Impl {
     // declared kernel argument to be bound even if never dereferenced).
     id<MTLBuffer> bvh_nodes;
     id<MTLBuffer> tris;
+    id<MTLBuffer> tri_mat;   // per-triangle material id, leaf order
     id<MTLBuffer> tex_base;
     id<MTLBuffer> tex_mr;
     id<MTLBuffer> tex_emis;
@@ -285,6 +286,7 @@ struct GpuRenderer::Impl {
         if (!mesh) {
             bvh_nodes = upload(nullptr, 0);
             tris = upload(nullptr, 0);
+            tri_mat = upload(nullptr, 0);
             tex_base = upload(nullptr, 0);
             tex_mr = upload(nullptr, 0);
             tex_emis = upload(nullptr, 0);
@@ -295,25 +297,30 @@ struct GpuRenderer::Impl {
                            mesh->nodes.size() * sizeof(BVHNode));
         tris = upload(mesh->tris.data(),
                       mesh->tris.size() * sizeof(GPUTriangle));
-        tex_base = upload(mesh->base.texels.data(),
-                          mesh->base.texels.size() * sizeof(std::uint16_t));
-        tex_mr = upload(mesh->mr.texels.data(),
-                        mesh->mr.texels.size() * sizeof(std::uint16_t));
-        tex_emis = upload(mesh->emissive.texels.data(),
-                          mesh->emissive.texels.size() * sizeof(std::uint16_t));
-        tex_norm = upload(mesh->normal.texels.data(),
-                          mesh->normal.texels.size() * sizeof(std::uint16_t));
+        tri_mat = upload(mesh->tri_mat.data(),
+                         mesh->tri_mat.size() * sizeof(std::uint32_t));
+        // Stage 1 interim: bind materials[0] through the legacy single-set
+        // path; Stage 2 replaces this with the bindless material table.
+        const MeshMaterial& m0 = mesh->materials[0];
+        tex_base = upload(m0.base.texels.data(),
+                          m0.base.texels.size() * sizeof(std::uint16_t));
+        tex_mr = upload(m0.mr.texels.data(),
+                        m0.mr.texels.size() * sizeof(std::uint16_t));
+        tex_emis = upload(m0.emissive.texels.data(),
+                          m0.emissive.texels.size() * sizeof(std::uint16_t));
+        tex_norm = upload(m0.normal.texels.data(),
+                          m0.normal.texels.size() * sizeof(std::uint16_t));
         mesh_u.has_mesh = 1;
         mesh_u.tri_count = pt_uint(mesh->tris.size());
         mesh_u.node_count = pt_uint(mesh->nodes.size());
-        mesh_u.base_w = pt_uint(mesh->base.w);
-        mesh_u.base_h = pt_uint(mesh->base.h);
-        mesh_u.mr_w = pt_uint(mesh->mr.w);
-        mesh_u.mr_h = pt_uint(mesh->mr.h);
-        mesh_u.emis_w = pt_uint(mesh->emissive.w);
-        mesh_u.emis_h = pt_uint(mesh->emissive.h);
-        mesh_u.norm_w = pt_uint(mesh->normal.w);
-        mesh_u.norm_h = pt_uint(mesh->normal.h);
+        mesh_u.base_w = pt_uint(m0.base.w);
+        mesh_u.base_h = pt_uint(m0.base.h);
+        mesh_u.mr_w = pt_uint(m0.mr.w);
+        mesh_u.mr_h = pt_uint(m0.mr.h);
+        mesh_u.emis_w = pt_uint(m0.emissive.w);
+        mesh_u.emis_h = pt_uint(m0.emissive.h);
+        mesh_u.norm_w = pt_uint(m0.normal.w);
+        mesh_u.norm_h = pt_uint(m0.normal.h);
         mesh_u.emissive_scale = mesh->emissive_scale;
     }
 
@@ -695,7 +702,10 @@ void GpuRenderer::update_spheres(const std::vector<GPUSphere>& spheres) {
 }
 
 void GpuRenderer::update_mesh_geometry(const std::vector<GPUTriangle>& tris,
-                                       const std::vector<BVHNode>& nodes) {
+                                       const std::vector<BVHNode>& nodes,
+                                       const std::vector<pt_uint>& tri_mat) {
+    impl_->tri_mat = impl_->upload(tri_mat.data(),
+                                   tri_mat.size() * sizeof(pt_uint));
     impl_->tris =
         [impl_->device newBufferWithBytes:tris.data()
                                    length:tris.size() * sizeof(GPUTriangle)

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <vector>
 
 #include "vec3.h"
@@ -61,8 +62,19 @@ struct Assembled {
     std::vector<float> tan_w;
     std::vector<float> uv;               // 2 per vertex
     std::vector<std::uint32_t> idx;
+    // Session I: per-TRIANGLE material index into `mats` (the unique-
+    // material registry; nullptr = glTF default material).
+    std::vector<std::uint32_t> tri_mat;
+    std::vector<const cgltf_material*> mats;
     bool any_tangents = false;
 };
+
+std::uint32_t register_material(Assembled& a, const cgltf_material* m) {
+    for (std::size_t i = 0; i < a.mats.size(); ++i)
+        if (a.mats[i] == m) return std::uint32_t(i);
+    a.mats.push_back(m);
+    return std::uint32_t(a.mats.size() - 1);
+}
 
 bool read_attr(const cgltf_attribute& attr, int comps,
                std::vector<float>& out) {
@@ -120,9 +132,13 @@ void append_primitive(const cgltf_primitive& prim, const float* world,
     }
     if (has_tan) out.any_tangents = true;
 
+    const std::uint32_t mat = register_material(out, prim.material);
     for (cgltf_size i = 0; i < prim.indices->count; ++i) {
         out.idx.push_back(
             vbase + std::uint32_t(cgltf_accessor_read_index(prim.indices, i)));
+    }
+    for (cgltf_size t = 0; t < prim.indices->count / 3; ++t) {
+        out.tri_mat.push_back(mat);
     }
 }
 
@@ -180,10 +196,22 @@ void compute_tangents(Assembled& a) {
     }
 }
 
-Texture16 decode_image(const cgltf_image* image, const std::string& glb_dir,
-                       bool srgb, const float factor[3]) {
-    Texture16 empty;
-    if (!image) return empty;
+Texture16 solid_texel(float r, float g, float b);
+
+// Decoded 8-bit image, cached by cgltf_image* — materials frequently
+// share images (Sponza), and the JPEG/PNG decode is the expensive part;
+// the per-material sRGB/factor bake below is cheap.
+struct Rgb8 {
+    int w = 0, h = 0;
+    std::vector<unsigned char> px;   // RGB
+};
+using ImageCache = std::map<const cgltf_image*, Rgb8>;
+
+const Rgb8& decode_rgb8(const cgltf_image* image, const std::string& glb_dir,
+                        ImageCache& cache) {
+    auto it = cache.find(image);
+    if (it != cache.end()) return it->second;
+    Rgb8& out = cache[image];
 
     int w = 0, h = 0, n = 0;
     unsigned char* rgb = nullptr;
@@ -197,17 +225,80 @@ Texture16 decode_image(const cgltf_image* image, const std::string& glb_dir,
         const std::string p = glb_dir + "/" + image->uri;
         rgb = stbi_load(p.c_str(), &w, &h, &n, 3);
     }
-    if (!rgb) return empty;
-    Texture16 t = texture_from_rgb8(rgb, w, h, srgb);
-    stbi_image_free(rgb);
+    if (rgb) {
+        out.w = w;
+        out.h = h;
+        out.px.assign(rgb, rgb + std::size_t(w) * h * 3);
+        stbi_image_free(rgb);
+    }
+    return out;
+}
+
+Texture16 decode_image(const cgltf_image* image, const std::string& glb_dir,
+                       bool srgb, const float factor[3], ImageCache& cache) {
+    Texture16 empty;
+    if (!image) return empty;
+    const Rgb8& rgb = decode_rgb8(image, glb_dir, cache);
+    if (rgb.px.empty()) return empty;
+    Texture16 t = texture_from_rgb8(rgb.px.data(), rgb.w, rgb.h, srgb);
 
     if (factor[0] != 1.0f || factor[1] != 1.0f || factor[2] != 1.0f) {
-        for (std::size_t i = 0, count = std::size_t(w) * h; i < count; ++i)
+        for (std::size_t i = 0, count = std::size_t(rgb.w) * rgb.h; i < count;
+             ++i)
             for (int c = 0; c < 3; ++c)
                 t.texels[i * 4 + c] = std::uint16_t(
                     std::lrintf(t.texels[i * 4 + c] * factor[c]));
     }
     return t;
+}
+
+// One glTF material -> one MeshMaterial, existing color-space/factor
+// rules per channel; missing textures become 1x1 factor texels.
+MeshMaterial bake_material(const cgltf_material* mat,
+                           const std::string& glb_dir, ImageCache& cache) {
+    MeshMaterial out;
+    if (!mat) {
+        out.base = solid_texel(0.8f, 0.8f, 0.8f);
+        out.mr = solid_texel(1.0f, 0.9f, 0.0f);
+        return out;
+    }
+    const auto& pbr = mat->pbr_metallic_roughness;
+    const float base_f[3] = {pbr.base_color_factor[0],
+                             pbr.base_color_factor[1],
+                             pbr.base_color_factor[2]};
+    out.base = decode_image(
+        pbr.base_color_texture.texture ? pbr.base_color_texture.texture->image
+                                       : nullptr,
+        glb_dir, /*srgb=*/true, base_f, cache);
+    if (!out.base.valid())
+        out.base = solid_texel(base_f[0], base_f[1], base_f[2]);
+
+    // glTF: G = roughness x factor, B = metallic x factor. LINEAR data.
+    const float mr_f[3] = {1.0f, pbr.roughness_factor, pbr.metallic_factor};
+    out.mr = decode_image(pbr.metallic_roughness_texture.texture
+                              ? pbr.metallic_roughness_texture.texture->image
+                              : nullptr,
+                          glb_dir, /*srgb=*/false, mr_f, cache);
+    if (!out.mr.valid())
+        out.mr = solid_texel(1.0f, pbr.roughness_factor, pbr.metallic_factor);
+
+    const float emis_f[3] = {mat->emissive_factor[0], mat->emissive_factor[1],
+                             mat->emissive_factor[2]};
+    out.emissive = decode_image(
+        mat->emissive_texture.texture ? mat->emissive_texture.texture->image
+                                      : nullptr,
+        glb_dir, /*srgb=*/true, emis_f, cache);
+    if (!out.emissive.valid() &&
+        (emis_f[0] > 0.0f || emis_f[1] > 0.0f || emis_f[2] > 0.0f))
+        out.emissive = solid_texel(emis_f[0], emis_f[1], emis_f[2]);
+
+    // Normal map: LINEAR, never sRGB-decoded.
+    const float one[3] = {1, 1, 1};
+    out.normal = decode_image(
+        mat->normal_texture.texture ? mat->normal_texture.texture->image
+                                    : nullptr,
+        glb_dir, /*srgb=*/false, one, cache);
+    return out;
 }
 
 // Factor-only material channel: a 1x1 texture so the shading path stays
@@ -332,62 +423,28 @@ std::shared_ptr<const MeshData> load_glb(const std::string& path,
         out->tris.push_back(tri);
     }
 
-    // ---- material: first primitive that has one ----
-    const cgltf_material* mat = nullptr;
-    for (cgltf_size m = 0; m < data->meshes_count && !mat; ++m)
-        for (cgltf_size p = 0; p < data->meshes[m].primitives_count && !mat; ++p)
-            mat = data->meshes[m].primitives[p].material;
-
+    // ---- materials: bake EVERY unique material's texture set ----
     const std::string glb_dir =
         std::filesystem::path(path).parent_path().string();
-    if (mat) {
-        const auto& pbr = mat->pbr_metallic_roughness;
-        const float base_f[3] = {pbr.base_color_factor[0],
-                                 pbr.base_color_factor[1],
-                                 pbr.base_color_factor[2]};
-        out->base = decode_image(
-            pbr.base_color_texture.texture ? pbr.base_color_texture.texture->image
-                                           : nullptr,
-            glb_dir, /*srgb=*/true, base_f);
-        if (!out->base.valid()) {
-            // Factor-only base color (already linear per spec).
-            out->base = solid_texel(base_f[0], base_f[1], base_f[2]);
-        }
-
-        // glTF: G = roughness x factor, B = metallic x factor. LINEAR data.
-        const float mr_f[3] = {1.0f, pbr.roughness_factor, pbr.metallic_factor};
-        out->mr = decode_image(
-            pbr.metallic_roughness_texture.texture
-                ? pbr.metallic_roughness_texture.texture->image
-                : nullptr,
-            glb_dir, /*srgb=*/false, mr_f);
-        if (!out->mr.valid())
-            out->mr = solid_texel(1.0f, pbr.roughness_factor, pbr.metallic_factor);
-
-        const float emis_f[3] = {mat->emissive_factor[0],
-                                 mat->emissive_factor[1],
-                                 mat->emissive_factor[2]};
-        out->emissive = decode_image(
-            mat->emissive_texture.texture ? mat->emissive_texture.texture->image
-                                          : nullptr,
-            glb_dir, /*srgb=*/true, emis_f);
-        if (!out->emissive.valid() &&
-            (emis_f[0] > 0.0f || emis_f[1] > 0.0f || emis_f[2] > 0.0f))
-            out->emissive = solid_texel(emis_f[0], emis_f[1], emis_f[2]);
-
-        // Normal map: LINEAR, never sRGB-decoded.
-        const float one[3] = {1, 1, 1};
-        out->normal = decode_image(
-            mat->normal_texture.texture ? mat->normal_texture.texture->image
-                                        : nullptr,
-            glb_dir, /*srgb=*/false, one);
-    } else {
-        out->base = solid_texel(0.8f, 0.8f, 0.8f);
-        out->mr = solid_texel(1.0f, 0.9f, 0.0f);
+    ImageCache cache;
+    out->materials.reserve(a.mats.size());
+    for (const cgltf_material* m : a.mats) {
+        out->materials.push_back(bake_material(m, glb_dir, cache));
+    }
+    if (out->materials.empty()) {   // defensive: geometry demands >= 1
+        out->materials.push_back(bake_material(nullptr, glb_dir, cache));
+    }
+    out->tri_mat = a.tri_mat;
+    info.material_count = out->materials.size();
+    for (const MeshMaterial& mm : out->materials) {
+        info.texture_bytes +=
+            (mm.base.texels.size() + mm.mr.texels.size() +
+             mm.emissive.texels.size() + mm.normal.texels.size()) *
+            sizeof(std::uint16_t);
     }
 
-    // ---- BVH (permutes tris into leaf order) ----
-    info.bvh = build_bvh(out->tris, out->nodes);
+    // ---- BVH (permutes tris AND material ids into leaf order) ----
+    info.bvh = build_bvh(out->tris, out->nodes, &out->tri_mat);
     return out;
 }
 

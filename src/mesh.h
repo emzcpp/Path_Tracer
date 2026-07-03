@@ -159,12 +159,15 @@ inline bool bvh_hit(const BVHNode* nodes, const GPUTriangle* tris,
 // metallic-roughness textures feed the model CONTINUOUSLY — no threshold.
 // Emission rides on the scattering surface (the integrator collects
 // rec.mat.emission unconditionally before scatter).
-inline Material eval_mesh_material(const MeshData& m, float u, float v) {
-    const color base = sample_bilinear(m.base, u, v);
-    const color mr = m.mr.valid() ? sample_bilinear(m.mr, u, v)
-                                  : color(0.0f, 1.0f, 0.0f);
-    const color emis = m.emissive.valid() ? sample_bilinear(m.emissive, u, v)
-                                          : color(0.0f, 0.0f, 0.0f);
+inline Material eval_mesh_material(const MeshData& m, std::uint32_t mat_id,
+                                   float u, float v) {
+    const MeshMaterial& set = m.materials[mat_id];
+    const color base = sample_bilinear(set.base, u, v);
+    const color mr = set.mr.valid() ? sample_bilinear(set.mr, u, v)
+                                    : color(0.0f, 1.0f, 0.0f);
+    const color emis = set.emissive.valid()
+                           ? sample_bilinear(set.emissive, u, v)
+                           : color(0.0f, 0.0f, 0.0f);
     Material out;
     out.base_color = base;
     out.emission = emis * m.emissive_scale;
@@ -209,8 +212,10 @@ public:
         // interpolated, Gram-Schmidt'd against the shading normal, and the
         // bitangent takes the glTF .w handedness sign. Mirrored in
         // pathtrace.metal.
-        if (data_->normal.valid()) {
-            const color tn = sample_bilinear(data_->normal, u, v);
+        const Texture16& nmap =
+            data_->materials[data_->tri_mat[best.tri]].normal;
+        if (nmap.valid()) {
+            const color tn = sample_bilinear(nmap, u, v);
             const vec3 tN(2.0f * tn.x - 1.0f, 2.0f * tn.y - 1.0f,
                           2.0f * tn.z - 1.0f);
             vec3 tang = w * mesh_c3(T.t0) + best.u * mesh_c3(T.t1) +
@@ -225,7 +230,7 @@ public:
         }
         rec.normal = front ? ns : -ns;
         rec.front_face = front;
-        rec.mat = eval_mesh_material(*data_, u, v);
+        rec.mat = eval_mesh_material(*data_, data_->tri_mat[best.tri], u, v);
         return true;
     }
 

@@ -132,6 +132,8 @@ struct ViewerCore {
     // (the load-time bake, treated as "model = identity") whenever the
     // gizmo edits mesh_model. Pick and GPU read the same re-baked arrays.
     std::vector<GPUTriangle> mesh_object_tris;
+    std::vector<std::uint32_t> mesh_object_tri_mat;   // parallel, pre-BVH
+    std::vector<std::uint32_t> mesh_tri_mat;          // live, leaf order
     std::vector<GPUTriangle> mesh_tris;
     std::vector<BVHNode> mesh_nodes;
     float mesh_model[16] = {1, 0, 0, 0, 0, 1, 0, 0,
@@ -357,8 +359,11 @@ void apply_mesh_transform(ViewerCore& core) {
         T.n1 = xn(T.n1);
         T.n2 = xn(T.n2);
     }
-    build_bvh(core.mesh_tris, core.mesh_nodes);
-    if (core.gpu) core.gpu->update_mesh_geometry(core.mesh_tris, core.mesh_nodes);
+    core.mesh_tri_mat = core.mesh_object_tri_mat;
+    build_bvh(core.mesh_tris, core.mesh_nodes, &core.mesh_tri_mat);
+    if (core.gpu)
+        core.gpu->update_mesh_geometry(core.mesh_tris, core.mesh_nodes,
+                                       core.mesh_tri_mat);
     core.mark_scene_dirty();
     core.mesh_apply_pending = false;
     core.last_mesh_apply = Clock::now();
@@ -396,7 +401,9 @@ void remove_mesh(ViewerCore& core) {
     core.desc.mesh_source_path.clear();
     core.desc.mesh_name.clear();
     core.mesh_object_tris.clear();
+    core.mesh_object_tri_mat.clear();
     core.mesh_tris.clear();
+    core.mesh_tri_mat.clear();
     core.mesh_nodes.clear();
     if (core.gpu) core.gpu->set_mesh(nullptr);
     core.mark_scene_dirty();
@@ -531,10 +538,13 @@ void restore_state(ViewerCore& core, const SceneState& s) {
         core.desc.mesh_source_path = s.mesh_source_path;
         if (s.mesh) {
             core.mesh_object_tris = s.mesh->tris;
+            core.mesh_object_tri_mat = s.mesh->tri_mat;
             if (core.gpu) core.gpu->set_mesh(s.mesh.get());
         } else {
             core.mesh_object_tris.clear();
+            core.mesh_object_tri_mat.clear();
             core.mesh_tris.clear();
+            core.mesh_tri_mat.clear();
             core.mesh_nodes.clear();
             if (core.gpu) core.gpu->set_mesh(nullptr);
         }
@@ -678,7 +688,9 @@ bool apply_snapshot(ViewerCore& core, SceneSnapshot&& snap,
             core.desc.mesh.reset();
             core.desc.mesh_source_path.clear();
             core.mesh_object_tris.clear();
+            core.mesh_object_tri_mat.clear();
             core.mesh_tris.clear();
+            core.mesh_tri_mat.clear();
             core.mesh_nodes.clear();
             if (core.gpu) core.gpu->set_mesh(nullptr);
         }
@@ -687,6 +699,7 @@ bool apply_snapshot(ViewerCore& core, SceneSnapshot&& snap,
             core.desc.mesh = imported;
             core.desc.mesh_source_path = snap.mesh_source;
             core.mesh_object_tris = imported->tris;
+            core.mesh_object_tri_mat = imported->tri_mat;
             if (core.gpu) core.gpu->set_mesh(imported.get());
         }
         core.desc.mesh_name = snap.mesh_name;
@@ -2228,7 +2241,9 @@ int run_viewer(const RenderSettings& settings, bool use_gpu,
         if (desc.mesh) {
             // Editable copies: object-space baseline + live world arrays.
             core->mesh_object_tris = desc.mesh->tris;
+            core->mesh_object_tri_mat = desc.mesh->tri_mat;
             core->mesh_tris = desc.mesh->tris;
+            core->mesh_tri_mat = desc.mesh->tri_mat;
             core->mesh_nodes = desc.mesh->nodes;
         }
         core->use_gpu = use_gpu;

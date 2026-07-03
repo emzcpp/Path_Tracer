@@ -130,7 +130,8 @@ public:
     // batch simply binds the new data.
     void update_spheres(const std::vector<GPUSphere>& spheres);
     void update_mesh_geometry(const std::vector<GPUTriangle>& tris,
-                              const std::vector<BVHNode>& nodes);
+                              const std::vector<BVHNode>& nodes,
+                              const std::vector<pt_uint>& tri_mat);
 
     // Phase 5 (scene load): swap the whole mesh — geometry AND textures —
     // or remove it (nullptr). Same buffer-swap semantics as above.

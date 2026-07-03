@@ -131,7 +131,8 @@ struct Builder {
 } // namespace
 
 BvhStats build_bvh(std::vector<GPUTriangle>& tris,
-                   std::vector<BVHNode>& nodes) {
+                   std::vector<BVHNode>& nodes,
+                   std::vector<std::uint32_t>* tri_ids) {
     nodes.clear();
     if (tris.empty()) return {};
 
@@ -152,5 +153,11 @@ BvhStats build_bvh(std::vector<GPUTriangle>& tris,
     std::vector<GPUTriangle> permuted(tris.size());
     for (std::size_t i = 0; i < tris.size(); ++i) permuted[i] = tris[b.order[i]];
     tris = std::move(permuted);
+    if (tri_ids && tri_ids->size() == b.order.size()) {
+        std::vector<std::uint32_t> pids(tri_ids->size());
+        for (std::size_t i = 0; i < pids.size(); ++i)
+            pids[i] = (*tri_ids)[b.order[i]];
+        *tri_ids = std::move(pids);
+    }
     return b.stats;
 }
