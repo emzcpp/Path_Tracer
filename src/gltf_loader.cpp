@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <vector>
 
 #include "vec3.h"
 
@@ -420,5 +421,46 @@ std::shared_ptr<const EnvMap> load_hdr(const std::string& path,
         std::fprintf(stderr, "load_hdr: sanitized %zu non-finite texels\n",
                      bad);
     stbi_image_free(data);
+
+    // ---- Session H: build the luminance x sin(theta) sampling CDFs ----
+    const float PI = 3.14159265358979f;
+    const std::size_t texel_count = std::size_t(w) * h;
+    double lum_sum = 0.0;
+    for (std::size_t i = 0; i < texel_count; ++i) {
+        lum_sum += 0.2126 * env->texels[i * 4] +
+                   0.7152 * env->texels[i * 4 + 1] +
+                   0.0722 * env->texels[i * 4 + 2];
+    }
+    const float floor_w =
+        float(lum_sum / double(texel_count)) * 1e-3f + 1e-12f;
+
+    env->row_cdf.resize(h);
+    env->cond_cdf.resize(std::size_t(w) * h);
+    std::vector<double> row_sum(h, 0.0);
+    for (int y = 0; y < h; ++y) {
+        const float sin_th = std::sin(PI * (float(y) + 0.5f) / float(h));
+        double run = 0.0;
+        float* crow = env->cond_cdf.data() + std::size_t(y) * w;
+        for (int x = 0; x < w; ++x) {
+            const std::size_t i = (std::size_t(y) * w + x) * 4;
+            const float lum = 0.2126f * env->texels[i] +
+                              0.7152f * env->texels[i + 1] +
+                              0.0722f * env->texels[i + 2];
+            run += double((lum + floor_w) * sin_th);
+            crow[x] = float(run);
+        }
+        row_sum[y] = run;
+        const float inv = run > 0.0 ? float(1.0 / run) : 0.0f;
+        for (int x = 0; x < w; ++x) crow[x] *= inv;
+        crow[w - 1] = 1.0f;   // exact top: binary search can't fall off
+    }
+    double total = 0.0;
+    for (int y = 0; y < h; ++y) total += row_sum[y];
+    double run = 0.0;
+    for (int y = 0; y < h; ++y) {
+        run += row_sum[y];
+        env->row_cdf[y] = float(run / total);
+    }
+    env->row_cdf[h - 1] = 1.0f;
     return env;
 }

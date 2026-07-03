@@ -62,6 +62,16 @@ std::shared_ptr<const MeshData> load_glb(const std::string& path,
 struct EnvMap {
     int w = 0, h = 0;
     std::vector<float> texels;   // RGBA float, linear radiance
+
+    // Session H: importance-sampling distribution over the equirect image,
+    // weighted by luminance x sin(theta) (rows near the poles subtend less
+    // solid angle). row_cdf: marginal over rows (h entries, last == 1).
+    // cond_cdf: per-row normalized column CDFs (h*w, row-major). A small
+    // support floor keeps every texel sampleable (bilinear shading can
+    // read radiance from texels whose own luminance is zero).
+    std::vector<float> row_cdf;
+    std::vector<float> cond_cdf;
+
     bool valid() const { return w > 0 && h > 0; }
 };
 

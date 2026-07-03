@@ -49,6 +49,10 @@ inline EnvLookup env_lookup(const SceneDesc& desc) {
         e.h = desc.env->h;
         e.intensity = desc.env_intensity;
         e.yaw_norm = desc.env_yaw_deg * (1.0f / 360.0f);
+        if (!desc.env->row_cdf.empty()) {
+            e.row_cdf = desc.env->row_cdf.data();
+            e.cond_cdf = desc.env->cond_cdf.data();
+        }
     }
     return e;
 }

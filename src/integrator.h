@@ -32,6 +32,11 @@ struct EnvLookup {
     int w = 0, h = 0;
     float intensity = 1.0f;
     float yaw_norm = 0.0f;           // yaw / 2pi, added to u
+    // Session H: importance-sampling CDFs (null = NEE unavailable) and the
+    // light-sampling toggle. Brute force remains the ground-truth mode.
+    const float* row_cdf = nullptr;
+    const float* cond_cdf = nullptr;
+    bool nee = false;
 };
 
 inline color env_fetch(const float* tex, int W, int x, int y) {
@@ -59,6 +64,78 @@ inline color sample_env_bilinear(const float* tex, int W, int H, float u,
     const color c01 = env_fetch(tex, W, x0, y1), c11 = env_fetch(tex, W, x1, y1);
     return (1.0f - ax) * (1.0f - ay) * c00 + ax * (1.0f - ay) * c10 +
            (1.0f - ax) * ay * c01 + ax * ay * c11;
+}
+
+// ---- Session H: env importance sampling (mirrored in pathtrace.metal) --
+// The distribution is luminance x sin(theta) over the equirect image;
+// image-space density converts to solid-angle pdf via
+//   pdf_sa = p_uv / (2 pi^2 sin(theta)),
+// with the SAME sin(theta) that weighted the CDF rows — carried
+// consistently in both sample() and pdf() below.
+
+// First index whose cdf value exceeds u. Identical loop on both backends.
+inline int cdf_find(const float* cdf, int n, float u) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (cdf[mid] > u) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+
+// Draw a direction from the env distribution; returns pdf w.r.t. solid
+// angle (0 on degenerate rows/poles — caller skips those samples).
+inline vec3 env_sample(const EnvLookup& env, float u1, float u2,
+                       float& pdf_sa) {
+    const int W = env.w, H = env.h;
+    const int y = cdf_find(env.row_cdf, H, u1);
+    const float* crow = env.cond_cdf + std::size_t(y) * W;
+    const int x = cdf_find(crow, W, u2);
+    const float row_lo = y > 0 ? env.row_cdf[y - 1] : 0.0f;
+    const float row_w = env.row_cdf[y] - row_lo;
+    const float col_lo = x > 0 ? crow[x - 1] : 0.0f;
+    const float col_w = crow[x] - col_lo;
+    // Continuous inversion inside the chosen texel (keeps stratification).
+    const float fy = row_w > 0.0f ? (u1 - row_lo) / row_w : 0.5f;
+    const float fx = col_w > 0.0f ? (u2 - col_lo) / col_w : 0.5f;
+    const float u = (float(x) + fx) / float(W);
+    const float v = (float(y) + fy) / float(H);
+    // UV -> direction: exact inverse of the miss mapping, yaw included.
+    const float phi = (u - 0.5f - env.yaw_norm) * 6.28318530717958648f;
+    const float theta = v * 3.14159265358979f;
+    const float st = std::sin(theta);
+    const vec3 d(st * std::cos(phi), std::cos(theta), st * std::sin(phi));
+    const float p_uv = row_w * col_w * float(W) * float(H);
+    pdf_sa = st > 1e-6f
+                 ? p_uv / (2.0f * 3.14159265358979f * 3.14159265358979f * st)
+                 : 0.0f;
+    return d;
+}
+
+// Solid-angle pdf the sampler above would assign to an arbitrary
+// direction — the MIS counterpart. Same dir->UV text as miss_radiance.
+inline float env_pdf(const EnvLookup& env, const vec3& dir) {
+    const vec3 d = normalize(dir);
+    float u = std::atan2(d.z, d.x) * 0.15915494309189533577f + 0.5f +
+              env.yaw_norm;
+    u = u - std::floor(u);
+    const float v = std::acos(std::fmin(std::fmax(d.y, -1.0f), 1.0f)) *
+                    0.31830988618379067154f;
+    const int W = env.w, H = env.h;
+    int x = int(u * float(W));
+    int y = int(v * float(H));
+    if (x >= W) x = W - 1;
+    if (y >= H) y = H - 1;
+    const float* crow = env.cond_cdf + std::size_t(y) * W;
+    const float row_lo = y > 0 ? env.row_cdf[y - 1] : 0.0f;
+    const float row_w = env.row_cdf[y] - row_lo;
+    const float col_lo = x > 0 ? crow[x - 1] : 0.0f;
+    const float col_w = crow[x] - col_lo;
+    const float st = std::sqrt(std::fmax(0.0f, 1.0f - d.y * d.y));
+    if (st <= 1e-6f) return 0.0f;
+    return row_w * col_w * float(W) * float(H) /
+           (2.0f * 3.14159265358979f * 3.14159265358979f * st);
 }
 
 // Direction -> lat-long UV -> radiance. Falls back to the gradient when no
