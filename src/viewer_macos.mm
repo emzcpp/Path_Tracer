@@ -110,6 +110,11 @@ struct ViewerCore {
     // (settings.clamp_indirect stays 0 there, as do offline/parity).
     bool preview_clamp_on = true;
     float preview_clamp_value = 10.0f;
+    // Opt-in ONLY (never silent, session-only — deliberately not saved in
+    // scenes): also clamp FINAL renders. Biased, but kills HDRI-sun
+    // speckle that brute-force sampling cannot converge away in practical
+    // sample counts. The FINAL log line states the clamp in effect.
+    bool clamp_final = false;
 
     // Session E: fast-nav raster preview. 0 = off, 1 = solid, 2 = wire.
     // Auto-handoff by design: raster only while the camera moves, traced
@@ -206,9 +211,17 @@ void set_final_mode(ViewerCore& core, bool entering) {
         // Fresh full-res convergence run (final_mode bypasses the preview
         // hysteresis, so this resets straight to full res).
         core.mark_scene_dirty();
-        std::printf("FINAL mode: camera locked, converging to %d spp — "
-                    "auto-saves PNG at target, P saves early, R unlocks\n",
-                    core.settings.final_target_spp);
+        if (core.clamp_final)
+            std::printf("FINAL mode: converging to %d spp, "
+                        "CLAMPED at %.1f (biased, opt-in) — "
+                        "auto-saves PNG at target, R unlocks\n",
+                        core.settings.final_target_spp,
+                        core.preview_clamp_value);
+        else
+            std::printf("FINAL mode: converging to %d spp, unclamped "
+                        "(ground truth) — auto-saves PNG at target, "
+                        "R unlocks\n",
+                        core.settings.final_target_spp);
     } else {
         std::printf("interactive mode\n");
     }
@@ -1361,9 +1374,9 @@ void render_thread_main(ViewerCore& core) {
     // the central reset so an accumulation is never a clamped/unclamped
     // mixture.
     {
-        const float eff = (!final_mode && core_->preview_clamp_on)
-                              ? core_->preview_clamp_value
-                              : 0.0f;
+        const bool clamp_now =
+            final_mode ? core_->clamp_final : core_->preview_clamp_on;
+        const float eff = clamp_now ? core_->preview_clamp_value : 0.0f;
         if (eff != core_->settings.clamp_indirect) {
             core_->settings.clamp_indirect = eff;
             gpu.set_clamp_indirect(eff);
@@ -1891,10 +1904,18 @@ void render_thread_main(ViewerCore& core) {
             "preview. Biased, so FINAL, --offline, and --parity always\n"
             "render unclamped ground truth. Applied via the central reset.");
     }
-    if (core_->preview_clamp_on) {
+    if (core_->preview_clamp_on || core_->clamp_final) {
         ImGui::SliderFloat("clamp threshold", &core_->preview_clamp_value,
                            1.0f, 100.0f, "%.1f",
                            ImGuiSliderFlags_Logarithmic);
+    }
+    ImGui::Checkbox("also clamp FINAL (biased)", &core_->clamp_final);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Opt-in: FINAL exports use the clamp too. Slightly darkens\n"
+            "genuine bright bounce light, but removes HDRI-sun speckle\n"
+            "that never converges away. Off = ground truth. Not saved in\n"
+            "scenes; the FINAL log states the clamp used.");
     }
     if (dirty) {
         core_->final_saved = false;   // settings changed: re-arm the export
