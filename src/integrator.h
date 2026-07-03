@@ -164,6 +164,7 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
     color radiance(0.0f);      // light collected so far
     color throughput(1.0f);    // fraction of it that survives back to the eye
     bool prev_nee = false;     // env NEE ran at the previous path vertex
+    float prev_pdf = 0.0f;     // BSDF pdf of the ray we're now following
 
     for (int depth = 0; depth < max_depth; ++depth) {
         HitRecord rec;
@@ -171,15 +172,19 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
         // put its origin a hair inside, and t_min=0 would let it re-hit the
         // same surface at t≈0 ("shadow acne" — dark speckles everywhere).
         if (!world.hit(ray, 1e-3f, std::numeric_limits<float>::infinity(), rec)) {
-            // NEE double-count rule: a vertex that ran env NEE already
-            // collected the environment's direct term, so its continuation
-            // miss must not add it again. Camera rays and delta/glass
-            // continuations (no NEE there) still see the env in full.
-            if (!prev_nee) {
-                const color c = throughput * miss_radiance(env, ray);
-                radiance +=
-                    (depth == 0 ? c : clamp_contribution(c, clamp_indirect));
+            // MIS (power heuristic): vertices that ran env NEE weight
+            // their continuation's env hit by the BSDF-sampling share;
+            // camera rays and delta/glass continuations (no NEE there)
+            // see the env in full.
+            float w = 1.0f;
+            if (prev_nee) {
+                const float pe = env_pdf(env, ray.dir);
+                w = (prev_pdf * prev_pdf) /
+                    (prev_pdf * prev_pdf + pe * pe + 1e-20f);
             }
+            const color c = throughput * miss_radiance(env, ray) * w;
+            radiance +=
+                (depth == 0 ? c : clamp_contribution(c, clamp_indirect));
             return radiance;
         }
 
@@ -196,14 +201,12 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
         // Deliberately sample the env distribution (the sun), evaluate the
         // BSDF for that direction, and add the contribution if the shadow
         // ray escapes. Delta glass is skipped — BSDF sampling owns it.
-        // Near-specular skip (glass is delta; a roughness-0.02 metal's
-        // lobe is spiked enough that env-sampling it produces jackpot
-        // noise while suppressing the clean BSDF mirror estimator) —
-        // those vertices rely on BSDF sampling. MIS (Stage 3) weights,
-        // rather than gates, this trade.
+        // Delta glass is skipped (no finite pdf); everything else —
+        // including near-specular metals — is handled by the MIS weights:
+        // where the BSDF lobe is sharp, pdf_bsdf dominates and the env-
+        // sample weight goes to zero instead of spiking.
         const bool can_nee = env.nee && env.row_cdf != nullptr &&
-                             rec.mat.transmission <= 0.5f &&
-                             rec.mat.roughness >= 0.1f;
+                             rec.mat.transmission <= 0.5f;
         if (can_nee) {
             const float u1 = rng.next_float();
             const float u2 = rng.next_float();
@@ -219,9 +222,13 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                     if (!world.occluded(
                             shadow, 1e-3f,
                             std::numeric_limits<float>::infinity())) {
+                        // MIS weight vs the BSDF sampler (power heuristic).
+                        const float w =
+                            (pdf_env * pdf_env) /
+                            (pdf_env * pdf_env + pdf_b * pdf_b + 1e-20f);
                         const color c = throughput * f * nl *
-                                        miss_radiance(env, shadow) /
-                                        pdf_env;
+                                        miss_radiance(env, shadow) *
+                                        (w / pdf_env);
                         radiance += clamp_contribution(c, clamp_indirect);
                     }
                 }
@@ -239,6 +246,8 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
         }
         throughput *= attenuation;
         ray = scattered;
+        prev_pdf = scatter_delta ? 0.0f : scatter_pdf;
+        if (scatter_delta) prev_nee = false;   // delta chains keep full env
 
         // Russian roulette: after a few bounces, kill dim paths with
         // probability (1 - p) and divide survivors by p. The expected

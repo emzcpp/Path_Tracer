@@ -729,6 +729,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
     float3 radiance = float3(0.0f);
     float3 throughput = float3(1.0f);
     bool prev_nee = false;   // env NEE ran at the previous path vertex
+    float prev_pdf = 0.0f;   // BSDF pdf of the ray we're now following
 
     for (uint depth = 0; depth < max_depth; ++depth) {
         // Closest hit: spheres first, then the mesh BVH seeded with the
@@ -743,19 +744,25 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             hit_m = bvh_hit(nodes, tris, ro, rd, 1e-3f, closest, th);
         }
         if (!hit_s && !hit_m) {
-            // NEE double-count rule: a vertex that ran env NEE already
-            // collected the environment's direct term, so its continuation
-            // miss must not add it again. Camera rays and delta/glass
-            // continuations (no NEE there) still see the env in full.
-            if (!prev_nee) {
-                const float3 c =
-                    throughput * miss_radiance(env_texels, U.env_w, U.env_h,
-                                               U.env_intensity,
-                                               U.env_yaw_norm, rd);
-                radiance +=
-                    (depth == 0u ? c
-                                 : clamp_contribution(c, U.clamp_indirect));
+            // MIS (power heuristic): vertices that ran env NEE weight
+            // their continuation's env hit by the BSDF-sampling share;
+            // camera rays and delta/glass continuations (no NEE there)
+            // see the env in full.
+            float w = 1.0f;
+            if (prev_nee) {
+                const float pe =
+                    env_pdf(env_row_cdf, env_cond_cdf, int(U.env_w),
+                            int(U.env_h), U.env_yaw_norm, rd);
+                w = (prev_pdf * prev_pdf) /
+                    (prev_pdf * prev_pdf + pe * pe + 1e-20f);
             }
+            const float3 c = throughput *
+                             miss_radiance(env_texels, U.env_w, U.env_h,
+                                           U.env_intensity, U.env_yaw_norm,
+                                           rd) *
+                             w;
+            radiance +=
+                (depth == 0u ? c : clamp_contribution(c, U.clamp_indirect));
             return radiance;
         }
 
@@ -813,10 +820,10 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
         // Deliberately sample the env distribution (the sun), evaluate the
         // BSDF for that direction, and add the contribution if the shadow
         // ray escapes. Delta glass is skipped — BSDF sampling owns it.
-        // Near-specular skip — mirror of integrator.h.
+        // Delta glass skipped; near-specular handled by MIS weights —
+        // mirror of integrator.h.
         const bool can_nee = U.env_nee != 0u && U.env_w != 0u &&
-                             mat.transmission <= 0.5f &&
-                             mat.roughness >= 0.1f;
+                             mat.transmission <= 0.5f;
         if (can_nee) {
             const float u1 = pcg_next_float(rng);
             const float u2 = pcg_next_float(rng);
@@ -832,12 +839,16 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                 if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
                     if (!occluded_scene(hp, ldir, spheres, n, nodes, tris,
                                         MU)) {
+                        // MIS weight vs the BSDF sampler (power heuristic).
+                        const float w =
+                            (pdf_env * pdf_env) /
+                            (pdf_env * pdf_env + pdf_b * pdf_b + 1e-20f);
                         const float3 c =
                             throughput * f * nl *
                             miss_radiance(env_texels, U.env_w, U.env_h,
                                           U.env_intensity, U.env_yaw_norm,
-                                          ldir) /
-                            pdf_env;
+                                          ldir) *
+                            (w / pdf_env);
                         radiance += clamp_contribution(c, U.clamp_indirect);
                     }
                 }
@@ -855,6 +866,8 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
         throughput *= attenuation;
         ro = hp;
         rd = new_dir;
+        prev_pdf = scatter_delta ? 0.0f : scatter_pdf;
+        if (scatter_delta) prev_nee = false;   // delta chains keep full env
 
         if (depth >= 3) {
             const float p = fmin(
