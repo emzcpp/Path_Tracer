@@ -45,6 +45,11 @@ struct PassUniforms {
     pt_uint pass_count;     // K passes looped inside the kernel
     pt_uint sphere_count;
     pt_uint max_depth;
+    // Session F: equirect HDRI environment. env_w == 0 -> gradient dome.
+    pt_uint env_w, env_h;
+    float env_intensity;
+    float env_yaw_norm;     // yaw as a u offset (yaw / 2pi)
+    float clamp_indirect;   // firefly clamp; 0 = off
 };
 
 struct ResolveUniforms {
@@ -90,7 +95,7 @@ struct MeshUniforms {
 static_assert(sizeof(pt_float3) == 12, "pt_float3 must be 12 bytes");
 static_assert(sizeof(GPUSphere) == 64, "GPUSphere must be one cacheline");
 static_assert(sizeof(GPUCamera) == 48, "GPUCamera layout drifted");
-static_assert(sizeof(PassUniforms) == 72, "PassUniforms layout drifted");
+static_assert(sizeof(PassUniforms) == 92, "PassUniforms layout drifted");
 static_assert(sizeof(ResolveUniforms) == 20, "ResolveUniforms layout drifted");
 static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");
 static_assert(sizeof(GPUTriangle) == 144, "GPUTriangle must be nine 16B rows");

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "gltf_loader.h"
+#include "integrator.h"
 #include "kernel_types.h"
 #include "mesh.h"
 #include "rng.h"
@@ -32,7 +33,25 @@ struct SceneDesc {
     std::shared_ptr<const MeshData> mesh;   // null = sphere-only scene
     std::string mesh_source_path;           // where the mesh came from (save/load)
     std::string mesh_name;                  // editable label for the mesh
+
+    // Session F: HDRI environment (null = gradient dome fallback).
+    std::shared_ptr<const EnvMap> env;
+    std::string env_source_path;
+    float env_intensity = 1.0f;
+    float env_yaw_deg = 0.0f;
 };
+
+inline EnvLookup env_lookup(const SceneDesc& desc) {
+    EnvLookup e;
+    if (desc.env && desc.env->valid()) {
+        e.texels = desc.env->texels.data();
+        e.w = desc.env->w;
+        e.h = desc.env->h;
+        e.intensity = desc.env_intensity;
+        e.yaw_norm = desc.env_yaw_deg * (1.0f / 360.0f);
+    }
+    return e;
+}
 
 inline SceneDesc build_scene_desc(
     std::shared_ptr<const MeshData> mesh = nullptr) {

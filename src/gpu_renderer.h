@@ -94,6 +94,7 @@ public:
 
     // Live-tunable from the UI (the renderer holds its own settings copy).
     void set_max_depth(int depth);
+    void set_clamp_indirect(float clamp);
 
     // Phase 4 scene edits. Both swap in NEW buffers rather than mutating in
     // place: Metal retains the old buffers for in-flight command buffers,
@@ -106,6 +107,12 @@ public:
     // Phase 5 (scene load): swap the whole mesh — geometry AND textures —
     // or remove it (nullptr). Same buffer-swap semantics as above.
     void set_mesh(const MeshData* mesh);
+
+    // Session F: HDRI environment. set_env swaps the texel buffer (nullptr
+    // reverts to the gradient dome); set_env_params updates intensity/yaw
+    // only (cheap, per-edit).
+    void set_env(const EnvMap* env);
+    void set_env_params(float intensity, float yaw_norm);
 
     // Bridged id<MTLDevice>, for CAMetalLayer.device.
     void* metal_device() const;

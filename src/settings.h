@@ -26,6 +26,11 @@ struct RenderSettings {
     float settle_ms        = 150.0f; // camera still this long → back to full res
     int   final_target_spp = 2048;   // FINAL mode (F key): converge to this,
                                      // then auto-export a PNG
+    // Firefly control (Cycles-style "clamp indirect"): cap the per-sample
+    // contribution of indirect bounces. Direct hits (visible sun/lights/
+    // background) are never clamped. 0 = off. Biased but standard — HDRI
+    // suns otherwise leave white speckle that outlives any sample count.
+    float clamp_indirect = 10.0f;
 
     // GPU backend: passes encoded per 60 Hz tick (per command buffer)
     int gpu_passes_per_tick_preview = 4;

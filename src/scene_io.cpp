@@ -78,8 +78,37 @@ bool material_from_json(const json& j, Material& m, std::string& error) {
 
 } // namespace
 
+namespace {
+// Portable scenes: store asset paths relative to the scene file when we can.
+std::string relative_to_scene(const std::string& asset,
+                              const std::string& scene_path) {
+    std::error_code ec;
+    const fs::path scene_dir =
+        fs::absolute(fs::path(scene_path), ec).parent_path();
+    const fs::path rel = fs::relative(fs::absolute(asset, ec), scene_dir, ec);
+    return (!ec && !rel.empty()) ? rel.string() : asset;
+}
+// Resolve a stored path: scene-file-relative, then cwd, then as-given.
+bool resolve_asset(const std::string& stored, const std::string& scene_path,
+                   std::string& out) {
+    std::error_code ec;
+    const fs::path scene_dir =
+        fs::absolute(fs::path(scene_path), ec).parent_path();
+    if (fs::exists(scene_dir / stored, ec)) {
+        out = (scene_dir / stored).string();
+        return true;
+    }
+    if (fs::exists(stored, ec)) {
+        out = stored;
+        return true;
+    }
+    return false;
+}
+} // namespace
+
 bool save_scene(const std::string& path, const SceneSnapshot& snap,
-                const std::string& mesh_source_abs, std::string& error) {
+                const std::string& mesh_source_abs,
+                const std::string& env_source_abs, std::string& error) {
     json objects = json::array();
     for (const SphereData& s : snap.spheres) {
         json o{{"type", "sphere"},
@@ -106,8 +135,16 @@ bool save_scene(const std::string& path, const SceneSnapshot& snap,
         objects.push_back(std::move(o));
     }
 
+    json environment;
+    if (!env_source_abs.empty()) {
+        environment = json{{"source", relative_to_scene(env_source_abs, path)},
+                           {"intensity", snap.env_intensity},
+                           {"yaw_deg", snap.env_yaw_deg}};
+    }
+
     const json doc{
         {"version", kSceneVersion},
+        {"environment", environment},
         {"camera",
          {{"position", vec_to_json(snap.cam_pos)},
           {"yaw", snap.cam_yaw},
@@ -117,7 +154,8 @@ bool save_scene(const std::string& path, const SceneSnapshot& snap,
         {"render",
          {{"final_target_spp", snap.final_target_spp},
           {"max_depth", snap.max_depth},
-          {"gpu_passes_per_tick", snap.gpu_passes_per_tick}}},
+          {"gpu_passes_per_tick", snap.gpu_passes_per_tick},
+          {"clamp_indirect", snap.clamp_indirect}}},
         {"objects", objects}};
 
     std::ofstream out(path);
@@ -182,10 +220,24 @@ bool load_scene(const std::string& path, SceneSnapshot& snap,
         return false;
     }
 
+    if (const auto e = doc.find("environment");
+        e != doc.end() && e->is_object()) {
+        const std::string stored = e->value("source", "");
+        if (!stored.empty()) {
+            if (!resolve_asset(stored, path, out.env_source)) {
+                error = "environment HDR not found: " + stored;
+                return false;
+            }
+            out.env_intensity = e->value("intensity", 1.0f);
+            out.env_yaw_deg = e->value("yaw_deg", 0.0f);
+        }
+    }
+
     if (const auto r = doc.find("render"); r != doc.end() && r->is_object()) {
         out.final_target_spp = r->value("final_target_spp", 2048);
         out.max_depth = r->value("max_depth", 16);
         out.gpu_passes_per_tick = r->value("gpu_passes_per_tick", 8);
+        out.clamp_indirect = r->value("clamp_indirect", 10.0f);
     }
 
     const auto objs = doc.find("objects");

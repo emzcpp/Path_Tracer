@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "camera.h"
+#include "integrator.h"
 #include "scene.h"
 #include "settings.h"
 #include "vec3.h"
@@ -29,7 +30,7 @@ public:
     // total_threads includes the calling thread: render_pass() works rows
     // itself, so the pool holds total_threads - 1 workers.
     ProgressiveRenderer(const Scene& scene, const RenderSettings& settings,
-                        unsigned total_threads);
+                        unsigned total_threads, const EnvLookup& env = {});
     ~ProgressiveRenderer();
 
     ProgressiveRenderer(const ProgressiveRenderer&) = delete;
@@ -66,6 +67,7 @@ private:
 
     const Scene& scene_;
     RenderSettings settings_;
+    EnvLookup env_;
 
     int w_ = 0, h_ = 0;
     int pass_count_ = 0;      // completed passes

@@ -55,3 +55,15 @@ struct MeshData {
 std::shared_ptr<const MeshData> load_glb(const std::string& path,
                                          const MeshPlacement& placement,
                                          std::string& error);
+
+// Session F: equirectangular HDRI environment map. Radiance .hdr data is
+// ALREADY linear — stored untouched (the inverse of the baseColor rule:
+// that was sRGB and needed decoding; this must not be).
+struct EnvMap {
+    int w = 0, h = 0;
+    std::vector<float> texels;   // RGBA float, linear radiance
+    bool valid() const { return w > 0 && h > 0; }
+};
+
+std::shared_ptr<const EnvMap> load_hdr(const std::string& path,
+                                       std::string& error);

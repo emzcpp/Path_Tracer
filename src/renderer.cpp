@@ -9,8 +9,9 @@
 
 ProgressiveRenderer::ProgressiveRenderer(const Scene& scene,
                                          const RenderSettings& settings,
-                                         unsigned total_threads)
-    : scene_(scene), settings_(settings) {
+                                         unsigned total_threads,
+                                         const EnvLookup& env)
+    : scene_(scene), settings_(settings), env_(env) {
     reset(settings.width, settings.height);
     const unsigned n_workers = total_threads > 1 ? total_threads - 1 : 0;
     workers_.reserve(n_workers);
@@ -99,7 +100,8 @@ void ProgressiveRenderer::render_row(int y) {
         const float u = (x + rng.next_float()) * inv_w;
         const float v = 1.0f - (y + rng.next_float()) * inv_h;
         accum_row[x] += trace(camera_.get_ray(u, v), scene_, rng,
-                              settings_.max_depth);
+                              settings_.max_depth, env_,
+                              settings_.clamp_indirect);
 
         const color c = accum_row[x] * inv_n;
         out[x * 4 + 0] = encode_channel(c.x);

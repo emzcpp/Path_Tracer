@@ -488,6 +488,54 @@ inline float3 sky_radiance(float3 rd) {
     return lerp_pt(float3(1.0f), float3(0.5f, 0.7f, 1.0f), t);
 }
 
+// ---- Session F: equirect HDRI environment (mirror of integrator.h) ----
+
+inline float3 env_fetch(device const float* tex, uint W, int x, int y) {
+    device const float* p = tex + (ulong(uint(y)) * W + uint(x)) * 4;
+    return float3(p[0], p[1], p[2]);
+}
+
+// Same manual-bilinear structure as material textures, with equirect
+// semantics: u WRAPS (azimuth seam), v CLAMPS (poles).
+inline float3 sample_env_bilinear(device const float* tex, uint W, uint H,
+                                  float u, float v) {
+    u = u - floor(u);
+    v = fmin(fmax(v, 0.0f), 1.0f);
+    const float x = u * float(W) - 0.5f;
+    const float y = v * float(H) - 0.5f;
+    const float fx = floor(x), fy = floor(y);
+    const float ax = x - fx, ay = y - fy;
+    int x0 = int(fx), x1 = x0 + 1;
+    int y0 = int(fy), y1 = y0 + 1;
+    if (x0 < 0) x0 += int(W);
+    if (x1 >= int(W)) x1 -= int(W);
+    if (y0 < 0) y0 = 0;
+    if (y1 >= int(H)) y1 = int(H) - 1;
+    const float3 c00 = env_fetch(tex, W, x0, y0), c10 = env_fetch(tex, W, x1, y0);
+    const float3 c01 = env_fetch(tex, W, x0, y1), c11 = env_fetch(tex, W, x1, y1);
+    return (1.0f - ax) * (1.0f - ay) * c00 + ax * (1.0f - ay) * c10 +
+           (1.0f - ax) * ay * c01 + ax * ay * c11;
+}
+
+inline float3 miss_radiance(device const float* env_texels, uint env_w,
+                            uint env_h, float intensity, float yaw_norm,
+                            float3 rd) {
+    if (env_w == 0u) return sky_radiance(rd);
+    const float3 d = normalize(rd);
+    const float u = atan2(d.z, d.x) * 0.15915494309189533577f + 0.5f +
+                    yaw_norm;
+    const float v =
+        acos(fmin(fmax(d.y, -1.0f), 1.0f)) * 0.31830988618379067154f;
+    return sample_env_bilinear(env_texels, env_w, env_h, u, v) * intensity;
+}
+
+// Scale an indirect contribution so its max component <= m (0 = off).
+inline float3 clamp_contribution(float3 c, float m) {
+    if (m <= 0.0f) return c;
+    const float mx = fmax(c.x, fmax(c.y, c.z));
+    return mx > m ? c * (m / mx) : c;
+}
+
 inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     uint n, device const BVHNode* nodes,
                     device const GPUTriangle* tris,
@@ -495,8 +543,9 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     device const ushort* tex_mr,
                     device const ushort* tex_emis,
                     device const ushort* tex_norm,
-                    constant MeshUniforms& MU, thread PRNG& rng,
-                    uint max_depth) {
+                    device const float* env_texels,
+                    constant MeshUniforms& MU, constant PassUniforms& U,
+                    thread PRNG& rng, uint max_depth) {
     float3 radiance = float3(0.0f);
     float3 throughput = float3(1.0f);
 
@@ -513,7 +562,13 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             hit_m = bvh_hit(nodes, tris, ro, rd, 1e-3f, closest, th);
         }
         if (!hit_s && !hit_m) {
-            return radiance + throughput * sky_radiance(rd);
+            const float3 c = throughput *
+                             miss_radiance(env_texels, U.env_w, U.env_h,
+                                           U.env_intensity, U.env_yaw_norm,
+                                           rd);
+            return radiance + (depth == 0u
+                                   ? c
+                                   : clamp_contribution(c, U.clamp_indirect));
         }
 
         EvalMat mat;
@@ -559,7 +614,12 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             mat = eval_sphere(spheres[rec.sphere_idx]);
         }
 
-        radiance += throughput * mat.emission;
+        {
+            const float3 c = throughput * mat.emission;
+            radiance += depth == 0u
+                            ? c
+                            : clamp_contribution(c, U.clamp_indirect);
+        }
 
         float3 attenuation, new_dir;
         if (!scatter(mat, rd, hn, front, rng, attenuation, new_dir)) {
@@ -595,6 +655,7 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                        device const ushort* tex_emis   [[buffer(7)]],
                        constant MeshUniforms& MU       [[buffer(8)]],
                        device const ushort* tex_norm   [[buffer(9)]],
+                       device const float* env_texels  [[buffer(10)]],
                        uint2 gid [[thread_position_in_grid]]) {
     // dispatchThreads => exact grid, no bounds guard needed
     const ulong px = ulong(gid.y) * U.width + gid.x;
@@ -613,7 +674,8 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                           v * c3(U.cam.vertical) - ro;
 
         total += trace(ro, rd, spheres, U.sphere_count, nodes, tris, tex_base,
-                       tex_mr, tex_emis, tex_norm, MU, rng, U.max_depth);
+                       tex_mr, tex_emis, tex_norm, env_texels, MU, U, rng,
+                       U.max_depth);
     }
     accum[px] += float4(total, 0.0f);
 }

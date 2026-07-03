@@ -21,6 +21,11 @@ struct SceneSnapshot {
     float mesh_model[16] = {1, 0, 0, 0, 0, 1, 0, 0,
                             0, 0, 1, 0, 0, 0, 0, 1};
 
+    // Session F: HDRI environment (empty source = gradient dome).
+    std::string env_source;   // stored scene-relative; resolved on load
+    float env_intensity = 1.0f;
+    float env_yaw_deg = 0.0f;
+
     // Camera pose.
     vec3 cam_pos{0.0f, 0.0f, 0.0f};
     float cam_yaw = 0.0f, cam_pitch = 0.0f;
@@ -31,6 +36,7 @@ struct SceneSnapshot {
     int final_target_spp = 2048;
     int max_depth = 16;
     int gpu_passes_per_tick = 8;
+    float clamp_indirect = 10.0f;
 };
 
 // Write the snapshot as pretty JSON. The mesh source is stored relative to
@@ -38,7 +44,8 @@ struct SceneSnapshot {
 // `mesh_source_abs` is the current session's mesh path (may be relative to
 // cwd); empty = no mesh. Returns false + `error` on I/O failure.
 bool save_scene(const std::string& path, const SceneSnapshot& snap,
-                const std::string& mesh_source_abs, std::string& error);
+                const std::string& mesh_source_abs,
+                const std::string& env_source_abs, std::string& error);
 
 // Parse and validate a scene file. Relative paths are probed in the
 // common launch locations (as given, then build/, then ../) since the app

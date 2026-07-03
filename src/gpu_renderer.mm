@@ -126,6 +126,10 @@ struct GpuRenderer::Impl {
     id<MTLBuffer> tex_emis;
     id<MTLBuffer> tex_norm;
     MeshUniforms mesh_u{};   // has_mesh = 0 by default
+    // Session F: HDRI environment (env_w == 0 -> gradient fallback).
+    id<MTLBuffer> env_texels;
+    pt_uint env_w = 0, env_h = 0;
+    float env_intensity = 1.0f, env_yaw_norm = 0.0f;
     // BVH register pressure can lower maxTotalThreadsPerThreadgroup below
     // a hardcoded 16x16=256, which would FAIL dispatch at runtime — pick
     // the threadgroup shape per pipeline at creation instead.
@@ -168,6 +172,11 @@ struct GpuRenderer::Impl {
         u.pass_count = pt_uint(count);
         u.sphere_count = sphere_count;
         u.max_depth = pt_uint(settings.max_depth);
+        u.env_w = env_w;
+        u.env_h = env_h;
+        u.env_intensity = env_intensity;
+        u.env_yaw_norm = env_yaw_norm;
+        u.clamp_indirect = settings.clamp_indirect;
 
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:accumulate_pso];
@@ -181,6 +190,7 @@ struct GpuRenderer::Impl {
         [enc setBuffer:tex_emis offset:0 atIndex:7];
         [enc setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
         [enc setBuffer:tex_norm offset:0 atIndex:9];
+        [enc setBuffer:env_texels offset:0 atIndex:10];
         [enc dispatchThreads:MTLSizeMake(w, h, 1)
             threadsPerThreadgroup:tg_accum];
         [enc endEncoding];
@@ -385,9 +395,29 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
     im.sphere_count = pt_uint(spheres.size());
 
     im.upload_mesh(mesh);
+    im.env_texels = im.upload(nullptr, 0);   // gradient until set_env
     im.w = settings.width;
     im.h = settings.height;
     return r;
+}
+
+void GpuRenderer::set_env(const EnvMap* env) {
+    if (env && env->valid()) {
+        impl_->env_texels =
+            impl_->upload(env->texels.data(),
+                          env->texels.size() * sizeof(float));
+        impl_->env_w = pt_uint(env->w);
+        impl_->env_h = pt_uint(env->h);
+    } else {
+        impl_->env_texels = impl_->upload(nullptr, 0);
+        impl_->env_w = 0;
+        impl_->env_h = 0;
+    }
+}
+
+void GpuRenderer::set_env_params(float intensity, float yaw_norm) {
+    impl_->env_intensity = intensity;
+    impl_->env_yaw_norm = yaw_norm;
 }
 
 void GpuRenderer::set_mesh(const MeshData* mesh) {
@@ -557,6 +587,10 @@ void GpuRenderer::encode_frame(const GPUCamera& cam, int count, void* layer,
 
 void GpuRenderer::set_max_depth(int depth) {
     impl_->settings.max_depth = depth;
+}
+
+void GpuRenderer::set_clamp_indirect(float clamp) {
+    impl_->settings.clamp_indirect = clamp;
 }
 
 void GpuRenderer::update_spheres(const std::vector<GPUSphere>& spheres) {

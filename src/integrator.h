@@ -21,7 +21,69 @@ inline color sky_radiance(const Ray& r) {
     return lerp(color(1.0f, 1.0f, 1.0f), color(0.5f, 0.7f, 1.0f), t);
 }
 
-inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth) {
+// ---- Session F: equirectangular HDRI environment ------------------------
+// Lookup ONLY (no NEE / importance sampling — next session): missed rays
+// sample the env map exactly where they sampled the gradient. All code
+// below is mirrored line-for-line in pathtrace.metal; --parity is the
+// drift detector, with special suspicion on atan2/acos ULPs.
+
+struct EnvLookup {
+    const float* texels = nullptr;   // RGBA float, linear radiance
+    int w = 0, h = 0;
+    float intensity = 1.0f;
+    float yaw_norm = 0.0f;           // yaw / 2pi, added to u
+};
+
+inline color env_fetch(const float* tex, int W, int x, int y) {
+    const float* p = tex + (std::size_t(y) * W + x) * 4;
+    return color(p[0], p[1], p[2]);
+}
+
+// Same manual-bilinear structure as material textures, with equirect
+// semantics: u WRAPS (azimuth seam), v CLAMPS (poles).
+inline color sample_env_bilinear(const float* tex, int W, int H, float u,
+                                 float v) {
+    u = u - std::floor(u);
+    v = std::fmin(std::fmax(v, 0.0f), 1.0f);
+    const float x = u * float(W) - 0.5f;
+    const float y = v * float(H) - 0.5f;
+    const float fx = std::floor(x), fy = std::floor(y);
+    const float ax = x - fx, ay = y - fy;
+    int x0 = int(fx), x1 = x0 + 1;
+    int y0 = int(fy), y1 = y0 + 1;
+    if (x0 < 0) x0 += W;
+    if (x1 >= W) x1 -= W;
+    if (y0 < 0) y0 = 0;
+    if (y1 >= H) y1 = H - 1;
+    const color c00 = env_fetch(tex, W, x0, y0), c10 = env_fetch(tex, W, x1, y0);
+    const color c01 = env_fetch(tex, W, x0, y1), c11 = env_fetch(tex, W, x1, y1);
+    return (1.0f - ax) * (1.0f - ay) * c00 + ax * (1.0f - ay) * c10 +
+           (1.0f - ax) * ay * c01 + ax * ay * c11;
+}
+
+// Direction -> lat-long UV -> radiance. Falls back to the gradient when no
+// map is loaded (--no HDRI, legacy scenes, CPU-viewer default).
+inline color miss_radiance(const EnvLookup& env, const Ray& r) {
+    if (!env.texels) return sky_radiance(r);
+    const vec3 d = normalize(r.dir);
+    const float u = std::atan2(d.z, d.x) * 0.15915494309189533577f + 0.5f +
+                    env.yaw_norm;
+    const float v =
+        std::acos(std::fmin(std::fmax(d.y, -1.0f), 1.0f)) *
+        0.31830988618379067154f;
+    return sample_env_bilinear(env.texels, env.w, env.h, u, v) *
+           env.intensity;
+}
+
+// Scale an indirect contribution so its max component <= m (0 = off).
+inline color clamp_contribution(const color& c, float m) {
+    if (m <= 0.0f) return c;
+    const float mx = std::fmax(c.x, std::fmax(c.y, c.z));
+    return mx > m ? c * (m / mx) : c;
+}
+
+inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
+                   const EnvLookup& env, float clamp_indirect) {
     color radiance(0.0f);      // light collected so far
     color throughput(1.0f);    // fraction of it that survives back to the eye
 
@@ -31,12 +93,19 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth) {
         // put its origin a hair inside, and t_min=0 would let it re-hit the
         // same surface at t≈0 ("shadow acne" — dark speckles everywhere).
         if (!world.hit(ray, 1e-3f, std::numeric_limits<float>::infinity(), rec)) {
-            return radiance + throughput * sky_radiance(ray);
+            const color c = throughput * miss_radiance(env, ray);
+            return radiance +
+                   (depth == 0 ? c : clamp_contribution(c, clamp_indirect));
         }
 
         // Collect whatever this surface emits (zero for non-lights), THEN
-        // try to continue the path.
-        radiance += throughput * rec.mat.emission;
+        // try to continue the path. Indirect pickups are firefly-clamped;
+        // depth 0 (directly visible lights/background) never is.
+        {
+            const color c = throughput * rec.mat.emission;
+            radiance +=
+                depth == 0 ? c : clamp_contribution(c, clamp_indirect);
+        }
 
         color attenuation;
         Ray scattered;

@@ -73,6 +73,11 @@ struct SceneState {
     std::string mesh_name;
     float mesh_model[16] = {1, 0, 0, 0, 0, 1, 0, 0,
                             0, 0, 1, 0, 0, 0, 0, 1};
+    // Session F: environment.
+    std::shared_ptr<const EnvMap> env;
+    std::string env_source_path;
+    float env_intensity = 1.0f;
+    float env_yaw_deg = 0.0f;
 };
 
 struct ViewerCore {
@@ -458,11 +463,18 @@ SceneState capture_state(const ViewerCore& core) {
     s.mesh_source_path = core.desc.mesh_source_path;
     s.mesh_name = core.desc.mesh_name;
     std::memcpy(s.mesh_model, core.mesh_model, sizeof s.mesh_model);
+    s.env = core.desc.env;
+    s.env_source_path = core.desc.env_source_path;
+    s.env_intensity = core.desc.env_intensity;
+    s.env_yaw_deg = core.desc.env_yaw_deg;
     return s;
 }
 
 bool states_equal(const SceneState& a, const SceneState& b) {
     if (a.mesh != b.mesh || a.mesh_name != b.mesh_name) return false;
+    if (a.env != b.env || a.env_intensity != b.env_intensity ||
+        a.env_yaw_deg != b.env_yaw_deg)
+        return false;
     if (std::memcmp(a.mesh_model, b.mesh_model, sizeof a.mesh_model) != 0)
         return false;
     if (a.spheres.size() != b.spheres.size()) return false;
@@ -477,6 +489,16 @@ bool states_equal(const SceneState& a, const SceneState& b) {
         }
     }
     return true;
+}
+
+// Push the desc's env state to the GPU (buffer swap only on identity
+// change; params always) — the single env-apply path.
+void apply_env(ViewerCore& core, bool env_changed) {
+    if (!core.gpu) return;
+    if (env_changed) core.gpu->set_env(core.desc.env.get());
+    core.gpu->set_env_params(core.desc.env_intensity,
+                             core.desc.env_yaw_deg / 360.0f);
+    core.mark_scene_dirty();
 }
 
 // Restores through the SAME apply paths as interactive edits, ending in
@@ -501,6 +523,13 @@ void restore_state(ViewerCore& core, const SceneState& s) {
     core.desc.mesh_name = s.mesh_name;
     std::memcpy(core.mesh_model, s.mesh_model, sizeof core.mesh_model);
     if (core.desc.mesh) apply_mesh_transform(core);
+
+    const bool env_changed = s.env != core.desc.env;
+    core.desc.env = s.env;
+    core.desc.env_source_path = s.env_source_path;
+    core.desc.env_intensity = s.env_intensity;
+    core.desc.env_yaw_deg = s.env_yaw_deg;
+    apply_env(core, env_changed);
 
     if (core.selection.kind == Selection::Kind::Sphere &&
         core.selection.index >= int(core.desc.spheres.size())) {
@@ -578,6 +607,9 @@ SceneSnapshot snapshot_from_core(const ViewerCore& core) {
         s.mesh_name = core.desc.mesh_name;
         std::memcpy(s.mesh_model, core.mesh_model, sizeof s.mesh_model);
     }
+    s.env_source = core.desc.env_source_path;
+    s.env_intensity = core.desc.env_intensity;
+    s.env_yaw_deg = core.desc.env_yaw_deg;
     s.cam_pos = core.fly.pos;
     s.cam_yaw = core.fly.yaw;
     s.cam_pitch = core.fly.pitch;
@@ -586,6 +618,7 @@ SceneSnapshot snapshot_from_core(const ViewerCore& core) {
     s.final_target_spp = core.settings.final_target_spp;
     s.max_depth = core.settings.max_depth;
     s.gpu_passes_per_tick = core.settings.gpu_passes_per_tick;
+    s.clamp_indirect = core.settings.clamp_indirect;
     return s;
 }
 
@@ -641,6 +674,37 @@ bool apply_snapshot(ViewerCore& core, SceneSnapshot&& snap,
         apply_mesh_transform(core);
     }
 
+    // Environment: import if the source changed; clear if absent.
+    {
+        bool env_changed = false;
+        if (snap.env_source.empty()) {
+            env_changed = core.desc.env != nullptr;
+            core.desc.env.reset();
+            core.desc.env_source_path.clear();
+        } else {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            const bool same =
+                core.desc.env &&
+                fs::weakly_canonical(snap.env_source, ec) ==
+                    fs::weakly_canonical(core.desc.env_source_path, ec);
+            if (!same) {
+                std::string err;
+                auto env = load_hdr(snap.env_source, err);
+                if (env) {
+                    core.desc.env = env;
+                    core.desc.env_source_path = snap.env_source;
+                    env_changed = true;
+                } else {
+                    std::fprintf(stderr, "scene env: %s\n", err.c_str());
+                }
+            }
+        }
+        core.desc.env_intensity = snap.env_intensity;
+        core.desc.env_yaw_deg = snap.env_yaw_deg;
+        apply_env(core, env_changed);
+    }
+
     core.fly.pos = snap.cam_pos;
     core.fly.yaw = snap.cam_yaw;
     core.fly.pitch = snap.cam_pitch;
@@ -649,7 +713,11 @@ bool apply_snapshot(ViewerCore& core, SceneSnapshot&& snap,
     core.settings.final_target_spp = snap.final_target_spp;
     core.settings.max_depth = snap.max_depth;
     core.settings.gpu_passes_per_tick = snap.gpu_passes_per_tick;
-    if (core.gpu) core.gpu->set_max_depth(snap.max_depth);
+    core.settings.clamp_indirect = snap.clamp_indirect;
+    if (core.gpu) {
+        core.gpu->set_max_depth(snap.max_depth);
+        core.gpu->set_clamp_indirect(snap.clamp_indirect);
+    }
 
     core.selection = Selection{};   // stale indices must not survive a load
     core.mark_scene_dirty();
@@ -682,7 +750,8 @@ void print_selection(const ViewerCore& core) {
 void render_thread_main(ViewerCore& core) {
     // Leave one core for the UI thread so event handling stays snappy.
     const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
-    ProgressiveRenderer renderer(core.scene, core.settings, hw - 1);
+    ProgressiveRenderer renderer(core.scene, core.settings, hw - 1,
+                                 env_lookup(core.desc));
 
     const auto settle =
         std::chrono::duration<float, std::milli>(core.settings.settle_ms);
@@ -975,6 +1044,9 @@ void render_thread_main(ViewerCore& core) {
     // Phase 5: scene file UI state.
     char scenePath_[256];
     std::string sceneStatus_;
+    // Session F: environment UI state.
+    char envPath_[256];
+    std::string envStatus_;
     // Phase 5.2: stats + rename buffer.
     Clock::time_point accumStart_;
     char nameBuf_[64];
@@ -993,6 +1065,8 @@ void render_thread_main(ViewerCore& core) {
         // The RGBA bytes are already gamma-encoded; sRGB labels them so.
         colorspace_ = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
         std::strncpy(scenePath_, "scene.json", sizeof scenePath_);
+        std::strncpy(envPath_, "assets/kloofendal_puresky_2k.hdr",
+                     sizeof envPath_);
     }
     return self;
 }
@@ -1674,10 +1748,78 @@ void render_thread_main(ViewerCore& core) {
         gpu.set_max_depth(s.max_depth);   // renderer holds its own copy
         dirty = true;
     }
+    if (ImGui::SliderFloat("clamp indirect", &s.clamp_indirect, 0.0f, 100.0f,
+                           s.clamp_indirect <= 0.0f ? "off" : "%.1f",
+                           ImGuiSliderFlags_Logarithmic)) {
+        gpu.set_clamp_indirect(s.clamp_indirect);
+        dirty = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Firefly control: caps indirect bounce spikes\n"
+                          "(HDRI suns). Direct light is never clamped.\n"
+                          "0 = off (unbiased).");
+    }
     if (dirty) {
         core_->final_saved = false;   // settings changed: re-arm the export
         core_->mark_scene_dirty();
     }
+
+    // ---- Environment (Session F) ----
+    ImGui::SeparatorText("Environment");
+    ImGui::SetNextItemWidth(-60.0f);
+    ImGui::InputText("hdr", envPath_, sizeof envPath_);
+    if (ImGui::Button("Load HDRI")) {
+        undo_begin(*core_);
+        std::string err, resolved;
+        // Reuse the launch-dir probing convention.
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        resolved = envPath_;
+        if (fs::path(resolved).is_relative() && !fs::exists(resolved, ec)) {
+            for (const char* prefix : {"../", "build/"}) {
+                if (fs::exists(fs::path(prefix) / envPath_, ec)) {
+                    resolved = (fs::path(prefix) / envPath_).string();
+                    break;
+                }
+            }
+        }
+        auto env = load_hdr(resolved, err);
+        if (env) {
+            core_->desc.env = env;
+            core_->desc.env_source_path = resolved;
+            apply_env(*core_, true);
+            undo_commit(*core_, "load HDRI");
+            envStatus_ = "loaded " + resolved;
+        } else {
+            core_->edit_active = false;   // nothing changed
+            envStatus_ = err;
+        }
+        std::printf("%s\n", envStatus_.c_str());
+        std::fflush(stdout);
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!core_->desc.env);
+    if (ImGui::Button("Clear")) {
+        undo_begin(*core_);
+        core_->desc.env.reset();
+        core_->desc.env_source_path.clear();
+        apply_env(*core_, true);
+        undo_commit(*core_, "clear HDRI");
+        envStatus_ = "gradient dome";
+    }
+    ImGui::EndDisabled();
+    if (core_->desc.env) {
+        bool env_edited = false;
+        env_edited |= ImGui::SliderFloat(
+            "intensity", &core_->desc.env_intensity, 0.05f, 8.0f, "%.2f",
+            ImGuiSliderFlags_Logarithmic);
+        undo_track(*core_);
+        env_edited |= ImGui::SliderFloat("env yaw", &core_->desc.env_yaw_deg,
+                                         -180.0f, 180.0f, "%.0f deg");
+        undo_track(*core_);
+        if (env_edited) apply_env(*core_, false);
+    }
+    if (!envStatus_.empty()) ImGui::TextWrapped("%s", envStatus_.c_str());
 
     ImGui::SeparatorText("Scene");
     ImGui::SetNextItemWidth(-60.0f);
@@ -1685,7 +1827,8 @@ void render_thread_main(ViewerCore& core) {
     if (ImGui::Button("Save")) {
         std::string err;
         if (save_scene(scenePath_, snapshot_from_core(*core_),
-                       core_->desc.mesh_source_path, err)) {
+                       core_->desc.mesh_source_path,
+                       core_->desc.env_source_path, err)) {
             std::error_code ec;
             sceneStatus_ = "saved " +
                 std::filesystem::absolute(scenePath_, ec).string();
@@ -1921,6 +2064,11 @@ int run_viewer(const RenderSettings& settings, bool use_gpu,
             std::string err;
             core->gpu = GpuRenderer::create(settings, flatten_scene(desc),
                                             desc.mesh.get(), err);
+            if (core->gpu && desc.env) {
+                core->gpu->set_env(desc.env.get());
+                core->gpu->set_env_params(desc.env_intensity,
+                                          desc.env_yaw_deg / 360.0f);
+            }
             if (!core->gpu) {
                 std::fprintf(stderr,
                              "GPU init failed (%s) — using CPU backend\n",

@@ -11,6 +11,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_PNG
+#define STBI_ONLY_HDR
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include "stb_image.h"
@@ -386,4 +387,26 @@ std::shared_ptr<const MeshData> load_glb(const std::string& path,
     // ---- BVH (permutes tris into leaf order) ----
     info.bvh = build_bvh(out->tris, out->nodes);
     return out;
+}
+
+std::shared_ptr<const EnvMap> load_hdr(const std::string& path,
+                                       std::string& error) {
+    int w = 0, h = 0, n = 0;
+    float* data = stbi_loadf(path.c_str(), &w, &h, &n, 3);
+    if (!data) {
+        error = "cannot load HDR: " + path;
+        return nullptr;
+    }
+    auto env = std::make_shared<EnvMap>();
+    env->w = w;
+    env->h = h;
+    env->texels.resize(std::size_t(w) * h * 4);
+    for (std::size_t i = 0, count = std::size_t(w) * h; i < count; ++i) {
+        env->texels[i * 4 + 0] = data[i * 3 + 0];   // linear radiance,
+        env->texels[i * 4 + 1] = data[i * 3 + 1];   // stored untouched
+        env->texels[i * 4 + 2] = data[i * 3 + 2];
+        env->texels[i * 4 + 3] = 1.0f;
+    }
+    stbi_image_free(data);
+    return env;
 }

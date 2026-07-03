@@ -95,6 +95,8 @@ int run_parity(const RenderSettings& settings, int spp,
         std::fprintf(stderr, "parity: %s\n", err.c_str());
         return 1;
     }
+    gpu->set_env(desc.env.get());
+    gpu->set_env_params(desc.env_intensity, desc.env_yaw_deg / 360.0f);
     auto t0 = Clock::now();
     gpu->render_passes_blocking(to_gpu_camera(camera), spp);
     const double gpu_s = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -107,7 +109,8 @@ int run_parity(const RenderSettings& settings, int spp,
     // --- CPU: passes 0..spp-1, then spp..2spp-1 for the noise floor ---
     const Scene scene = make_scene(desc);
     ProgressiveRenderer cpu(scene, settings,
-                            std::max(1u, std::thread::hardware_concurrency()));
+                            std::max(1u, std::thread::hardware_concurrency()),
+                            env_lookup(desc));
     t0 = Clock::now();
     for (int s = 0; s < spp; ++s) cpu.render_pass(camera);
     const double cpu_s = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -224,6 +227,7 @@ int main(int argc, char** argv) {
     Mode mode = Mode::Viewer;
     int spp_override = 0;
     std::string model_path;
+    std::string env_path;
     bool no_model = false;
     bool grid = false;
 
@@ -240,6 +244,8 @@ int main(int argc, char** argv) {
             model_path = argv[++i];
         } else if (std::strcmp(argv[i], "--no-model") == 0) {
             no_model = true;
+        } else if (std::strcmp(argv[i], "--env") == 0 && i + 1 < argc) {
+            env_path = argv[++i];
         } else if (std::strcmp(argv[i], "--grid") == 0) {
             grid = true;   // GGX validation: roughness x metallic array
         } else if (std::strcmp(argv[i], "--gpu-check") == 0) {
@@ -288,6 +294,18 @@ int main(int argc, char** argv) {
     SceneDesc desc =
         grid ? build_grid_desc() : build_scene_desc(std::move(mesh));
     if (desc.mesh) desc.mesh_source_path = resolved_model;
+    if (!env_path.empty()) {
+        std::string err;
+        auto env = load_hdr(env_path, err);
+        if (env) {
+            desc.env = env;
+            desc.env_source_path = env_path;
+            std::printf("environment: %s (%dx%d)\n", env_path.c_str(),
+                        env->w, env->h);
+        } else {
+            std::fprintf(stderr, "%s\n", err.c_str());
+        }
+    }
     if (grid) {
         // Elevated view so all 36 spheres and both axes read clearly.
         settings.cam_pos = point3(0.0f, 7.5f, 8.5f);
@@ -317,7 +335,8 @@ int main(int argc, char** argv) {
 
     const Scene scene = make_scene(desc);
     ProgressiveRenderer renderer(scene, settings,
-                                 std::max(1u, std::thread::hardware_concurrency()));
+                                 std::max(1u, std::thread::hardware_concurrency()),
+                                 env_lookup(desc));
 
     std::printf("rendering %dx%d @ %d spp, max depth %d\n", settings.width,
                 settings.height, settings.samples_per_pixel, settings.max_depth);

@@ -89,6 +89,14 @@ central reset hook), the selection readout, and scene Save/Load (JSON;
 geometry stored by reference — sphere parameters and a relative mesh path,
 never vertex data).
 
+The environment is an equirectangular HDRI (`--env <path.hdr>` or the
+panel's Environment section: load/clear, intensity, yaw — all persisted in
+scene files as a relative path). Radiance data stays linear (never
+sRGB-decoded), missed rays sample it with the same hand-written bilinear
+as material textures (u wraps, v clamps), and with no HDRI loaded the
+original gradient dome remains. Environment importance sampling / NEE is
+deliberately not implemented yet — bright suns converge slowly for now.
+
 Fast-nav (V) rasterizes the scene (flat-lit solid or wireframe) at full
 framerate while the camera moves — same camera matrices as the tracer, so
 it registers exactly — and hands back to path tracing on settle. The
