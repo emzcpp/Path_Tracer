@@ -1,0 +1,21 @@
+# Build output (includes generated shader-embed headers and binaries)
+build/
+*.o
+*.dSYM/
+
+# Render/export outputs
+out.png
+out.ppm
+render_*.png
+parity_*.png
+ref_*.png
+
+# UI state
+imgui.ini
+
+# macOS / editor cruft
+.DS_Store
+.vscode/
+.idea/
+
+# NOT ignored on purpose: external/ (vendored deps), assets/, Test_Models/

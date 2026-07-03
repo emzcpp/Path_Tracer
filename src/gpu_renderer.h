@@ -1,0 +1,99 @@
+#pragma once
+
+// GPU progressive renderer (Metal compute). This header is C++-clean —
+// all Objective-C lives in gpu_renderer.mm behind the pimpl — so pure C++
+// translation units (main.cpp, the parity harness) can drive the GPU.
+
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "camera.h"
+#include "gltf_loader.h"
+#include "kernel_types.h"
+#include "settings.h"
+
+// Fill the GPU camera from the CPU camera's own basis — same derivation,
+// no re-derived trig.
+inline GPUCamera to_gpu_camera(const Camera& cam) {
+    const auto p3 = [](const vec3& v) { return pt_float3{v.x, v.y, v.z}; };
+    return GPUCamera{p3(cam.origin()), p3(cam.lower_left()),
+                     p3(cam.horizontal()), p3(cam.vertical())};
+}
+
+class GpuRenderer {
+public:
+    // nullptr + `error` filled if there's no Metal device or the embedded
+    // kernel fails to compile. `mesh` may be null (sphere-only scene).
+    static std::unique_ptr<GpuRenderer> create(
+        const RenderSettings& settings, const std::vector<GPUSphere>& spheres,
+        const MeshData* mesh, std::string& error);
+    ~GpuRenderer();
+
+    // Switch accumulation dims (full <-> preview) and clear. The buffer is
+    // allocated once at full res; smaller dims use a prefix of it.
+    void reset(int w, int h);
+
+    int width() const;
+    int height() const;
+    int passes() const;   // passes scheduled since the last reset
+    // True between reset() and the next encoded batch. While pending,
+    // passes() still reports the PRE-reset count — callers gating on
+    // passes-reached-target must also check this.
+    bool reset_pending() const;
+
+    // Headless path (parity/offline): render `count` passes, block until
+    // the GPU finishes. Chunked internally to stay under the GPU watchdog.
+    void render_passes_blocking(const GPUCamera& cam, int count);
+
+    // Linear accumulation sums, width*height float4s (RGBX). Valid after a
+    // blocking render or wait_idle().
+    const float* accum_data() const;
+
+    void wait_idle() const;
+    bool save_png(const std::string& path) const;
+
+    // Optional UI overlay pass: called synchronously after resolve, before
+    // present, with the command buffer and drawable texture (bridged
+    // id<MTLCommandBuffer> / id<MTLTexture>).
+    using UiEncoder = std::function<void(void* command_buffer,
+                                         void* target_texture)>;
+
+    // Viewer path: encode [clear if pending +] `count` passes + resolve
+    // into the CAMetalLayer's next drawable + present. `count` may be 0:
+    // a present-only frame (resolve + UI) that keeps the overlay live
+    // while accumulation is parked. Non-blocking; on_complete fires on an
+    // arbitrary thread when the GPU finishes. `layer` is a CAMetalLayer*
+    // passed as void* to keep this header ObjC-free.
+    void encode_frame(const GPUCamera& cam, int count, void* layer,
+                      std::function<void()> on_complete,
+                      const UiEncoder& ui = {});
+
+    // Live-tunable from the UI (the renderer holds its own settings copy).
+    void set_max_depth(int depth);
+
+    // Phase 4 scene edits. Both swap in NEW buffers rather than mutating in
+    // place: Metal retains the old buffers for in-flight command buffers,
+    // so there is no GPU stall and no torn geometry — the next encoded
+    // batch simply binds the new data.
+    void update_spheres(const std::vector<GPUSphere>& spheres);
+    void update_mesh_geometry(const std::vector<GPUTriangle>& tris,
+                              const std::vector<BVHNode>& nodes);
+
+    // Phase 5 (scene load): swap the whole mesh — geometry AND textures —
+    // or remove it (nullptr). Same buffer-swap semantics as above.
+    void set_mesh(const MeshData* mesh);
+
+    // Bridged id<MTLDevice>, for CAMetalLayer.device.
+    void* metal_device() const;
+
+private:
+    GpuRenderer();
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// --gpu-check: create the device, compile the embedded kernels, print
+// device capabilities. Returns false on any failure.
+bool gpu_check();
