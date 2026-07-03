@@ -32,9 +32,18 @@ struct RenderSettings {
     // suns otherwise leave white speckle that outlives any sample count.
     float clamp_indirect = 10.0f;
 
-    // GPU backend: passes encoded per 60 Hz tick (per command buffer)
+    // GPU backend: passes encoded per 60 Hz tick (per command buffer).
+    // These are CAPS; the budget controller below decides the actual work.
     int gpu_passes_per_tick_preview = 4;
     int gpu_passes_per_tick         = 8;
+
+    // Session G: per-command-buffer GPU-time budget. No trace dispatch is
+    // allowed to run much past this — heavy frames are sliced into row
+    // ranges across ticks instead — so the compositor and the UI always
+    // get the GPU within one budget window. FINAL trades some of that
+    // headroom for convergence speed but stays preemptible/cancellable.
+    float gpu_budget_ms       = 10.0f;
+    float gpu_budget_ms_final = 24.0f;
 
     // Execution
     int thread_count = 0;         // 0 = use all hardware threads

@@ -2,6 +2,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -146,8 +147,13 @@ struct GpuRenderer::Impl {
     id<MTLCommandBuffer> last_cb;
     pt_uint sphere_count = 0;
     int w = 0, h = 0;        // current accumulation dims
-    int passes = 0;          // scheduled since reset
+    int passes = 0;          // completed full passes scheduled since reset
+    int cursor = 0;          // next row of the in-progress pass (0 = none)
     bool needs_clear = true;
+    // Timing of the last completed accumulate batch (written from Metal's
+    // completion handler thread, read by the main-thread tick).
+    std::atomic<float> last_gpu_ms{0.0f};
+    std::atomic<unsigned long long> last_px_passes{0};
 
     void encode_clear_if_needed(id<MTLCommandBuffer> cb) {
         if (!needs_clear) return;
@@ -160,16 +166,23 @@ struct GpuRenderer::Impl {
         [blit endEncoding];
         needs_clear = false;
         passes = 0;
+        cursor = 0;
     }
 
+    // Full frame (row_count == h): K passes in-kernel — the headless
+    // parity/offline path and cheap interactive frames. Slice (row_count <
+    // h): a single pass over [row_start, row_start+row_count), so heavy
+    // frames are spread across many short command buffers.
     void encode_accumulate(id<MTLCommandBuffer> cb, const GPUCamera& cam,
-                           int count) {
+                           int count, int row_start = 0, int row_count = 0) {
+        const bool slice = row_count > 0 && row_count < h;
         PassUniforms u{};
         u.cam = cam;
         u.width = pt_uint(w);
         u.height = pt_uint(h);
         u.pass_base = pt_uint(passes);
-        u.pass_count = pt_uint(count);
+        u.pass_count = pt_uint(slice ? 1 : count);
+        u.row_offset = pt_uint(slice ? row_start : 0);
         u.sphere_count = sphere_count;
         u.max_depth = pt_uint(settings.max_depth);
         u.env_w = env_w;
@@ -191,10 +204,18 @@ struct GpuRenderer::Impl {
         [enc setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
         [enc setBuffer:tex_norm offset:0 atIndex:9];
         [enc setBuffer:env_texels offset:0 atIndex:10];
-        [enc dispatchThreads:MTLSizeMake(w, h, 1)
+        [enc dispatchThreads:MTLSizeMake(w, slice ? row_count : h, 1)
             threadsPerThreadgroup:tg_accum];
         [enc endEncoding];
-        passes += count;
+        if (slice) {
+            cursor = row_start + row_count;
+            if (cursor >= h) {
+                passes += 1;
+                cursor = 0;
+            }
+        } else {
+            passes += count;
+        }
     }
 
     void ensure_raster_depth(id<MTLTexture> target) {
@@ -298,6 +319,7 @@ struct GpuRenderer::Impl {
         u.out_w = pt_uint(target.width);
         u.out_h = pt_uint(target.height);
         u.pass_total = pt_uint(passes);
+        u.rows_plus1 = pt_uint(cursor);
 
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:resolve_pso];
@@ -437,6 +459,7 @@ void GpuRenderer::reset(int w, int h) {
     impl_->w = w;
     impl_->h = h;
     impl_->needs_clear = true;
+    impl_->cursor = 0;
 }
 
 int GpuRenderer::width() const  { return impl_->w; }
@@ -539,14 +562,23 @@ void GpuRenderer::encode_raster_frame(const RasterParams& params, void* layer,
     impl_->last_cb = cb;
 }
 
-void GpuRenderer::encode_frame(const GPUCamera& cam, int count, void* layer,
+void GpuRenderer::encode_frame(const GPUCamera& cam, const TraceWork& work,
+                               void* layer,
                                std::function<void()> on_complete,
                                const UiEncoder& ui,
                                const RasterParams* overlay) {
     CAMetalLayer* metal_layer = (__bridge CAMetalLayer*)layer;
     id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
     impl_->encode_clear_if_needed(cb);
-    if (count > 0) impl_->encode_accumulate(cb, cam, count);
+    unsigned long long px_passes = 0;
+    if (work.passes > 0) {
+        impl_->encode_accumulate(cb, cam, work.passes, work.row_start,
+                                 work.row_count);
+        const bool slice = work.row_count > 0 && work.row_count < impl_->h;
+        px_passes = (unsigned long long)(impl_->w) *
+                    (slice ? work.row_count : impl_->h) *
+                    (slice ? 1 : work.passes);
+    }
 
     // Drawable acquired LAST (after all CPU-side work) and nil-checked:
     // when the pool is exhausted nextDrawable can block, so the pacing
@@ -578,11 +610,53 @@ void GpuRenderer::encode_frame(const GPUCamera& cam, int count, void* layer,
             [cb presentDrawable:drawable];
         }
     }
-    if (on_complete) {
-        [cb addCompletedHandler:^(id<MTLCommandBuffer>) { on_complete(); }];
-    }
+    // Timing lands from Metal's completion thread; the tick reads the
+    // atomics to steer the next frame's budget.
+    Impl* impl = impl_.get();
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (px_passes > 0) {
+            const double ms = (done.GPUEndTime - done.GPUStartTime) * 1000.0;
+            impl->last_gpu_ms.store(float(ms), std::memory_order_relaxed);
+            impl->last_px_passes.store(px_passes, std::memory_order_relaxed);
+        }
+        if (on_complete) on_complete();
+    }];
     [cb commit];
     impl_->last_cb = cb;
+}
+
+int GpuRenderer::partial_row() const { return impl_->cursor; }
+float GpuRenderer::last_batch_gpu_ms() const {
+    return impl_->last_gpu_ms.load(std::memory_order_relaxed);
+}
+unsigned long long GpuRenderer::last_batch_px_passes() const {
+    return impl_->last_px_passes.load(std::memory_order_relaxed);
+}
+
+void GpuRenderer::save_png_async(const std::string& path,
+                                 std::function<void(bool ok)> done) {
+    // Snapshot the ingredients now; the caller pauses accumulate encodes
+    // until `done`, so the accum contents are stable once this CB retires.
+    id<MTLCommandBuffer> cb = impl_->last_cb;
+    Impl* impl = impl_.get();
+    const int w = impl_->w, h = impl_->h;
+    const int passes = impl_->passes, cursor = impl_->cursor;
+    dispatch_async(
+        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (cb) [cb waitUntilCompleted];
+            const float* a = static_cast<const float*>(impl->accum.contents);
+            Image img(w, h);
+            for (int y = 0; y < h; ++y) {
+                const float inv_n =
+                    1.0f / float(std::max(1, passes + (y < cursor ? 1 : 0)));
+                for (int x = 0; x < w; ++x) {
+                    const size_t i = (size_t(y) * w + x) * 4;
+                    img.at(x, y) = color(a[i], a[i + 1], a[i + 2]) * inv_n;
+                }
+            }
+            const bool ok = img.write_png(path);
+            dispatch_async(dispatch_get_main_queue(), ^{ done(ok); });
+        });
 }
 
 void GpuRenderer::set_max_depth(int depth) {

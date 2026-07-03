@@ -60,6 +60,34 @@ public:
     using UiEncoder = std::function<void(void* command_buffer,
                                          void* target_texture)>;
 
+    // Session G: one tick's worth of trace work, bounded by the caller so
+    // no single command buffer monopolizes the GPU. passes == 0 encodes a
+    // present-only frame. row_count == 0 means the full frame; a nonzero
+    // row_count dispatches a K=1 slice of rows [row_start, row_start +
+    // row_count). Slicing never changes the accumulated image — seeds are
+    // per (pixel, pass) — only the schedule.
+    struct TraceWork {
+        int passes = 0;
+        int row_start = 0;
+        int row_count = 0;
+    };
+
+    // Row where the in-progress pass stops (0 = at a pass boundary).
+    int partial_row() const;
+
+    // GPU time and size of the most recently COMPLETED accumulate batch
+    // (from MTLCommandBuffer GPUStart/EndTime). Zero until one completes.
+    // The tick's budget controller derives ns/(pixel*pass) from these.
+    float last_batch_gpu_ms() const;
+    unsigned long long last_batch_px_passes() const;
+
+    // Async PNG export: waits for the GPU and encodes on a background
+    // queue; `done` fires on the MAIN queue. The caller must pause new
+    // accumulate work until then (present-only frames are fine) so the
+    // snapshot is race-free. Never blocks the calling thread.
+    void save_png_async(const std::string& path,
+                        std::function<void(bool ok)> done);
+
     // Session E: raster navigation preview + selection overlay.
     struct RasterParams {
         float view[16];          // the SAME matrices ImGuizmo uses —
@@ -79,8 +107,8 @@ public:
     // passed as void* to keep this header ObjC-free. When `overlay` is
     // non-null, the selected object's wireframe is drawn over the traced
     // image (registration guaranteed: same camera matrices).
-    void encode_frame(const GPUCamera& cam, int count, void* layer,
-                      std::function<void()> on_complete,
+    void encode_frame(const GPUCamera& cam, const TraceWork& work,
+                      void* layer, std::function<void()> on_complete,
                       const UiEncoder& ui = {},
                       const RasterParams* overlay = nullptr);
 

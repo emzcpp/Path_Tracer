@@ -102,6 +102,13 @@ framerate while the camera moves — same camera matrices as the tracer, so
 it registers exactly — and hands back to path tracing on settle. The
 selected object always shows a wireframe overlay, in both modes.
 
+Trace work is scheduled against a per-command-buffer GPU-time budget
+(panel slider, default 10 ms; FINAL uses 24 ms): cheap frames batch several
+passes, heavy frames (4K/4x) are sliced into row ranges across ticks, so no
+dispatch monopolizes the GPU and the UI stays responsive at any detail.
+Slicing never changes the image — seeds are per (pixel, pass). PNG exports
+run on a background queue; the main thread never waits on the GPU.
+
 While the camera moves the renderer drops to a half-resolution preview;
 once you stop for ~150 ms it switches back to full resolution and
 progressively accumulates samples — the title bar shows the live sample

@@ -50,12 +50,18 @@ struct PassUniforms {
     float env_intensity;
     float env_yaw_norm;     // yaw as a u offset (yaw / 2pi)
     float clamp_indirect;   // firefly clamp; 0 = off
+    // Session G (responsiveness): dispatches may cover a row slice of the
+    // frame so no single command buffer runs long. Seeds depend only on
+    // (pixel, pass), so the accumulated result is bit-identical no matter
+    // how work is sliced.
+    pt_uint row_offset;
 };
 
 struct ResolveUniforms {
     pt_uint accum_w, accum_h;   // accumulation dims (may be preview-sized)
     pt_uint out_w, out_h;       // drawable dims (always full res)
-    pt_uint pass_total;
+    pt_uint pass_total;         // completed full passes
+    pt_uint rows_plus1;         // rows [0, rows_plus1) carry one extra pass
 };
 
 // ---- Triangle mesh (glTF import) ----
@@ -95,8 +101,8 @@ struct MeshUniforms {
 static_assert(sizeof(pt_float3) == 12, "pt_float3 must be 12 bytes");
 static_assert(sizeof(GPUSphere) == 64, "GPUSphere must be one cacheline");
 static_assert(sizeof(GPUCamera) == 48, "GPUCamera layout drifted");
-static_assert(sizeof(PassUniforms) == 92, "PassUniforms layout drifted");
-static_assert(sizeof(ResolveUniforms) == 20, "ResolveUniforms layout drifted");
+static_assert(sizeof(PassUniforms) == 96, "PassUniforms layout drifted");
+static_assert(sizeof(ResolveUniforms) == 24, "ResolveUniforms layout drifted");
 static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");
 static_assert(sizeof(GPUTriangle) == 144, "GPUTriangle must be nine 16B rows");
 static_assert(sizeof(MeshUniforms) == 64, "MeshUniforms layout drifted");

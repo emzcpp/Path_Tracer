@@ -1036,6 +1036,13 @@ void render_thread_main(ViewerCore& core) {
     // GPU backend state — main-thread only, no locks anywhere.
     CAMetalLayer* metalLayer_;
     dispatch_semaphore_t gpuInflight_;
+    // Session G: budget controller + instrumentation (zeroed in init).
+    float nsPerPxPass_;   // EMA cost model from completed batches
+    float gpuMsEma_;      // smoothed per-CB GPU time (display)
+    float tickMsEma_;     // smoothed main-thread tick time (display)
+    int lastSliceRows_;   // last submitted work shape (display)
+    int lastSliceK_;
+    bool savingPng_;      // async export in flight: pause new traces
     std::uint64_t gpuAppliedGen_;
     int gpuLastPasses_;
     float gpuRate_;   // smoothed passes/s for the title
@@ -1115,6 +1122,9 @@ void render_thread_main(ViewerCore& core) {
     if (core_->use_gpu) {
         metalLayer_ = (CAMetalLayer*)view_.layer;
         gpuInflight_ = dispatch_semaphore_create(2);
+        nsPerPxPass_ = gpuMsEma_ = tickMsEma_ = 0.0f;
+        lastSliceRows_ = lastSliceK_ = 0;
+        savingPng_ = false;
         gpuAppliedGen_ = 0;   // != generation (1): first tick clears + starts
         accumStart_ = Clock::now();
         [self updateRenderSize];
@@ -1249,6 +1259,19 @@ void render_thread_main(ViewerCore& core) {
 // simply skips encoding — input stays responsive, convergence rate degrades
 // gracefully.
 - (void)tickGPU:(float)dt {
+    const auto tick_t0 = Clock::now();
+    struct TickTimer {   // EMA on every exit path
+        PTAppDelegate* d;
+        std::chrono::steady_clock::time_point t0;
+        ~TickTimer() {
+            const float ms = std::chrono::duration<float, std::milli>(
+                                 Clock::now() - t0)
+                                 .count();
+            d->tickMsEma_ = d->tickMsEma_ > 0.0f
+                                ? 0.9f * d->tickMsEma_ + 0.1f * ms
+                                : ms;
+        }
+    } tick_timer{self, tick_t0};
     GpuRenderer& gpu = *core_->gpu;
     const auto now = Clock::now();
 
@@ -1322,6 +1345,22 @@ void render_thread_main(ViewerCore& core) {
     // camera moves, a rasterized frame replaces tracing entirely; movement
     // keeps bumping the generation, so on settle the tracer reconverges
     // from the current pose through the normal reset machinery.
+    // Session G budget controller: learn the cost of a pixel-pass from
+    // completed command buffers, then size each tick's work to a GPU-time
+    // budget. Cheap frames run K full passes exactly as before; expensive
+    // frames drop to one pass, then to a slice of rows — so no dispatch
+    // monopolizes the GPU and the compositor/UI always get their slot.
+    // The schedule changes; the accumulated image does not.
+    {
+        const float bms = gpu.last_batch_gpu_ms();
+        const unsigned long long bpx = gpu.last_batch_px_passes();
+        if (bms > 0.05f && bpx > 0) {
+            const float ns = bms * 1.0e6f / float(bpx);
+            nsPerPxPass_ =
+                nsPerPxPass_ > 0.0f ? 0.8f * nsPerPxPass_ + 0.2f * ns : ns;
+            gpuMsEma_ = gpuMsEma_ > 0.0f ? 0.8f * gpuMsEma_ + 0.2f * bms : bms;
+        }
+    }
     if (dispatch_semaphore_wait(gpuInflight_, DISPATCH_TIME_NOW) == 0) {
         dispatch_semaphore_t sem = gpuInflight_;
         const auto ui_enc = [self](void* cb, void* tex) {
@@ -1332,15 +1371,50 @@ void render_thread_main(ViewerCore& core) {
                                     [sem] { dispatch_semaphore_signal(sem); },
                                     ui_enc);
         } else {
-            int k = 0;
-            if (gpu.passes() < target && !core_->paused) {
-                k = moving ? core_->settings.gpu_passes_per_tick_preview
+            GpuRenderer::TraceWork work{};   // passes == 0: present-only
+            if (gpu.passes() < target && !core_->paused && !savingPng_) {
+                const int kcap =
+                    moving ? core_->settings.gpu_passes_per_tick_preview
                            : core_->settings.gpu_passes_per_tick;
-                if (target != INT_MAX) k = std::min(k, target - gpu.passes());
+                const float budget = final_mode
+                                         ? core_->settings.gpu_budget_ms_final
+                                         : core_->settings.gpu_budget_ms;
+                const int cursor = gpu.partial_row();
+                if (nsPerPxPass_ <= 0.0f) {
+                    // First batch after launch: a modest probe to seed the
+                    // cost model without risking a monster dispatch.
+                    work.passes = 1;
+                    work.row_start = cursor;
+                    work.row_count =
+                        std::min(h - cursor, std::max(32, h / 8));
+                } else {
+                    const double budget_px =
+                        double(budget) * 1.0e6 / nsPerPxPass_;
+                    const double full = double(w) * double(h);
+                    if (cursor > 0) {
+                        // Finish the in-progress pass first.
+                        work.passes = 1;
+                        work.row_start = cursor;
+                        work.row_count = std::clamp(
+                            int(budget_px / w), 32, h - cursor);
+                    } else if (budget_px >= full) {
+                        int k = int(std::min<double>(kcap, budget_px / full));
+                        if (target != INT_MAX)
+                            k = std::min(k, target - gpu.passes());
+                        work.passes = std::max(1, k);
+                    } else {
+                        work.passes = 1;
+                        work.row_start = 0;
+                        work.row_count =
+                            std::clamp(int(budget_px / w), 32, h);
+                    }
+                }
+                lastSliceK_ = work.passes;
+                lastSliceRows_ = work.row_count > 0 ? work.row_count : h;
             }
             const Camera cam = core_->fly.make_camera(
                 core_->settings.vfov_deg, core_->settings.aspect());
-            gpu.encode_frame(to_gpu_camera(cam), k,
+            gpu.encode_frame(to_gpu_camera(cam), work,
                              (__bridge void*)metalLayer_,
                              [sem] { dispatch_semaphore_signal(sem); }, ui_enc,
                              rp.overlay_kind != 0 ? &rp : nullptr);
@@ -1352,22 +1426,36 @@ void render_thread_main(ViewerCore& core) {
     // !reset_pending(): right after a reset, passes() still reports the
     // pre-reset count until a batch is encoded — without the gate, a
     // semaphore-starved entry tick could export the stale image.
-    if (final_mode && !gpu.reset_pending() &&
+    // Exports are ASYNC (Session G): the wait + readback + PNG encode run
+    // on a background queue while the tick keeps presenting 0-pass frames
+    // (savingPng_ pauses new trace work so the snapshot is race-free). The
+    // main thread never calls waitUntilCompleted anymore.
+    if (final_mode && !gpu.reset_pending() && gpu.partial_row() == 0 &&
         gpu.passes() >= core_->settings.final_target_spp &&
         !core_->final_saved.exchange(true)) {
         const std::string name = timestamped_png_name();
-        if (gpu.save_png(name)) {
-            std::printf("FINAL: saved %s (%dx%d @ %d spp)\n", name.c_str(),
-                        gpu.width(), gpu.height(), gpu.passes());
-        }
+        const int sw = gpu.width(), sh = gpu.height(), sp = gpu.passes();
+        savingPng_ = true;
+        gpu.save_png_async(name, [self, name, sw, sh, sp](bool ok) {
+            self->savingPng_ = false;
+            if (ok)
+                std::printf("FINAL: saved %s (%dx%d @ %d spp)\n",
+                            name.c_str(), sw, sh, sp);
+            std::fflush(stdout);
+        });
     }
 
-    if (core_->save_requested.exchange(false)) {
+    if (core_->save_requested.exchange(false) && !savingPng_) {
         const std::string name = timestamped_png_name();
-        if (gpu.save_png(name)) {
-            std::printf("saved %s (%dx%d @ %d spp)\n", name.c_str(),
-                        gpu.width(), gpu.height(), gpu.passes());
-        }
+        const int sw = gpu.width(), sh = gpu.height(), sp = gpu.passes();
+        savingPng_ = true;
+        gpu.save_png_async(name, [self, name, sw, sh, sp](bool ok) {
+            self->savingPng_ = false;
+            if (ok)
+                std::printf("saved %s (%dx%d @ %d spp)\n", name.c_str(), sw,
+                            sh, sp);
+            std::fflush(stdout);
+        });
     }
 
     // Smoothed pass rate for the title (scheduled counts; ahead of the GPU
@@ -1449,6 +1537,20 @@ void render_thread_main(ViewerCore& core) {
             Clock::now() - accumStart_).count();
         ImGui::Text("%d spp · %.0f passes/s · %.1fs", gpu.passes(), gpuRate_,
                     accum_s);
+    }
+    // Session G telemetry: per-CB GPU time vs budget, main-thread tick
+    // time, and the shape of the last submitted slice.
+    if (gpuMsEma_ > 0.0f) {
+        ImGui::Text("GPU %.1f ms/batch · tick %.2f ms · %.1f ns/px·pass",
+                    gpuMsEma_, tickMsEma_, nsPerPxPass_);
+        if (lastSliceRows_ > 0 && lastSliceRows_ < gpu.height()) {
+            ImGui::Text("slicing: %d rows/batch (%d batches/pass)",
+                        lastSliceRows_,
+                        (gpu.height() + lastSliceRows_ - 1) / lastSliceRows_);
+        } else if (lastSliceK_ > 0) {
+            ImGui::Text("full frame · %d pass%s/batch", lastSliceK_,
+                        lastSliceK_ == 1 ? "" : "es");
+        }
     }
     ImGui::Checkbox("Pause accumulation", &core_->paused);
     ImGui::BeginDisabled(core_->undo_stack.empty() && !core_->edit_active);
@@ -1742,6 +1844,14 @@ void render_thread_main(ViewerCore& core) {
     // future scene edits will use. No other accumulator-clear path exists.
     bool dirty = false;
     dirty |= ImGui::SliderInt("passes / tick", &s.gpu_passes_per_tick, 1, 32);
+    ImGui::SliderFloat("GPU budget", &s.gpu_budget_ms, 4.0f, 33.0f,
+                       "%.0f ms");   // scheduling only — never resets accum
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Interactivity vs throughput: max GPU time per\n"
+                          "trace batch. Lower = smoother UI, higher = faster\n"
+                          "convergence. FINAL mode uses %.0f ms.",
+                          s.gpu_budget_ms_final);
+    }
     dirty |= ImGui::SliderInt("final target spp", &s.final_target_spp, 64,
                               16384, "%d", ImGuiSliderFlags_Logarithmic);
     if (ImGui::SliderInt("max bounces", &s.max_depth, 1, 32)) {

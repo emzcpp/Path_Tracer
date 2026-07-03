@@ -657,8 +657,12 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                        device const ushort* tex_norm   [[buffer(9)]],
                        device const float* env_texels  [[buffer(10)]],
                        uint2 gid [[thread_position_in_grid]]) {
-    // dispatchThreads => exact grid, no bounds guard needed
-    const ulong px = ulong(gid.y) * U.width + gid.x;
+    // The dispatch may cover a row slice [row_offset, row_offset+rows);
+    // everything below keys off the FRAME pixel, so slicing is invisible
+    // to the math (identical seeds and jitter per (pixel, pass)).
+    const uint py = gid.y + U.row_offset;
+    if (py >= U.height) return;
+    const ulong px = ulong(py) * U.width + gid.x;
     const float inv_w = 1.0f / float(U.width);
     const float inv_h = 1.0f / float(U.height);
 
@@ -668,7 +672,7 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
         PRNG rng = pcg_init(mix64(px ^ (pass << 32)), px);
 
         const float u = (float(gid.x) + pcg_next_float(rng)) * inv_w;
-        const float v = 1.0f - (float(gid.y) + pcg_next_float(rng)) * inv_h;
+        const float v = 1.0f - (float(py) + pcg_next_float(rng)) * inv_h;
         const float3 ro = c3(U.cam.origin);
         const float3 rd = c3(U.cam.lower_left) + u * c3(U.cam.horizontal) +
                           v * c3(U.cam.vertical) - ro;
@@ -690,7 +694,10 @@ kernel void resolve(device const float4* accum         [[buffer(0)]],
     const uint sy = gid.y * U.accum_h / U.out_h;
     const float4 sum = accum[ulong(sy) * U.accum_w + sx];
 
-    const float inv_n = 1.0f / float(max(U.pass_total, 1u));
+    // Rows above the partial-pass cursor carry one extra sample; normalize
+    // per source row so mid-pass frames display without banding.
+    const uint n = U.pass_total + (sy < U.rows_plus1 ? 1u : 0u);
+    const float inv_n = 1.0f / float(max(n, 1u));
     // Same gamma as image.h's encode_channel, so the screen matches PNGs.
     float3 c = pow(fmax(sum.xyz * inv_n, 0.0f), float3(1.0f / 2.2f));
     out.write(float4(saturate(c), 1.0f), gid);
