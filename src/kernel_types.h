@@ -60,9 +60,10 @@ struct PassUniforms {
     // Session J: number of area lights (emissive spheres/triangles) in the
     // light list; 0 = none (area NEE off).
     pt_uint light_count;
-    // Session K: RIS candidate count per light slot (partitioned pipeline).
+    // Session K: RIS candidate count per light slot (partitioned pipeline)
+    // and the temporal-reuse toggle (Stage 2).
     pt_uint restir_m;
-    pt_uint pad_h2;
+    pt_uint restir_temporal;
 };
 
 struct ResolveUniforms {
@@ -141,6 +142,31 @@ struct GPULight {
     float sel_pdf;      pt_uint pad0;
 };
 
+// Session K Stage 2: per-pixel persistent reservoirs (temporal reuse).
+// One slot per light strategy. The sample representation is chosen so a
+// sample is a FIXED object independent of the (jittered) receiving
+// surface: env slot stores the direction (solid-angle measure); the area
+// slot stores the light id plus either the world-space point (spheres —
+// cone samples aren't portable) or the barycentrics (triangles), with
+// its RIS bookkeeping in the AREA measure so re-evaluating the target at
+// a new surface applies the correct cos/r^2 Jacobian. W and M follow the
+// standard reservoir form; M == 0 marks an empty/invalidated slot.
+struct ReSTIRSlot {
+    float ax, ay, az;     // env: direction | sphere: point | tri: (bu,bv,-)
+    float W;
+    float M;
+    pt_uint light_id_p1;  // 0 for the env slot
+    pt_uint pad0, pad1;
+};
+
+struct ReSTIRPixel {
+    ReSTIRSlot env_slot;
+    ReSTIRSlot area_slot;
+    pt_float3 prev_normal;   // similarity gate for history validity
+    float prev_t;
+    pt_uint pad[4];
+};
+
 // Session K (ReSTIR Stage 0.5): per-pixel primary-hit record. Written by
 // the g_primary phase, consumed by the direct phase (vertex-0 lighting)
 // and the indirect continuation. rng_lo/hi carry the PCG stream state
@@ -168,6 +194,8 @@ static_assert(sizeof(GPUTriangle) == 144, "GPUTriangle must be nine 16B rows");
 static_assert(sizeof(MeshUniforms) == 32, "MeshUniforms layout drifted");
 static_assert(sizeof(GPULight) == 96, "GPULight must be six 16B rows");
 static_assert(sizeof(GBufferPx) == 96, "GBufferPx must be six 16B rows");
+static_assert(sizeof(ReSTIRSlot) == 32, "ReSTIRSlot layout drifted");
+static_assert(sizeof(ReSTIRPixel) == 96, "ReSTIRPixel layout drifted");
 static_assert(sizeof(GPUMaterialArgs) == 64,
               "GPUMaterialArgs must be four 8B pointers + eight uints");
 #endif

@@ -121,6 +121,7 @@ struct GpuRenderer::Impl {
     id<MTLComputePipelineState> direct_pso;
     id<MTLComputePipelineState> indirect_pso;
     id<MTLBuffer> gbuf;   // GBufferPx per pixel, allocated at full res
+    id<MTLBuffer> resv;   // ReSTIRPixel per pixel (temporal reservoirs)
     id<MTLBuffer> accum;     // full-res float4, StorageModeShared
     id<MTLBuffer> spheres;   // bound as constant GPUSphere*
     // Mesh data (placeholder-sized when no mesh — Metal requires every
@@ -178,6 +179,11 @@ struct GpuRenderer::Impl {
         [blit fillBuffer:accum
                    range:NSMakeRange(0, size_t(w) * h * sizeof(float) * 4)
                    value:0];
+        // Session K: reservoirs reset WITH the accumulation — the central
+        // reset is the temporal-reuse ghosting guarantee.
+        [blit fillBuffer:resv
+                   range:NSMakeRange(0, size_t(w) * h * sizeof(ReSTIRPixel))
+                   value:0];
         [blit endEncoding];
         needs_clear = false;
         passes = 0;
@@ -208,6 +214,7 @@ struct GpuRenderer::Impl {
         u.env_nee = pt_uint(settings.env_nee != 0 ? 1 : 0);
         u.light_count = light_count;
         u.restir_m = pt_uint(settings.restir_m > 0 ? settings.restir_m : 1);
+        u.restir_temporal = pt_uint(settings.restir_temporal != 0 ? 1 : 0);
 
         if (settings.restir != 0) {
             // Partitioned: K sequential (g_primary -> direct -> indirect)
@@ -251,6 +258,7 @@ struct GpuRenderer::Impl {
                 [e setBuffer:env_row_cdf offset:0 atIndex:11];
                 [e setBuffer:env_cond_cdf offset:0 atIndex:12];
                 [e setBuffer:lights offset:0 atIndex:13];
+                [e setBuffer:resv offset:0 atIndex:14];
                 for (id<MTLBuffer> t : mat_textures) {
                     [e useResource:t usage:MTLResourceUsageRead];
                 }
@@ -551,6 +559,10 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
         newBufferWithLength:size_t(settings.width) * settings.height *
                             sizeof(GBufferPx)
                     options:MTLResourceStorageModeShared];
+    im.resv = [device
+        newBufferWithLength:size_t(settings.width) * settings.height *
+                            sizeof(ReSTIRPixel)
+                    options:MTLResourceStorageModeShared];
     // Guarded like update_spheres: --only-model scenes have no spheres,
     // and a zero-length newBufferWithBytes returns NIL (unbound buffer(1)).
     im.spheres = im.upload(spheres.empty() ? nullptr : spheres.data(),
@@ -619,6 +631,12 @@ void GpuRenderer::reset(int w, int h) {
     if (gneeded > impl_->gbuf.length) {
         impl_->gbuf =
             [impl_->device newBufferWithLength:gneeded
+                                       options:MTLResourceStorageModeShared];
+    }
+    const size_t rneeded = size_t(w) * h * sizeof(ReSTIRPixel);
+    if (rneeded > impl_->resv.length) {
+        impl_->resv =
+            [impl_->device newBufferWithLength:rneeded
                                        options:MTLResourceStorageModeShared];
     }
     impl_->w = w;

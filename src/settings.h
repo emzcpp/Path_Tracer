@@ -59,6 +59,10 @@ struct RenderSettings {
     int restir = 0;
     // RIS candidates per light slot (env / area) at the primary vertex.
     int restir_m = 8;
+    // Stage 2: temporal reservoir reuse (within one accumulation run —
+    // reservoirs reset with the accumulation through the central reset,
+    // which is the ghosting guarantee). M-capped at 20x.
+    int restir_temporal = 1;
 
     // Execution
     int thread_count = 0;         // 0 = use all hardware threads

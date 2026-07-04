@@ -389,33 +389,40 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
         can_nee_light_out = can_nee_light;
 }
 
-// ---- Session K Stage 1: RIS direct lighting (partitioned pipeline) ----
-// Weighted reservoir sampling over M candidates per light slot. The
-// candidates come from the SAME source distributions plain NEE uses (env
-// CDF / power-weighted light pick); each is weighted target/source with
-// target = luminance of the unshadowed MIS-weighted contribution; ONE
-// shadow ray resolves the winner with the RIS factor w_sum/(M * target).
-// The BSDF strategy stays in the path continuation exactly as validated
-// — RIS only sharpens the light-slot estimators, so the MIS partition of
-// unity is untouched and unbiasedness follows for any positive target.
-// Mirrored in pathtrace.metal.
-inline void sample_direct_ris(const HitRecord& rec, const Ray& ray,
-                              const Hittable& world, RNG& rng,
-                              const EnvLookup& env,
-                              const LightsLookup& lights, int M,
-                              float clamp_indirect, color& radiance) {
+// ---- Session K Stages 1+2: RIS + temporal reservoirs (partitioned) ----
+// Per light slot: weighted reservoir sampling over M fresh candidates
+// (Stage 1, numerics unchanged — the area slot's bookkeeping is in the
+// AREA measure, where the cos/r^2 Jacobians cancel inside the candidate
+// weights), then a temporal merge with the pixel's persistent reservoir
+// (Stage 2): the stored sample is a fixed object (env direction / light
+// point / barycentrics), its target re-evaluated on TODAY's surface,
+// history M-capped at 20x and gated on geometric similarity with the
+// surface it was built for. The winner's visibility is re-traced every
+// frame; reservoirs reset with the accumulation (central reset), which
+// is the ghosting guarantee. Mirrored in pathtrace.metal.
+inline void restir_direct(const HitRecord& rec, const Ray& ray,
+                          const Hittable& world, RNG& rng,
+                          const EnvLookup& env, const LightsLookup& lights,
+                          int M, bool temporal, ReSTIRPixel& pix,
+                          float clamp_indirect, color& radiance) {
     const bool can_env = env.nee && env.row_cdf != nullptr &&
                          rec.mat.transmission <= 0.5f;
     const bool can_area = env.nee && lights.count > 0 &&
                           rec.mat.transmission <= 0.5f;
     const vec3 vdir = -normalize(ray.dir);
+    const float McapF = 20.0f * float(M);
+    const bool hist_ok =
+        temporal && pix.prev_t > 0.0f && rec.t > 0.0f &&
+        std::fabs(pix.prev_t - rec.t) < 0.1f * rec.t &&
+        (pix.prev_normal.x * rec.normal.x +
+         pix.prev_normal.y * rec.normal.y +
+         pix.prev_normal.z * rec.normal.z) > 0.9f;
 
-    // --- env slot ---
+    // --- env slot (solid-angle measure; the sample is a direction) ---
     if (can_env) {
-        float wsum = 0.0f;
+        float wsum = 0.0f, win_that = 0.0f, win_mis = 0.0f;
         vec3 win_dir(0.0f, 0.0f, 1.0f);
         color win_c(0.0f);
-        float win_mis = 0.0f, win_that = 0.0f;
         for (int i = 0; i < M; ++i) {
             const float u1 = rng.next_float();
             const float u2 = rng.next_float();
@@ -445,22 +452,63 @@ inline void sample_direct_ris(const HitRecord& rec, const Ray& ray,
                 win_that = that;
             }
         }
-        if (wsum > 0.0f && win_that > 0.0f) {
+        // temporal merge
+        float Mtot = float(M);
+        const float ur_h = rng.next_float();
+        if (hist_ok && pix.env_slot.M > 0.0f && pix.env_slot.W > 0.0f) {
+            const vec3 hdir(pix.env_slot.ax, pix.env_slot.ay,
+                            pix.env_slot.az);
+            float that = 0.0f, w_mis = 0.0f;
+            color contrib(0.0f);
+            float pb = 0.0f;
+            const color f = eval_bsdf(rec.mat, rec, vdir, hdir, pb);
+            const float nl = dot(rec.normal, hdir);
+            if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
+                contrib = f * nl * miss_radiance(env, Ray(rec.p, hdir));
+                const float pl = env_pdf(env, hdir);
+                w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
+                that = luminance(contrib * w_mis);
+            }
+            const float Mh = std::fmin(pix.env_slot.M, McapF);
+            const float wh = that * pix.env_slot.W * Mh;
+            wsum += wh;
+            Mtot += Mh;
+            if (wh > 0.0f && ur_h < wh / wsum) {
+                win_dir = hdir;
+                win_c = contrib;
+                win_mis = w_mis;
+                win_that = that;
+            }
+        }
+        const float Wnew = (wsum > 0.0f && win_that > 0.0f)
+                               ? wsum / (Mtot * win_that)
+                               : 0.0f;
+        pix.env_slot.ax = win_dir.x;
+        pix.env_slot.ay = win_dir.y;
+        pix.env_slot.az = win_dir.z;
+        pix.env_slot.W = Wnew;
+        pix.env_slot.M = std::fmin(Mtot, McapF);
+        pix.env_slot.light_id_p1 = 0u;
+        if (Wnew > 0.0f) {
             if (!world.occluded(Ray(rec.p, win_dir), 1e-3f,
                                 std::numeric_limits<float>::infinity())) {
-                const color c =
-                    win_c * win_mis * (wsum / (float(M) * win_that));
+                const color c = win_c * win_mis * Wnew;
                 radiance += clamp_contribution(c, clamp_indirect);
             }
         }
+    } else {
+        pix.env_slot.M = 0.0f;
+        pix.env_slot.W = 0.0f;
     }
 
-    // --- area-light slot ---
+    // --- area slot (AREA measure; the sample is a light point) ---
     if (can_area) {
-        float wsum = 0.0f;
+        float wsum = 0.0f, win_thatA = 0.0f, win_mis = 0.0f;
+        float win_G = 0.0f, win_t = 0.0f;
         vec3 win_dir(0.0f, 0.0f, 1.0f);
         color win_c(0.0f);
-        float win_mis = 0.0f, win_that = 0.0f, win_t = 0.0f;
+        float win_ax = 0.0f, win_ay = 0.0f, win_az = 0.0f;
+        pt_uint win_id_p1 = 0u;
         for (int i = 0; i < M; ++i) {
             const float us = rng.next_float();
             const float u1 = rng.next_float();
@@ -475,17 +523,22 @@ inline void sample_direct_ris(const HitRecord& rec, const Ray& ray,
                     ? sample_sphere_light(L, rec.p, u1, u2, pdf_sa, t_light)
                     : sample_tri_light(L, rec.p, u1, u2, pdf_sa, t_light,
                                        bu, bv);
-            float w_i = 0.0f, that = 0.0f, w_mis = 0.0f;
+            float w_i = 0.0f, thatA = 0.0f, w_mis = 0.0f, G = 0.0f;
             color contrib(0.0f);
             const float pl = pdf_sa * L.sel_pdf;
-            if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
+            if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f && t_light > 1e-6f) {
                 float pb = 0.0f;
                 const color f = eval_bsdf(rec.mat, rec, vdir, ldir, pb);
                 const float nl = dot(rec.normal, ldir);
                 if (nl > 1e-6f &&
                     (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
                     color Le(L.emission.x, L.emission.y, L.emission.z);
-                    if (L.kind == 1u) {
+                    vec3 n_y;
+                    if (L.kind == 0u) {
+                        const vec3 y = rec.p + ldir * t_light;
+                        n_y = normalize(
+                            y - vec3(L.p0.x, L.p0.y, L.p0.z));
+                    } else {
                         const float b0 = 1.0f - bu - bv;
                         const float tu = b0 * L.u0 + bu * L.u1 + bv * L.u2;
                         const float tv = b0 * L.v0 + bu * L.v1 + bv * L.v2;
@@ -493,11 +546,17 @@ inline void sample_direct_ris(const HitRecord& rec, const Ray& ray,
                             lights.mesh->materials[L.mat_id];
                         Le = sample_bilinear(mm.emissive, tu, tv) *
                              lights.mesh->emissive_scale;
+                        n_y = normalize(cross(
+                            vec3(L.e1.x, L.e1.y, L.e1.z),
+                            vec3(L.e2.x, L.e2.y, L.e2.z)));
                     }
+                    G = std::fabs(dot(n_y, ldir)) /
+                        (t_light * t_light);
                     contrib = f * nl * Le;
                     w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
-                    that = luminance(contrib * w_mis);
-                    w_i = that / pl;
+                    const float that = luminance(contrib * w_mis);
+                    thatA = that * G;
+                    w_i = that / pl;   // == thatA / (pl * G)
                 }
             }
             wsum += w_i;
@@ -505,19 +564,124 @@ inline void sample_direct_ris(const HitRecord& rec, const Ray& ray,
                 win_dir = ldir;
                 win_c = contrib;
                 win_mis = w_mis;
-                win_that = that;
+                win_thatA = thatA;
+                win_G = G;
                 win_t = t_light;
+                win_id_p1 = pt_uint(li + 1);
+                if (L.kind == 0u) {
+                    const vec3 y = rec.p + ldir * t_light;
+                    win_ax = y.x;
+                    win_ay = y.y;
+                    win_az = y.z;
+                } else {
+                    win_ax = bu;
+                    win_ay = bv;
+                    win_az = 0.0f;
+                }
             }
         }
-        if (wsum > 0.0f && win_that > 0.0f) {
+        // temporal merge (target re-evaluated on today's surface)
+        float Mtot = float(M);
+        const float ur_h = rng.next_float();
+        if (hist_ok && pix.area_slot.M > 0.0f && pix.area_slot.W > 0.0f &&
+            pix.area_slot.light_id_p1 > 0u &&
+            int(pix.area_slot.light_id_p1) <= lights.count) {
+            const int hid = int(pix.area_slot.light_id_p1) - 1;
+            const GPULight& L = lights.lights[hid];
+            vec3 y;
+            float hbu = 0.0f, hbv = 0.0f;
+            if (L.kind == 0u) {
+                y = vec3(pix.area_slot.ax, pix.area_slot.ay,
+                         pix.area_slot.az);
+            } else {
+                hbu = pix.area_slot.ax;
+                hbv = pix.area_slot.ay;
+                y = vec3(L.p0.x, L.p0.y, L.p0.z) +
+                    hbu * vec3(L.e1.x, L.e1.y, L.e1.z) +
+                    hbv * vec3(L.e2.x, L.e2.y, L.e2.z);
+            }
+            const vec3 d = y - rec.p;
+            const float r2 = dot(d, d);
+            float thatA = 0.0f, w_mis = 0.0f, G = 0.0f, t_l = 0.0f;
+            color contrib(0.0f);
+            vec3 hdir(0.0f, 0.0f, 1.0f);
+            if (r2 > 1e-12f) {
+                const float r = std::sqrt(r2);
+                hdir = d / r;
+                t_l = r;
+                float pb = 0.0f;
+                const color f = eval_bsdf(rec.mat, rec, vdir, hdir, pb);
+                const float nl = dot(rec.normal, hdir);
+                if (nl > 1e-6f &&
+                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
+                    color Le(L.emission.x, L.emission.y, L.emission.z);
+                    vec3 n_y;
+                    if (L.kind == 0u) {
+                        n_y = normalize(
+                            y - vec3(L.p0.x, L.p0.y, L.p0.z));
+                    } else {
+                        const float b0 = 1.0f - hbu - hbv;
+                        const float tu =
+                            b0 * L.u0 + hbu * L.u1 + hbv * L.u2;
+                        const float tv =
+                            b0 * L.v0 + hbu * L.v1 + hbv * L.v2;
+                        const MeshMaterial& mm =
+                            lights.mesh->materials[L.mat_id];
+                        Le = sample_bilinear(mm.emissive, tu, tv) *
+                             lights.mesh->emissive_scale;
+                        n_y = normalize(cross(
+                            vec3(L.e1.x, L.e1.y, L.e1.z),
+                            vec3(L.e2.x, L.e2.y, L.e2.z)));
+                    }
+                    G = std::fabs(dot(n_y, hdir)) / r2;
+                    const float pl =
+                        light_dir_pdf(L, rec.p, hdir, r) * L.sel_pdf;
+                    contrib = f * nl * Le;
+                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
+                    thatA = luminance(contrib * w_mis) * G;
+                }
+            }
+            const float Mh = std::fmin(pix.area_slot.M, McapF);
+            const float wh = thatA * pix.area_slot.W * Mh;
+            wsum += wh;
+            Mtot += Mh;
+            if (wh > 0.0f && ur_h < wh / wsum) {
+                win_dir = hdir;
+                win_c = contrib;
+                win_mis = w_mis;
+                win_thatA = thatA;
+                win_G = G;
+                win_t = t_l;
+                win_id_p1 = pix.area_slot.light_id_p1;
+                win_ax = pix.area_slot.ax;
+                win_ay = pix.area_slot.ay;
+                win_az = pix.area_slot.az;
+            }
+        }
+        const float Wnew = (wsum > 0.0f && win_thatA > 0.0f)
+                               ? wsum / (Mtot * win_thatA)
+                               : 0.0f;
+        pix.area_slot.ax = win_ax;
+        pix.area_slot.ay = win_ay;
+        pix.area_slot.az = win_az;
+        pix.area_slot.W = Wnew;
+        pix.area_slot.M = std::fmin(Mtot, McapF);
+        pix.area_slot.light_id_p1 = win_id_p1;
+        if (Wnew > 0.0f) {
             if (!world.occluded(Ray(rec.p, win_dir), 1e-3f,
                                 win_t * (1.0f - 1e-3f))) {
-                const color c =
-                    win_c * win_mis * (wsum / (float(M) * win_that));
+                // F_A / p_A form: contrib * G * w_mis * W_A.
+                const color c = win_c * win_mis * (win_G * Wnew);
                 radiance += clamp_contribution(c, clamp_indirect);
             }
         }
+    } else {
+        pix.area_slot.M = 0.0f;
+        pix.area_slot.W = 0.0f;
     }
+
+    pix.prev_normal = {rec.normal.x, rec.normal.y, rec.normal.z};
+    pix.prev_t = rec.t;
 }
 
 inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,

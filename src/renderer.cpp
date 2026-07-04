@@ -38,6 +38,11 @@ void ProgressiveRenderer::reset(int w, int h) {
     pass_count_ = 0;
     accum_.assign(std::size_t(w) * h, color(0.0f));
     rgba_.assign(std::size_t(w) * h * 4, 0);
+    // Session K: reservoirs reset with the accumulation — this IS the
+    // temporal-reuse ghosting guarantee (central reset -> fresh history).
+    if (settings_.restir != 0) {
+        resv_.assign(std::size_t(w) * h, ReSTIRPixel{});
+    }
 }
 
 void ProgressiveRenderer::render_pass(const Camera& camera) {
@@ -129,6 +134,9 @@ void ProgressiveRenderer::render_pass_partitioned() {
     if (gbuf_.size() != std::size_t(w_) * h_) {
         gbuf_.assign(std::size_t(w_) * h_, GBufferPx{});
     }
+    if (resv_.size() != std::size_t(w_) * h_) {
+        resv_.assign(std::size_t(w_) * h_, ReSTIRPixel{});
+    }
     const auto par_rows = [&](auto&& fn) {
         const unsigned T =
             std::max(1u, std::thread::hardware_concurrency());
@@ -205,11 +213,12 @@ void ProgressiveRenderer::render_pass_partitioned() {
             RNG rng(0, px);
             rng.state =
                 (std::uint64_t(g.rng_hi) << 32) | std::uint64_t(g.rng_lo);
+            rec.t = g.t;
             const Ray pray(rec.p, vec3(g.rd.x, g.rd.y, g.rd.z));
             color rad(0.0f);
-            sample_direct_ris(rec, pray, scene_, rng, env_, lights_,
-                              settings_.restir_m, settings_.clamp_indirect,
-                              rad);
+            restir_direct(rec, pray, scene_, rng, env_, lights_,
+                          settings_.restir_m, settings_.restir_temporal != 0,
+                          resv_[px], settings_.clamp_indirect, rad);
             accum_row[x] += rad;
             g.rng_lo = pt_uint(rng.state & 0xffffffffULL);
             g.rng_hi = pt_uint(rng.state >> 32);
