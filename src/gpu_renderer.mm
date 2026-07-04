@@ -119,9 +119,11 @@ struct GpuRenderer::Impl {
     // Session K: partitioned pipeline (ReSTIR scaffolding).
     id<MTLComputePipelineState> g_primary_pso;
     id<MTLComputePipelineState> direct_pso;
+    id<MTLComputePipelineState> spatial_pso;
     id<MTLComputePipelineState> indirect_pso;
     id<MTLBuffer> gbuf;   // GBufferPx per pixel, allocated at full res
-    id<MTLBuffer> resv;   // ReSTIRPixel per pixel (temporal reservoirs)
+    id<MTLBuffer> resv;      // persistent reservoirs (temporal history)
+    id<MTLBuffer> resv_cur;  // this frame, post-temporal (spatial input)
     id<MTLBuffer> accum;     // full-res float4, StorageModeShared
     id<MTLBuffer> spheres;   // bound as constant GPUSphere*
     // Mesh data (placeholder-sized when no mesh — Metal requires every
@@ -215,6 +217,7 @@ struct GpuRenderer::Impl {
         u.light_count = light_count;
         u.restir_m = pt_uint(settings.restir_m > 0 ? settings.restir_m : 1);
         u.restir_temporal = pt_uint(settings.restir_temporal != 0 ? 1 : 0);
+        u.restir_spatial = pt_uint(settings.restir_spatial != 0 ? 1 : 0);
 
         if (settings.restir != 0) {
             // Partitioned: K sequential (g_primary -> direct -> indirect)
@@ -259,6 +262,29 @@ struct GpuRenderer::Impl {
                 [e setBuffer:env_cond_cdf offset:0 atIndex:12];
                 [e setBuffer:lights offset:0 atIndex:13];
                 [e setBuffer:resv offset:0 atIndex:14];
+                [e setBuffer:resv_cur offset:0 atIndex:15];
+                for (id<MTLBuffer> t : mat_textures) {
+                    [e useResource:t usage:MTLResourceUsageRead];
+                }
+                [e dispatchThreads:grid threadsPerThreadgroup:tg_accum];
+                [e endEncoding];
+
+                e = [cb computeCommandEncoder];
+                [e setComputePipelineState:spatial_pso];
+                [e setBuffer:accum offset:0 atIndex:0];
+                [e setBuffer:spheres offset:0 atIndex:1];
+                [e setBytes:&pu length:sizeof pu atIndex:2];
+                [e setBuffer:bvh_nodes offset:0 atIndex:3];
+                [e setBuffer:tris offset:0 atIndex:4];
+                [e setBuffer:mat_table offset:0 atIndex:5];
+                [e setBuffer:gbuf offset:0 atIndex:6];
+                [e setBuffer:resv_cur offset:0 atIndex:7];
+                [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
+                [e setBuffer:resv offset:0 atIndex:9];
+                [e setBuffer:env_texels offset:0 atIndex:10];
+                [e setBuffer:env_row_cdf offset:0 atIndex:11];
+                [e setBuffer:env_cond_cdf offset:0 atIndex:12];
+                [e setBuffer:lights offset:0 atIndex:13];
                 for (id<MTLBuffer> t : mat_textures) {
                     [e useResource:t usage:MTLResourceUsageRead];
                 }
@@ -526,8 +552,10 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
 
     im.g_primary_pso = make_pipeline(device, lib, @"g_primary", error);
     im.direct_pso = make_pipeline(device, lib, @"direct_v0", error);
+    im.spatial_pso = make_pipeline(device, lib, @"spatial_v0", error);
     im.indirect_pso = make_pipeline(device, lib, @"indirect_v0", error);
-    if (!im.g_primary_pso || !im.direct_pso || !im.indirect_pso)
+    if (!im.g_primary_pso || !im.direct_pso || !im.spatial_pso ||
+        !im.indirect_pso)
         return nullptr;
 
     im.raster_mesh_pso = make_raster_pso(@"raster_mesh_vs", error);
@@ -560,6 +588,10 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
                             sizeof(GBufferPx)
                     options:MTLResourceStorageModeShared];
     im.resv = [device
+        newBufferWithLength:size_t(settings.width) * settings.height *
+                            sizeof(ReSTIRPixel)
+                    options:MTLResourceStorageModeShared];
+    im.resv_cur = [device
         newBufferWithLength:size_t(settings.width) * settings.height *
                             sizeof(ReSTIRPixel)
                     options:MTLResourceStorageModeShared];
@@ -636,6 +668,11 @@ void GpuRenderer::reset(int w, int h) {
     const size_t rneeded = size_t(w) * h * sizeof(ReSTIRPixel);
     if (rneeded > impl_->resv.length) {
         impl_->resv =
+            [impl_->device newBufferWithLength:rneeded
+                                       options:MTLResourceStorageModeShared];
+    }
+    if (rneeded > impl_->resv_cur.length) {
+        impl_->resv_cur =
             [impl_->device newBufferWithLength:rneeded
                                        options:MTLResourceStorageModeShared];
     }

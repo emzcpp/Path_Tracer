@@ -72,7 +72,8 @@ private:
     EnvLookup env_;
     LightsLookup lights_;
     std::vector<GBufferPx> gbuf_;   // Session K: per-pixel primary hits
-    std::vector<ReSTIRPixel> resv_; // Stage 2: persistent reservoirs
+    std::vector<ReSTIRPixel> resv_;     // persistent (temporal history)
+    std::vector<ReSTIRPixel> resv_cur_; // this frame, post-temporal
 
     int w_ = 0, h_ = 0;
     int pass_count_ = 0;      // completed passes

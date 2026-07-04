@@ -61,9 +61,11 @@ struct PassUniforms {
     // light list; 0 = none (area NEE off).
     pt_uint light_count;
     // Session K: RIS candidate count per light slot (partitioned pipeline)
-    // and the temporal-reuse toggle (Stage 2).
+    // and the reuse toggles (Stage 2 temporal, Stage 3 spatial).
     pt_uint restir_m;
     pt_uint restir_temporal;
+    pt_uint restir_spatial;
+    pt_uint pad_k0, pad_k1, pad_k2;
 };
 
 struct ResolveUniforms {
@@ -151,6 +153,9 @@ struct GPULight {
 // its RIS bookkeeping in the AREA measure so re-evaluating the target at
 // a new surface applies the correct cos/r^2 Jacobian. W and M follow the
 // standard reservoir form; M == 0 marks an empty/invalidated slot.
+// Stage 3 spatial-reuse shape, shared by both backends.
+enum { PT_RESTIR_NEIGHBORS = 3, PT_RESTIR_RADIUS = 16 };
+
 struct ReSTIRSlot {
     float ax, ay, az;     // env: direction | sphere: point | tri: (bu,bv,-)
     float W;
@@ -187,7 +192,7 @@ struct GBufferPx {
 static_assert(sizeof(pt_float3) == 12, "pt_float3 must be 12 bytes");
 static_assert(sizeof(GPUSphere) == 64, "GPUSphere must be one cacheline");
 static_assert(sizeof(GPUCamera) == 48, "GPUCamera layout drifted");
-static_assert(sizeof(PassUniforms) == 112, "PassUniforms layout drifted");
+static_assert(sizeof(PassUniforms) == 128, "PassUniforms layout drifted");
 static_assert(sizeof(ResolveUniforms) == 24, "ResolveUniforms layout drifted");
 static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");
 static_assert(sizeof(GPUTriangle) == 144, "GPUTriangle must be nine 16B rows");

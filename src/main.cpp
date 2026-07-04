@@ -253,6 +253,7 @@ int main(int argc, char** argv) {
     float model_height = 2.2f;   // building-scale assets: e.g. Sponza ~12
     float model_yaw = 232.0f;    // helmet-facing default
     bool only_model = false;     // mesh + env only (no sphere field)
+    bool lights_demo = false;    // add a grid of emissive fixtures (ReSTIR)
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--offline") == 0) {
@@ -275,6 +276,8 @@ int main(int argc, char** argv) {
             brute = true;
         } else if (std::strcmp(argv[i], "--restir") == 0) {
             settings.restir = 1;
+        } else if (std::strcmp(argv[i], "--lights-demo") == 0) {
+            lights_demo = true;
         } else if (std::strcmp(argv[i], "--model-height") == 0 && i + 1 < argc) {
             char* end = nullptr;
             model_height = std::strtof(argv[++i], &end);
@@ -358,6 +361,31 @@ int main(int argc, char** argv) {
         std::printf("scene: model only (%s)\n", desc.mesh_name.c_str());
     }
     if (desc.mesh) desc.mesh_source_path = resolved_model;
+    if (lights_demo) {
+        // Session K Stage 3: the many-light arena — two double rows of
+        // small warm fixtures down the hall (Sponza-scaled by default).
+        int added = 0;
+        for (int level = 0; level < 2; ++level) {
+            const float fy = level == 0 ? 1.6f : 5.4f;
+            for (int ix = -4; ix <= 4; ++ix) {
+                for (int side = -1; side <= 1; side += 2) {
+                    SphereData s;
+                    s.center = point3(float(ix) * 2.4f, fy,
+                                      float(side) * 3.1f);
+                    s.radius = 0.09f;
+                    const float k = 1.0f + 0.15f * float((ix + 4) % 3);
+                    s.mat = Material::emissive(
+                        color(26.0f * k, 16.0f * k, 7.0f * k));
+                    char name[32];
+                    std::snprintf(name, sizeof name, "Fixture %d", added);
+                    s.name = name;
+                    desc.spheres.push_back(s);
+                    ++added;
+                }
+            }
+        }
+        std::printf("lights-demo: %d emissive fixtures added\n", added);
+    }
     if (brute) {
         settings.env_nee = 0;
         std::printf("lighting: brute force (ground-truth mode)\n");

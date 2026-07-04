@@ -389,22 +389,93 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
         can_nee_light_out = can_nee_light;
 }
 
-// ---- Session K Stages 1+2: RIS + temporal reservoirs (partitioned) ----
-// Per light slot: weighted reservoir sampling over M fresh candidates
-// (Stage 1, numerics unchanged — the area slot's bookkeeping is in the
-// AREA measure, where the cos/r^2 Jacobians cancel inside the candidate
-// weights), then a temporal merge with the pixel's persistent reservoir
-// (Stage 2): the stored sample is a fixed object (env direction / light
-// point / barycentrics), its target re-evaluated on TODAY's surface,
-// history M-capped at 20x and gated on geometric similarity with the
-// surface it was built for. The winner's visibility is re-traced every
-// frame; reservoirs reset with the accumulation (central reset), which
-// is the ghosting guarantee. Mirrored in pathtrace.metal.
-inline void restir_direct(const HitRecord& rec, const Ray& ray,
-                          const Hittable& world, RNG& rng,
-                          const EnvLookup& env, const LightsLookup& lights,
-                          int M, bool temporal, ReSTIRPixel& pix,
-                          float clamp_indirect, color& radiance) {
+// ---- Session K: ReSTIR direct lighting (partitioned pipeline) ----------
+// Stage 1: per-slot RIS over M candidates. Stage 2: temporal reservoirs.
+// Stage 3: spatial reuse with the paper's UNBIASED 1/Z variant — the
+// merged winner's target is re-evaluated on every contributing surface,
+// and Z counts only reservoirs whose surface could have produced it.
+// Mirrored in pathtrace.metal.
+
+// Target evaluation for a fixed env-slot sample (a direction), on an
+// arbitrary surface. Returns that (target value); fills the contribution
+// pieces the shader needs when this surface is the receiver.
+inline float target_env(const HitRecord& rec, const vec3& vdir,
+                        const vec3& dir, const EnvLookup& env,
+                        color& contrib_out, float& wmis_out) {
+    contrib_out = color(0.0f);
+    wmis_out = 0.0f;
+    float pb = 0.0f;
+    const color f = eval_bsdf(rec.mat, rec, vdir, dir, pb);
+    const float nl = dot(rec.normal, dir);
+    if (nl <= 1e-6f || (f.x <= 0.0f && f.y <= 0.0f && f.z <= 0.0f))
+        return 0.0f;
+    contrib_out = f * nl * miss_radiance(env, Ray(rec.p, dir));
+    const float pl = env_pdf(env, dir);
+    wmis_out = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
+    return luminance(contrib_out * wmis_out);
+}
+
+// Target evaluation for a fixed area-slot sample (a light point encoded
+// as sphere world-point or triangle barycentrics), on an arbitrary
+// surface. AREA measure: returns thatA = that * G.
+inline float target_area(const HitRecord& rec, const vec3& vdir,
+                         const GPULight& L, float ax, float ay, float az,
+                         const LightsLookup& lights, color& contrib_out,
+                         float& wmis_out, float& G_out, vec3& dir_out,
+                         float& t_out) {
+    contrib_out = color(0.0f);
+    wmis_out = 0.0f;
+    G_out = 0.0f;
+    t_out = 0.0f;
+    vec3 y;
+    float bu = 0.0f, bv = 0.0f;
+    if (L.kind == 0u) {
+        y = vec3(ax, ay, az);
+    } else {
+        bu = ax;
+        bv = ay;
+        y = vec3(L.p0.x, L.p0.y, L.p0.z) +
+            bu * vec3(L.e1.x, L.e1.y, L.e1.z) +
+            bv * vec3(L.e2.x, L.e2.y, L.e2.z);
+    }
+    const vec3 d = y - rec.p;
+    const float r2 = dot(d, d);
+    if (r2 < 1e-12f) return 0.0f;
+    const float r = std::sqrt(r2);
+    dir_out = d / r;
+    t_out = r;
+    float pb = 0.0f;
+    const color f = eval_bsdf(rec.mat, rec, vdir, dir_out, pb);
+    const float nl = dot(rec.normal, dir_out);
+    if (nl <= 1e-6f || (f.x <= 0.0f && f.y <= 0.0f && f.z <= 0.0f))
+        return 0.0f;
+    color Le(L.emission.x, L.emission.y, L.emission.z);
+    vec3 n_y;
+    if (L.kind == 0u) {
+        n_y = normalize(y - vec3(L.p0.x, L.p0.y, L.p0.z));
+    } else {
+        const float b0 = 1.0f - bu - bv;
+        const float tu = b0 * L.u0 + bu * L.u1 + bv * L.u2;
+        const float tv = b0 * L.v0 + bu * L.v1 + bv * L.v2;
+        const MeshMaterial& mm = lights.mesh->materials[L.mat_id];
+        Le = sample_bilinear(mm.emissive, tu, tv) *
+             lights.mesh->emissive_scale;
+        n_y = normalize(cross(vec3(L.e1.x, L.e1.y, L.e1.z),
+                              vec3(L.e2.x, L.e2.y, L.e2.z)));
+    }
+    G_out = std::fabs(dot(n_y, dir_out)) / r2;
+    const float pl = light_dir_pdf(L, rec.p, dir_out, r) * L.sel_pdf;
+    contrib_out = f * nl * Le;
+    wmis_out = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
+    return luminance(contrib_out * wmis_out) * G_out;
+}
+
+// Phase D1: fresh candidates + temporal merge -> the per-frame reservoir
+// (resv_cur). No shadow rays here; shading happens after spatial reuse.
+inline void restir_build(const HitRecord& rec, const Ray& ray, RNG& rng,
+                         const EnvLookup& env, const LightsLookup& lights,
+                         int M, bool temporal, const ReSTIRPixel& hist,
+                         ReSTIRPixel& cur) {
     const bool can_env = env.nee && env.row_cdf != nullptr &&
                          rec.mat.transmission <= 0.5f;
     const bool can_area = env.nee && lights.count > 0 &&
@@ -412,101 +483,68 @@ inline void restir_direct(const HitRecord& rec, const Ray& ray,
     const vec3 vdir = -normalize(ray.dir);
     const float McapF = 20.0f * float(M);
     const bool hist_ok =
-        temporal && pix.prev_t > 0.0f && rec.t > 0.0f &&
-        std::fabs(pix.prev_t - rec.t) < 0.1f * rec.t &&
-        (pix.prev_normal.x * rec.normal.x +
-         pix.prev_normal.y * rec.normal.y +
-         pix.prev_normal.z * rec.normal.z) > 0.9f;
+        temporal && hist.prev_t > 0.0f && rec.t > 0.0f &&
+        std::fabs(hist.prev_t - rec.t) < 0.1f * rec.t &&
+        (hist.prev_normal.x * rec.normal.x +
+         hist.prev_normal.y * rec.normal.y +
+         hist.prev_normal.z * rec.normal.z) > 0.9f;
 
-    // --- env slot (solid-angle measure; the sample is a direction) ---
+    // --- env slot ---
     if (can_env) {
-        float wsum = 0.0f, win_that = 0.0f, win_mis = 0.0f;
+        float wsum = 0.0f, win_that = 0.0f;
         vec3 win_dir(0.0f, 0.0f, 1.0f);
-        color win_c(0.0f);
         for (int i = 0; i < M; ++i) {
             const float u1 = rng.next_float();
             const float u2 = rng.next_float();
             const float ur = rng.next_float();
             float pl = 0.0f;
             const vec3 ldir = env_sample(env, u1, u2, pl);
-            float w_i = 0.0f, that = 0.0f, w_mis = 0.0f;
-            color contrib(0.0f);
+            float w_i = 0.0f, that = 0.0f;
             if (pl > 1e-12f) {
-                float pb = 0.0f;
-                const color f = eval_bsdf(rec.mat, rec, vdir, ldir, pb);
-                const float nl = dot(rec.normal, ldir);
-                if (nl > 1e-6f &&
-                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
-                    contrib =
-                        f * nl * miss_radiance(env, Ray(rec.p, ldir));
-                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
-                    that = luminance(contrib * w_mis);
-                    w_i = that / pl;
-                }
+                color contrib;
+                float w_mis;
+                that = target_env(rec, vdir, ldir, env, contrib, w_mis);
+                if (that > 0.0f) w_i = that / pl;
             }
             wsum += w_i;
             if (w_i > 0.0f && ur < w_i / wsum) {
                 win_dir = ldir;
-                win_c = contrib;
-                win_mis = w_mis;
                 win_that = that;
             }
         }
-        // temporal merge
         float Mtot = float(M);
         const float ur_h = rng.next_float();
-        if (hist_ok && pix.env_slot.M > 0.0f && pix.env_slot.W > 0.0f) {
-            const vec3 hdir(pix.env_slot.ax, pix.env_slot.ay,
-                            pix.env_slot.az);
-            float that = 0.0f, w_mis = 0.0f;
-            color contrib(0.0f);
-            float pb = 0.0f;
-            const color f = eval_bsdf(rec.mat, rec, vdir, hdir, pb);
-            const float nl = dot(rec.normal, hdir);
-            if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
-                contrib = f * nl * miss_radiance(env, Ray(rec.p, hdir));
-                const float pl = env_pdf(env, hdir);
-                w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
-                that = luminance(contrib * w_mis);
-            }
-            const float Mh = std::fmin(pix.env_slot.M, McapF);
-            const float wh = that * pix.env_slot.W * Mh;
+        if (hist_ok && hist.env_slot.M > 0.0f && hist.env_slot.W > 0.0f) {
+            const vec3 hdir(hist.env_slot.ax, hist.env_slot.ay,
+                            hist.env_slot.az);
+            color contrib;
+            float w_mis;
+            const float that =
+                target_env(rec, vdir, hdir, env, contrib, w_mis);
+            const float Mh = std::fmin(hist.env_slot.M, McapF);
+            const float wh = that * hist.env_slot.W * Mh;
             wsum += wh;
             Mtot += Mh;
             if (wh > 0.0f && ur_h < wh / wsum) {
                 win_dir = hdir;
-                win_c = contrib;
-                win_mis = w_mis;
                 win_that = that;
             }
         }
-        const float Wnew = (wsum > 0.0f && win_that > 0.0f)
-                               ? wsum / (Mtot * win_that)
-                               : 0.0f;
-        pix.env_slot.ax = win_dir.x;
-        pix.env_slot.ay = win_dir.y;
-        pix.env_slot.az = win_dir.z;
-        pix.env_slot.W = Wnew;
-        pix.env_slot.M = std::fmin(Mtot, McapF);
-        pix.env_slot.light_id_p1 = 0u;
-        if (Wnew > 0.0f) {
-            if (!world.occluded(Ray(rec.p, win_dir), 1e-3f,
-                                std::numeric_limits<float>::infinity())) {
-                const color c = win_c * win_mis * Wnew;
-                radiance += clamp_contribution(c, clamp_indirect);
-            }
-        }
+        cur.env_slot.ax = win_dir.x;
+        cur.env_slot.ay = win_dir.y;
+        cur.env_slot.az = win_dir.z;
+        cur.env_slot.W = (wsum > 0.0f && win_that > 0.0f)
+                             ? wsum / (Mtot * win_that)
+                             : 0.0f;
+        cur.env_slot.M = std::fmin(Mtot, McapF);
+        cur.env_slot.light_id_p1 = 0u;
     } else {
-        pix.env_slot.M = 0.0f;
-        pix.env_slot.W = 0.0f;
+        cur.env_slot = ReSTIRSlot{};
     }
 
-    // --- area slot (AREA measure; the sample is a light point) ---
+    // --- area slot ---
     if (can_area) {
-        float wsum = 0.0f, win_thatA = 0.0f, win_mis = 0.0f;
-        float win_G = 0.0f, win_t = 0.0f;
-        vec3 win_dir(0.0f, 0.0f, 1.0f);
-        color win_c(0.0f);
+        float wsum = 0.0f, win_thatA = 0.0f;
         float win_ax = 0.0f, win_ay = 0.0f, win_az = 0.0f;
         pt_uint win_id_p1 = 0u;
         for (int i = 0; i < M; ++i) {
@@ -523,165 +561,306 @@ inline void restir_direct(const HitRecord& rec, const Ray& ray,
                     ? sample_sphere_light(L, rec.p, u1, u2, pdf_sa, t_light)
                     : sample_tri_light(L, rec.p, u1, u2, pdf_sa, t_light,
                                        bu, bv);
-            float w_i = 0.0f, thatA = 0.0f, w_mis = 0.0f, G = 0.0f;
-            color contrib(0.0f);
-            const float pl = pdf_sa * L.sel_pdf;
+            float w_i = 0.0f, thatA = 0.0f;
+            float sax = 0.0f, say = 0.0f, saz = 0.0f;
             if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f && t_light > 1e-6f) {
-                float pb = 0.0f;
-                const color f = eval_bsdf(rec.mat, rec, vdir, ldir, pb);
-                const float nl = dot(rec.normal, ldir);
-                if (nl > 1e-6f &&
-                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
-                    color Le(L.emission.x, L.emission.y, L.emission.z);
-                    vec3 n_y;
-                    if (L.kind == 0u) {
-                        const vec3 y = rec.p + ldir * t_light;
-                        n_y = normalize(
-                            y - vec3(L.p0.x, L.p0.y, L.p0.z));
-                    } else {
-                        const float b0 = 1.0f - bu - bv;
-                        const float tu = b0 * L.u0 + bu * L.u1 + bv * L.u2;
-                        const float tv = b0 * L.v0 + bu * L.v1 + bv * L.v2;
-                        const MeshMaterial& mm =
-                            lights.mesh->materials[L.mat_id];
-                        Le = sample_bilinear(mm.emissive, tu, tv) *
-                             lights.mesh->emissive_scale;
-                        n_y = normalize(cross(
-                            vec3(L.e1.x, L.e1.y, L.e1.z),
-                            vec3(L.e2.x, L.e2.y, L.e2.z)));
-                    }
-                    G = std::fabs(dot(n_y, ldir)) /
-                        (t_light * t_light);
-                    contrib = f * nl * Le;
-                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
-                    const float that = luminance(contrib * w_mis);
-                    thatA = that * G;
-                    w_i = that / pl;   // == thatA / (pl * G)
+                if (L.kind == 0u) {
+                    const vec3 yy = rec.p + ldir * t_light;
+                    sax = yy.x;
+                    say = yy.y;
+                    saz = yy.z;
+                } else {
+                    sax = bu;
+                    say = bv;
                 }
+                color contrib;
+                float w_mis, G, t_o;
+                vec3 d_o;
+                thatA = target_area(rec, vdir, L, sax, say, saz, lights,
+                                    contrib, w_mis, G, d_o, t_o);
+                const float pl = pdf_sa * L.sel_pdf;
+                if (thatA > 0.0f && G > 0.0f) w_i = thatA / (pl * G);
             }
             wsum += w_i;
             if (w_i > 0.0f && ur < w_i / wsum) {
-                win_dir = ldir;
-                win_c = contrib;
-                win_mis = w_mis;
                 win_thatA = thatA;
-                win_G = G;
-                win_t = t_light;
+                win_ax = sax;
+                win_ay = say;
+                win_az = saz;
                 win_id_p1 = pt_uint(li + 1);
-                if (L.kind == 0u) {
-                    const vec3 y = rec.p + ldir * t_light;
-                    win_ax = y.x;
-                    win_ay = y.y;
-                    win_az = y.z;
-                } else {
-                    win_ax = bu;
-                    win_ay = bv;
-                    win_az = 0.0f;
-                }
             }
         }
-        // temporal merge (target re-evaluated on today's surface)
         float Mtot = float(M);
         const float ur_h = rng.next_float();
-        if (hist_ok && pix.area_slot.M > 0.0f && pix.area_slot.W > 0.0f &&
-            pix.area_slot.light_id_p1 > 0u &&
-            int(pix.area_slot.light_id_p1) <= lights.count) {
-            const int hid = int(pix.area_slot.light_id_p1) - 1;
-            const GPULight& L = lights.lights[hid];
-            vec3 y;
-            float hbu = 0.0f, hbv = 0.0f;
-            if (L.kind == 0u) {
-                y = vec3(pix.area_slot.ax, pix.area_slot.ay,
-                         pix.area_slot.az);
-            } else {
-                hbu = pix.area_slot.ax;
-                hbv = pix.area_slot.ay;
-                y = vec3(L.p0.x, L.p0.y, L.p0.z) +
-                    hbu * vec3(L.e1.x, L.e1.y, L.e1.z) +
-                    hbv * vec3(L.e2.x, L.e2.y, L.e2.z);
-            }
-            const vec3 d = y - rec.p;
-            const float r2 = dot(d, d);
-            float thatA = 0.0f, w_mis = 0.0f, G = 0.0f, t_l = 0.0f;
-            color contrib(0.0f);
-            vec3 hdir(0.0f, 0.0f, 1.0f);
-            if (r2 > 1e-12f) {
-                const float r = std::sqrt(r2);
-                hdir = d / r;
-                t_l = r;
-                float pb = 0.0f;
-                const color f = eval_bsdf(rec.mat, rec, vdir, hdir, pb);
-                const float nl = dot(rec.normal, hdir);
-                if (nl > 1e-6f &&
-                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
-                    color Le(L.emission.x, L.emission.y, L.emission.z);
-                    vec3 n_y;
-                    if (L.kind == 0u) {
-                        n_y = normalize(
-                            y - vec3(L.p0.x, L.p0.y, L.p0.z));
-                    } else {
-                        const float b0 = 1.0f - hbu - hbv;
-                        const float tu =
-                            b0 * L.u0 + hbu * L.u1 + hbv * L.u2;
-                        const float tv =
-                            b0 * L.v0 + hbu * L.v1 + hbv * L.v2;
-                        const MeshMaterial& mm =
-                            lights.mesh->materials[L.mat_id];
-                        Le = sample_bilinear(mm.emissive, tu, tv) *
-                             lights.mesh->emissive_scale;
-                        n_y = normalize(cross(
-                            vec3(L.e1.x, L.e1.y, L.e1.z),
-                            vec3(L.e2.x, L.e2.y, L.e2.z)));
-                    }
-                    G = std::fabs(dot(n_y, hdir)) / r2;
-                    const float pl =
-                        light_dir_pdf(L, rec.p, hdir, r) * L.sel_pdf;
-                    contrib = f * nl * Le;
-                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
-                    thatA = luminance(contrib * w_mis) * G;
-                }
-            }
-            const float Mh = std::fmin(pix.area_slot.M, McapF);
-            const float wh = thatA * pix.area_slot.W * Mh;
+        if (hist_ok && hist.area_slot.M > 0.0f && hist.area_slot.W > 0.0f &&
+            hist.area_slot.light_id_p1 > 0u &&
+            int(hist.area_slot.light_id_p1) <= lights.count) {
+            const GPULight& L =
+                lights.lights[int(hist.area_slot.light_id_p1) - 1];
+            color contrib;
+            float w_mis, G, t_o;
+            vec3 d_o;
+            const float thatA =
+                target_area(rec, vdir, L, hist.area_slot.ax,
+                            hist.area_slot.ay, hist.area_slot.az, lights,
+                            contrib, w_mis, G, d_o, t_o);
+            const float Mh = std::fmin(hist.area_slot.M, McapF);
+            const float wh = thatA * hist.area_slot.W * Mh;
             wsum += wh;
             Mtot += Mh;
             if (wh > 0.0f && ur_h < wh / wsum) {
-                win_dir = hdir;
-                win_c = contrib;
-                win_mis = w_mis;
                 win_thatA = thatA;
-                win_G = G;
-                win_t = t_l;
-                win_id_p1 = pix.area_slot.light_id_p1;
-                win_ax = pix.area_slot.ax;
-                win_ay = pix.area_slot.ay;
-                win_az = pix.area_slot.az;
+                win_ax = hist.area_slot.ax;
+                win_ay = hist.area_slot.ay;
+                win_az = hist.area_slot.az;
+                win_id_p1 = hist.area_slot.light_id_p1;
             }
         }
-        const float Wnew = (wsum > 0.0f && win_thatA > 0.0f)
-                               ? wsum / (Mtot * win_thatA)
-                               : 0.0f;
-        pix.area_slot.ax = win_ax;
-        pix.area_slot.ay = win_ay;
-        pix.area_slot.az = win_az;
-        pix.area_slot.W = Wnew;
-        pix.area_slot.M = std::fmin(Mtot, McapF);
-        pix.area_slot.light_id_p1 = win_id_p1;
+        cur.area_slot.ax = win_ax;
+        cur.area_slot.ay = win_ay;
+        cur.area_slot.az = win_az;
+        cur.area_slot.W = (wsum > 0.0f && win_thatA > 0.0f)
+                              ? wsum / (Mtot * win_thatA)
+                              : 0.0f;
+        cur.area_slot.M = std::fmin(Mtot, McapF);
+        cur.area_slot.light_id_p1 = win_id_p1;
+    } else {
+        cur.area_slot = ReSTIRSlot{};
+    }
+}
+
+// Phase D2: spatial merge (unbiased 1/Z), the slot's single shadow ray,
+// shading, and the persistent store that feeds next frame's temporal.
+inline void restir_spatial_shade(
+    const HitRecord& rec, const Ray& ray, const Hittable& world, RNG& rng,
+    const EnvLookup& env, const LightsLookup& lights, int M, bool spatial,
+    const GBufferPx* gbuf, const ReSTIRPixel* cur_all, int w, int h, int x,
+    int y, ReSTIRPixel& persist, float clamp_indirect, color& radiance) {
+    const bool can_env = env.nee && env.row_cdf != nullptr &&
+                         rec.mat.transmission <= 0.5f;
+    const bool can_area = env.nee && lights.count > 0 &&
+                          rec.mat.transmission <= 0.5f;
+    const vec3 vdir = -normalize(ray.dir);
+    const float McapF = 20.0f * float(M);
+    const std::size_t px = std::size_t(y) * w + x;
+    const ReSTIRPixel& own = cur_all[px];
+
+    // Neighbor set: chosen once, shared by both slots. Draws are fixed-
+    // shape (2 offset draws per neighbor) for determinism.
+    int nxs[PT_RESTIR_NEIGHBORS], nys[PT_RESTIR_NEIGHBORS];
+    bool ok[PT_RESTIR_NEIGHBORS];
+    const int K = spatial ? PT_RESTIR_NEIGHBORS : 0;
+    for (int k = 0; k < K; ++k) {
+        const float u1 = rng.next_float();
+        const float u2 = rng.next_float();
+        int nx = x + int((u1 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
+        int ny = y + int((u2 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
+        nx = nx < 0 ? 0 : (nx >= w ? w - 1 : nx);
+        ny = ny < 0 ? 0 : (ny >= h ? h - 1 : ny);
+        nxs[k] = nx;
+        nys[k] = ny;
+        ok[k] = false;
+        if (nx == x && ny == y) continue;
+        const GBufferPx& gn = gbuf[std::size_t(ny) * w + nx];
+        if (gn.t < 0.0f || gn.transmission > 0.5f) continue;
+        if (std::fabs(gn.t - rec.t) >= 0.1f * rec.t) continue;
+        const float ndot = gn.normal.x * rec.normal.x +
+                           gn.normal.y * rec.normal.y +
+                           gn.normal.z * rec.normal.z;
+        if (ndot <= 0.9f) continue;
+        ok[k] = true;
+    }
+    // Neighbor surface shim for the 1/Z target evaluations.
+    const auto neighbor_rec = [&](int k, HitRecord& nr, vec3& nvdir) {
+        const GBufferPx& gn = gbuf[std::size_t(nys[k]) * w + nxs[k]];
+        nr.p = point3(gn.pos.x, gn.pos.y, gn.pos.z);
+        nr.normal = vec3(gn.normal.x, gn.normal.y, gn.normal.z);
+        nr.front_face = (gn.flags & 1u) != 0u;
+        nr.t = gn.t;
+        nr.mat.base_color =
+            color(gn.base_color.x, gn.base_color.y, gn.base_color.z);
+        nr.mat.emission = color(gn.emission.x, gn.emission.y, gn.emission.z);
+        nr.mat.metallic = gn.metallic;
+        nr.mat.roughness = gn.roughness;
+        nr.mat.ior = gn.ior;
+        nr.mat.transmission = gn.transmission;
+        nvdir = -normalize(vec3(gn.rd.x, gn.rd.y, gn.rd.z));
+    };
+
+    // --- env slot ---
+    if (can_env) {
+        // Seed the merge with the pixel's own reservoir.
+        vec3 win_dir(own.env_slot.ax, own.env_slot.ay, own.env_slot.az);
+        color win_c(0.0f);
+        float win_mis = 0.0f;
+        float win_that =
+            (own.env_slot.M > 0.0f && own.env_slot.W > 0.0f)
+                ? target_env(rec, vdir, win_dir, env, win_c, win_mis)
+                : 0.0f;
+        float wsum = win_that * own.env_slot.W * own.env_slot.M;
+        float Mtot = own.env_slot.M;
+        if (win_that <= 0.0f) wsum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            const float ur = rng.next_float();
+            if (!ok[k]) continue;
+            const ReSTIRPixel& nb = cur_all[std::size_t(nys[k]) * w + nxs[k]];
+            if (nb.env_slot.M <= 0.0f || nb.env_slot.W <= 0.0f) continue;
+            const vec3 sdir(nb.env_slot.ax, nb.env_slot.ay, nb.env_slot.az);
+            color contrib;
+            float w_mis;
+            const float that =
+                target_env(rec, vdir, sdir, env, contrib, w_mis);
+            const float wh = that * nb.env_slot.W * nb.env_slot.M;
+            wsum += wh;
+            Mtot += nb.env_slot.M;
+            if (wh > 0.0f && ur < wh / wsum) {
+                win_dir = sdir;
+                win_c = contrib;
+                win_mis = w_mis;
+                win_that = that;
+            }
+        }
+        // Unbiased 1/Z: count the M of every input whose OWN surface has
+        // nonzero target for the winner.
+        // Shading uses the unbiased 1/Z weight; the PERSISTED reservoir
+        // uses the M-consistent 1/Mtot weight so next frame's merge
+        // (which multiplies W by M) keeps the invariant W*M = wsum/p^.
+        // Feeding the 1/Z weight back inflates history by Mtot/Z and
+        // compounds into energy GAIN wherever neighbors can't see the
+        // winner (found on the many-light demo: +96%).
+        float Wshade = 0.0f, Wstore = 0.0f;
+        if (wsum > 0.0f && win_that > 0.0f) {
+            float Z = own.env_slot.M;   // own target > 0 by selection
+            for (int k = 0; k < K; ++k) {
+                if (!ok[k]) continue;
+                const ReSTIRPixel& nb =
+                    cur_all[std::size_t(nys[k]) * w + nxs[k]];
+                if (nb.env_slot.M <= 0.0f) continue;
+                HitRecord nr;
+                vec3 nvdir;
+                neighbor_rec(k, nr, nvdir);
+                color cc;
+                float wm;
+                if (target_env(nr, nvdir, win_dir, env, cc, wm) > 0.0f) {
+                    Z += nb.env_slot.M;
+                }
+            }
+            if (Z > 0.0f) Wshade = wsum / (Z * win_that);
+            if (Mtot > 0.0f) Wstore = wsum / (Mtot * win_that);
+        }
+        const float Wnew = Wshade;
+        (void)Wstore;
+        // Persist the PRE-spatial reservoir: temporal chains then only
+        // ever contain same-surface history (bias-free within the
+        // similarity gate), and spatial reuse is a pure per-frame
+        // variance reducer shaded with the unbiased 1/Z weight. Feeding
+        // the spatial merge back compounds cross-surface correlation
+        // into measurable energy bias (found on many-light scenes).
+        persist.env_slot = own.env_slot;
+        if (Wnew > 0.0f) {
+            if (!world.occluded(Ray(rec.p, win_dir), 1e-3f,
+                                std::numeric_limits<float>::infinity())) {
+                const color c = win_c * win_mis * Wnew;
+                radiance += clamp_contribution(c, clamp_indirect);
+            }
+        }
+    } else {
+        for (int k = 0; k < K; ++k) rng.next_float();   // fixed draw shape
+        persist.env_slot = ReSTIRSlot{};
+    }
+
+    // --- area slot ---
+    if (can_area) {
+        float win_ax = own.area_slot.ax, win_ay = own.area_slot.ay,
+              win_az = own.area_slot.az;
+        pt_uint win_id_p1 = own.area_slot.light_id_p1;
+        color win_c(0.0f);
+        float win_mis = 0.0f, win_G = 0.0f, win_t = 0.0f;
+        vec3 win_dir(0.0f, 0.0f, 1.0f);
+        float win_that = 0.0f;
+        if (own.area_slot.M > 0.0f && own.area_slot.W > 0.0f &&
+            win_id_p1 > 0u && int(win_id_p1) <= lights.count) {
+            win_that = target_area(rec, vdir,
+                                   lights.lights[int(win_id_p1) - 1],
+                                   win_ax, win_ay, win_az, lights, win_c,
+                                   win_mis, win_G, win_dir, win_t);
+        }
+        float wsum = win_that * own.area_slot.W * own.area_slot.M;
+        float Mtot = own.area_slot.M;
+        if (win_that <= 0.0f) wsum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            const float ur = rng.next_float();
+            if (!ok[k]) continue;
+            const ReSTIRPixel& nb = cur_all[std::size_t(nys[k]) * w + nxs[k]];
+            if (nb.area_slot.M <= 0.0f || nb.area_slot.W <= 0.0f ||
+                nb.area_slot.light_id_p1 == 0u ||
+                int(nb.area_slot.light_id_p1) > lights.count)
+                continue;
+            const GPULight& L =
+                lights.lights[int(nb.area_slot.light_id_p1) - 1];
+            color contrib;
+            float w_mis, G, t_o;
+            vec3 d_o;
+            const float thatA =
+                target_area(rec, vdir, L, nb.area_slot.ax, nb.area_slot.ay,
+                            nb.area_slot.az, lights, contrib, w_mis, G, d_o,
+                            t_o);
+            const float wh = thatA * nb.area_slot.W * nb.area_slot.M;
+            wsum += wh;
+            Mtot += nb.area_slot.M;
+            if (wh > 0.0f && ur < wh / wsum) {
+                win_ax = nb.area_slot.ax;
+                win_ay = nb.area_slot.ay;
+                win_az = nb.area_slot.az;
+                win_id_p1 = nb.area_slot.light_id_p1;
+                win_c = contrib;
+                win_mis = w_mis;
+                win_G = G;
+                win_dir = d_o;
+                win_t = t_o;
+                win_that = thatA;
+            }
+        }
+        float Wshade = 0.0f, Wstore = 0.0f;
+        if (wsum > 0.0f && win_that > 0.0f && win_id_p1 > 0u) {
+            const GPULight& Lw = lights.lights[int(win_id_p1) - 1];
+            float Z = own.area_slot.M;
+            for (int k = 0; k < K; ++k) {
+                if (!ok[k]) continue;
+                const ReSTIRPixel& nb =
+                    cur_all[std::size_t(nys[k]) * w + nxs[k]];
+                if (nb.area_slot.M <= 0.0f) continue;
+                HitRecord nr;
+                vec3 nvdir;
+                neighbor_rec(k, nr, nvdir);
+                color cc;
+                float wm, gg, tt;
+                vec3 dd;
+                if (target_area(nr, nvdir, Lw, win_ax, win_ay, win_az,
+                                lights, cc, wm, gg, dd, tt) > 0.0f) {
+                    Z += nb.area_slot.M;
+                }
+            }
+            if (Z > 0.0f) Wshade = wsum / (Z * win_that);
+            if (Mtot > 0.0f) Wstore = wsum / (Mtot * win_that);
+        }
+        const float Wnew = Wshade;
+        (void)Wstore;
+        persist.area_slot = own.area_slot;   // pre-spatial (see env slot)
         if (Wnew > 0.0f) {
             if (!world.occluded(Ray(rec.p, win_dir), 1e-3f,
                                 win_t * (1.0f - 1e-3f))) {
-                // F_A / p_A form: contrib * G * w_mis * W_A.
                 const color c = win_c * win_mis * (win_G * Wnew);
                 radiance += clamp_contribution(c, clamp_indirect);
             }
         }
     } else {
-        pix.area_slot.M = 0.0f;
-        pix.area_slot.W = 0.0f;
+        for (int k = 0; k < K; ++k) rng.next_float();   // fixed draw shape
+        persist.area_slot = ReSTIRSlot{};
     }
 
-    pix.prev_normal = {rec.normal.x, rec.normal.y, rec.normal.z};
-    pix.prev_t = rec.t;
+    persist.prev_normal = {rec.normal.x, rec.normal.y, rec.normal.z};
+    persist.prev_t = rec.t;
 }
 
 inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,

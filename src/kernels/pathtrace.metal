@@ -1185,39 +1185,113 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
 // vertex-0 direct skipped). Phase order is enforced by command-queue
 // ordering; the rng stream travels through the G-buffer.
 
-// ---- Session K Stages 1+2: RIS + temporal reservoirs — mirror of
-// integrator.h's restir_direct.
-inline void restir_direct(thread const HitInfo& hi, float3 rd,
-                          thread PRNG& rng, int M, bool temporal,
-                          device ReSTIRPixel& pix, thread float3& radiance,
-                          constant GPUSphere* spheres, uint n,
-                          device const BVHNode* nodes,
-                          device const GPUTriangle* tris,
-                          device const GPUMaterialArgs* materials,
+// ---- Session K: ReSTIR direct lighting — mirror of integrator.h -------
+
+inline float target_env_t(thread const EvalMat& mat, float3 hn, float3 hp,
+                          float3 vdir, float3 dir,
                           device const float* env_texels,
                           device const float* env_row_cdf,
                           device const float* env_cond_cdf,
-                          device const GPULight* lights,
-                          constant MeshUniforms& MU,
-                          constant PassUniforms& U) {
+                          constant PassUniforms& U,
+                          thread float3& contrib_out,
+                          thread float& wmis_out) {
+    contrib_out = float3(0.0f);
+    wmis_out = 0.0f;
+    float pb = 0.0f;
+    const float3 f = eval_bsdf(mat, hn, vdir, dir, pb);
+    const float nl = dot(hn, dir);
+    if (nl <= 1e-6f || (f.x <= 0.0f && f.y <= 0.0f && f.z <= 0.0f))
+        return 0.0f;
+    contrib_out = f * nl *
+                  miss_radiance(env_texels, U.env_w, U.env_h,
+                                U.env_intensity, U.env_yaw_norm, dir);
+    const float pl = env_pdf(env_row_cdf, env_cond_cdf, int(U.env_w),
+                             int(U.env_h), U.env_yaw_norm, dir);
+    wmis_out = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
+    return luminance(contrib_out * wmis_out);
+}
+
+inline float target_area_t(thread const EvalMat& mat, float3 hn, float3 hp,
+                           float3 vdir, device const GPULight& L, float ax,
+                           float ay, float az,
+                           device const GPUMaterialArgs* materials,
+                           constant MeshUniforms& MU,
+                           thread float3& contrib_out,
+                           thread float& wmis_out, thread float& G_out,
+                           thread float3& dir_out, thread float& t_out) {
+    contrib_out = float3(0.0f);
+    wmis_out = 0.0f;
+    G_out = 0.0f;
+    t_out = 0.0f;
+    dir_out = float3(0.0f, 0.0f, 1.0f);
+    float3 y;
+    float bu = 0.0f, bv = 0.0f;
+    if (L.kind == 0u) {
+        y = float3(ax, ay, az);
+    } else {
+        bu = ax;
+        bv = ay;
+        y = c3(L.p0) + bu * c3(L.e1) + bv * c3(L.e2);
+    }
+    const float3 d = y - hp;
+    const float r2 = dot(d, d);
+    if (r2 < 1e-12f) return 0.0f;
+    const float r = sqrt(r2);
+    dir_out = d / r;
+    t_out = r;
+    float pb = 0.0f;
+    const float3 f = eval_bsdf(mat, hn, vdir, dir_out, pb);
+    const float nl = dot(hn, dir_out);
+    if (nl <= 1e-6f || (f.x <= 0.0f && f.y <= 0.0f && f.z <= 0.0f))
+        return 0.0f;
+    float3 Le = c3(L.emission);
+    float3 n_y;
+    if (L.kind == 0u) {
+        n_y = normalize(y - c3(L.p0));
+    } else {
+        const float b0 = 1.0f - bu - bv;
+        const float tu = b0 * L.u0 + bu * L.u1 + bv * L.u2;
+        const float tv = b0 * L.v0 + bu * L.v1 + bv * L.v2;
+        device const GPUMaterialArgs& LM = materials[L.mat_id];
+        Le = sample_bilinear(LM.emis, LM.emis_w, LM.emis_h, tu, tv) *
+             MU.emissive_scale;
+        n_y = normalize(cross_pt(c3(L.e1), c3(L.e2)));
+    }
+    G_out = fabs(dot(n_y, dir_out)) / r2;
+    const float pl = light_dir_pdf(L, hp, dir_out, r) * L.sel_pdf;
+    contrib_out = f * nl * Le;
+    wmis_out = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
+    return luminance(contrib_out * wmis_out) * G_out;
+}
+
+// Phase D1 — mirror of integrator.h's restir_build.
+inline void restir_build(thread const HitInfo& hi, float3 rd,
+                         thread PRNG& rng, int M, bool temporal,
+                         device const ReSTIRPixel& hist,
+                         device ReSTIRPixel& cur,
+                         constant GPUSphere* spheres, uint n,
+                         device const GPUMaterialArgs* materials,
+                         device const float* env_texels,
+                         device const float* env_row_cdf,
+                         device const float* env_cond_cdf,
+                         device const GPULight* lights,
+                         constant MeshUniforms& MU,
+                         constant PassUniforms& U) {
     const bool can_env = U.env_nee != 0u && U.env_w != 0u &&
                          hi.mat.transmission <= 0.5f;
     const bool can_area = U.env_nee != 0u && U.light_count > 0u &&
                           hi.mat.transmission <= 0.5f;
     const float3 vdir = -normalize(rd);
     const float McapF = 20.0f * float(M);
-    const float3 pn = c3(pix.prev_normal);
+    const float3 pn = c3(hist.prev_normal);
     const bool hist_ok =
-        temporal && pix.prev_t > 0.0f && hi.t > 0.0f &&
-        fabs(pix.prev_t - hi.t) < 0.1f * hi.t &&
+        temporal && hist.prev_t > 0.0f && hi.t > 0.0f &&
+        fabs(hist.prev_t - hi.t) < 0.1f * hi.t &&
         (pn.x * hi.hn.x + pn.y * hi.hn.y + pn.z * hi.hn.z) > 0.9f;
 
-    // --- env slot (solid-angle measure; the sample is a direction) ---
     if (can_env) {
-        ReSTIRSlot es = pix.env_slot;
-        float wsum = 0.0f, win_that = 0.0f, win_mis = 0.0f;
+        float wsum = 0.0f, win_that = 0.0f;
         float3 win_dir = float3(0.0f, 0.0f, 1.0f);
-        float3 win_c = float3(0.0f);
         for (int i = 0; i < M; ++i) {
             const float u1 = pcg_next_float(rng);
             const float u2 = pcg_next_float(rng);
@@ -1226,91 +1300,60 @@ inline void restir_direct(thread const HitInfo& hi, float3 rd,
             const float3 ldir =
                 env_sample(env_row_cdf, env_cond_cdf, int(U.env_w),
                            int(U.env_h), U.env_yaw_norm, u1, u2, pl);
-            float w_i = 0.0f, that = 0.0f, w_mis = 0.0f;
-            float3 contrib = float3(0.0f);
+            float w_i = 0.0f, that = 0.0f;
             if (pl > 1e-12f) {
-                float pb = 0.0f;
-                const float3 f = eval_bsdf(hi.mat, hi.hn, vdir, ldir, pb);
-                const float nl = dot(hi.hn, ldir);
-                if (nl > 1e-6f &&
-                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
-                    contrib = f * nl *
-                              miss_radiance(env_texels, U.env_w, U.env_h,
-                                            U.env_intensity, U.env_yaw_norm,
-                                            ldir);
-                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
-                    that = luminance(contrib * w_mis);
-                    w_i = that / pl;
-                }
+                float3 contrib;
+                float w_mis;
+                that = target_env_t(hi.mat, hi.hn, hi.hp, vdir, ldir,
+                                    env_texels, env_row_cdf, env_cond_cdf,
+                                    U, contrib, w_mis);
+                if (that > 0.0f) w_i = that / pl;
             }
             wsum += w_i;
             if (w_i > 0.0f && ur < w_i / wsum) {
                 win_dir = ldir;
-                win_c = contrib;
-                win_mis = w_mis;
                 win_that = that;
             }
         }
         float Mtot = float(M);
         const float ur_h = pcg_next_float(rng);
-        if (hist_ok && es.M > 0.0f && es.W > 0.0f) {
-            const float3 hdir = float3(es.ax, es.ay, es.az);
-            float that = 0.0f, w_mis = 0.0f;
-            float3 contrib = float3(0.0f);
-            float pb = 0.0f;
-            const float3 f = eval_bsdf(hi.mat, hi.hn, vdir, hdir, pb);
-            const float nl = dot(hi.hn, hdir);
-            if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
-                contrib = f * nl *
-                          miss_radiance(env_texels, U.env_w, U.env_h,
-                                        U.env_intensity, U.env_yaw_norm,
-                                        hdir);
-                const float pl =
-                    env_pdf(env_row_cdf, env_cond_cdf, int(U.env_w),
-                            int(U.env_h), U.env_yaw_norm, hdir);
-                w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
-                that = luminance(contrib * w_mis);
-            }
-            const float Mh = fmin(es.M, McapF);
-            const float wh = that * es.W * Mh;
+        if (hist_ok && hist.env_slot.M > 0.0f && hist.env_slot.W > 0.0f) {
+            const float3 hdir =
+                float3(hist.env_slot.ax, hist.env_slot.ay, hist.env_slot.az);
+            float3 contrib;
+            float w_mis;
+            const float that =
+                target_env_t(hi.mat, hi.hn, hi.hp, vdir, hdir, env_texels,
+                             env_row_cdf, env_cond_cdf, U, contrib, w_mis);
+            const float Mh = fmin(hist.env_slot.M, McapF);
+            const float wh = that * hist.env_slot.W * Mh;
             wsum += wh;
             Mtot += Mh;
             if (wh > 0.0f && ur_h < wh / wsum) {
                 win_dir = hdir;
-                win_c = contrib;
-                win_mis = w_mis;
                 win_that = that;
             }
         }
-        const float Wnew = (wsum > 0.0f && win_that > 0.0f)
-                               ? wsum / (Mtot * win_that)
-                               : 0.0f;
+        ReSTIRSlot es;
         es.ax = win_dir.x;
         es.ay = win_dir.y;
         es.az = win_dir.z;
-        es.W = Wnew;
+        es.W = (wsum > 0.0f && win_that > 0.0f) ? wsum / (Mtot * win_that)
+                                                : 0.0f;
         es.M = fmin(Mtot, McapF);
         es.light_id_p1 = 0u;
-        pix.env_slot = es;
-        if (Wnew > 0.0f) {
-            if (!occluded_scene(hi.hp, win_dir, INFINITY, spheres, n, nodes,
-                                tris, MU)) {
-                const float3 c = win_c * win_mis * Wnew;
-                radiance += clamp_contribution(c, U.clamp_indirect);
-            }
-        }
+        es.pad0 = 0u;
+        es.pad1 = 0u;
+        cur.env_slot = es;
     } else {
-        pix.env_slot.M = 0.0f;
-        pix.env_slot.W = 0.0f;
+        ReSTIRSlot z;
+        z.ax = 0.0f; z.ay = 0.0f; z.az = 1.0f;
+        z.W = 0.0f; z.M = 0.0f; z.light_id_p1 = 0u; z.pad0 = 0u; z.pad1 = 0u;
+        cur.env_slot = z;
     }
 
-    // --- area slot (AREA measure; the sample is a light point) ---
     if (can_area) {
-        ReSTIRSlot as = pix.area_slot;
-        float wsum = 0.0f, win_thatA = 0.0f, win_mis = 0.0f;
-        float win_G = 0.0f, win_t = 0.0f;
-        float3 win_dir = float3(0.0f, 0.0f, 1.0f);
-        float3 win_c = float3(0.0f);
+        float wsum = 0.0f, win_thatA = 0.0f;
         float win_ax = 0.0f, win_ay = 0.0f, win_az = 0.0f;
         uint win_id_p1 = 0u;
         for (int i = 0; i < M; ++i) {
@@ -1327,156 +1370,80 @@ inline void restir_direct(thread const HitInfo& hi, float3 rd,
                     ? sample_sphere_light(L, hi.hp, u1, u2, pdf_sa, t_light)
                     : sample_tri_light(L, hi.hp, u1, u2, pdf_sa, t_light,
                                        bu, bv);
-            float w_i = 0.0f, thatA = 0.0f, w_mis = 0.0f, G = 0.0f;
-            float3 contrib = float3(0.0f);
-            const float pl = pdf_sa * L.sel_pdf;
+            float w_i = 0.0f, thatA = 0.0f;
+            float sax = 0.0f, say = 0.0f, saz = 0.0f;
             if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f && t_light > 1e-6f) {
-                float pb = 0.0f;
-                const float3 f = eval_bsdf(hi.mat, hi.hn, vdir, ldir, pb);
-                const float nl = dot(hi.hn, ldir);
-                if (nl > 1e-6f &&
-                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
-                    float3 Le = c3(L.emission);
-                    float3 n_y;
-                    if (L.kind == 0u) {
-                        const float3 y = hi.hp + ldir * t_light;
-                        n_y = normalize(y - c3(L.p0));
-                    } else {
-                        const float b0 = 1.0f - bu - bv;
-                        const float tu = b0 * L.u0 + bu * L.u1 + bv * L.u2;
-                        const float tv = b0 * L.v0 + bu * L.v1 + bv * L.v2;
-                        device const GPUMaterialArgs& LM =
-                            materials[L.mat_id];
-                        Le = sample_bilinear(LM.emis, LM.emis_w, LM.emis_h,
-                                             tu, tv) *
-                             MU.emissive_scale;
-                        n_y = normalize(cross_pt(c3(L.e1), c3(L.e2)));
-                    }
-                    G = fabs(dot(n_y, ldir)) / (t_light * t_light);
-                    contrib = f * nl * Le;
-                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
-                    const float that = luminance(contrib * w_mis);
-                    thatA = that * G;
-                    w_i = that / pl;   // == thatA / (pl * G)
+                if (L.kind == 0u) {
+                    const float3 yy = hi.hp + ldir * t_light;
+                    sax = yy.x;
+                    say = yy.y;
+                    saz = yy.z;
+                } else {
+                    sax = bu;
+                    say = bv;
                 }
+                float3 contrib;
+                float w_mis, G, t_o;
+                float3 d_o;
+                thatA = target_area_t(hi.mat, hi.hn, hi.hp, vdir, L, sax,
+                                      say, saz, materials, MU, contrib,
+                                      w_mis, G, d_o, t_o);
+                const float pl = pdf_sa * L.sel_pdf;
+                if (thatA > 0.0f && G > 0.0f) w_i = thatA / (pl * G);
             }
             wsum += w_i;
             if (w_i > 0.0f && ur < w_i / wsum) {
-                win_dir = ldir;
-                win_c = contrib;
-                win_mis = w_mis;
                 win_thatA = thatA;
-                win_G = G;
-                win_t = t_light;
+                win_ax = sax;
+                win_ay = say;
+                win_az = saz;
                 win_id_p1 = uint(li + 1);
-                if (L.kind == 0u) {
-                    const float3 y = hi.hp + ldir * t_light;
-                    win_ax = y.x;
-                    win_ay = y.y;
-                    win_az = y.z;
-                } else {
-                    win_ax = bu;
-                    win_ay = bv;
-                    win_az = 0.0f;
-                }
             }
         }
         float Mtot = float(M);
         const float ur_h = pcg_next_float(rng);
-        if (hist_ok && as.M > 0.0f && as.W > 0.0f && as.light_id_p1 > 0u &&
-            as.light_id_p1 <= U.light_count) {
-            const int hid = int(as.light_id_p1) - 1;
-            device const GPULight& L = lights[hid];
-            float3 y;
-            float hbu = 0.0f, hbv = 0.0f;
-            if (L.kind == 0u) {
-                y = float3(as.ax, as.ay, as.az);
-            } else {
-                hbu = as.ax;
-                hbv = as.ay;
-                y = c3(L.p0) + hbu * c3(L.e1) + hbv * c3(L.e2);
-            }
-            const float3 d = y - hi.hp;
-            const float r2 = dot(d, d);
-            float thatA = 0.0f, w_mis = 0.0f, G = 0.0f, t_l = 0.0f;
-            float3 contrib = float3(0.0f);
-            float3 hdir = float3(0.0f, 0.0f, 1.0f);
-            if (r2 > 1e-12f) {
-                const float r = sqrt(r2);
-                hdir = d / r;
-                t_l = r;
-                float pb = 0.0f;
-                const float3 f = eval_bsdf(hi.mat, hi.hn, vdir, hdir, pb);
-                const float nl = dot(hi.hn, hdir);
-                if (nl > 1e-6f &&
-                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
-                    float3 Le = c3(L.emission);
-                    float3 n_y;
-                    if (L.kind == 0u) {
-                        n_y = normalize(y - c3(L.p0));
-                    } else {
-                        const float b0 = 1.0f - hbu - hbv;
-                        const float tu =
-                            b0 * L.u0 + hbu * L.u1 + hbv * L.u2;
-                        const float tv =
-                            b0 * L.v0 + hbu * L.v1 + hbv * L.v2;
-                        device const GPUMaterialArgs& LM =
-                            materials[L.mat_id];
-                        Le = sample_bilinear(LM.emis, LM.emis_w, LM.emis_h,
-                                             tu, tv) *
-                             MU.emissive_scale;
-                        n_y = normalize(cross_pt(c3(L.e1), c3(L.e2)));
-                    }
-                    G = fabs(dot(n_y, hdir)) / r2;
-                    const float pl =
-                        light_dir_pdf(L, hi.hp, hdir, r) * L.sel_pdf;
-                    contrib = f * nl * Le;
-                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
-                    thatA = luminance(contrib * w_mis) * G;
-                }
-            }
-            const float Mh = fmin(as.M, McapF);
-            const float wh = thatA * as.W * Mh;
+        if (hist_ok && hist.area_slot.M > 0.0f && hist.area_slot.W > 0.0f &&
+            hist.area_slot.light_id_p1 > 0u &&
+            hist.area_slot.light_id_p1 <= U.light_count) {
+            device const GPULight& L =
+                lights[int(hist.area_slot.light_id_p1) - 1];
+            float3 contrib;
+            float w_mis, G, t_o;
+            float3 d_o;
+            const float thatA = target_area_t(
+                hi.mat, hi.hn, hi.hp, vdir, L, hist.area_slot.ax,
+                hist.area_slot.ay, hist.area_slot.az, materials, MU,
+                contrib, w_mis, G, d_o, t_o);
+            const float Mh = fmin(hist.area_slot.M, McapF);
+            const float wh = thatA * hist.area_slot.W * Mh;
             wsum += wh;
             Mtot += Mh;
             if (wh > 0.0f && ur_h < wh / wsum) {
-                win_dir = hdir;
-                win_c = contrib;
-                win_mis = w_mis;
                 win_thatA = thatA;
-                win_G = G;
-                win_t = t_l;
-                win_id_p1 = as.light_id_p1;
-                win_ax = as.ax;
-                win_ay = as.ay;
-                win_az = as.az;
+                win_ax = hist.area_slot.ax;
+                win_ay = hist.area_slot.ay;
+                win_az = hist.area_slot.az;
+                win_id_p1 = hist.area_slot.light_id_p1;
             }
         }
-        const float Wnew = (wsum > 0.0f && win_thatA > 0.0f)
-                               ? wsum / (Mtot * win_thatA)
-                               : 0.0f;
+        ReSTIRSlot as;
         as.ax = win_ax;
         as.ay = win_ay;
         as.az = win_az;
-        as.W = Wnew;
+        as.W = (wsum > 0.0f && win_thatA > 0.0f)
+                   ? wsum / (Mtot * win_thatA)
+                   : 0.0f;
         as.M = fmin(Mtot, McapF);
         as.light_id_p1 = win_id_p1;
-        pix.area_slot = as;
-        if (Wnew > 0.0f) {
-            if (!occluded_scene(hi.hp, win_dir, win_t * (1.0f - 1e-3f),
-                                spheres, n, nodes, tris, MU)) {
-                // F_A / p_A form: contrib * G * w_mis * W_A.
-                const float3 c = win_c * win_mis * (win_G * Wnew);
-                radiance += clamp_contribution(c, U.clamp_indirect);
-            }
-        }
+        as.pad0 = 0u;
+        as.pad1 = 0u;
+        cur.area_slot = as;
     } else {
-        pix.area_slot.M = 0.0f;
-        pix.area_slot.W = 0.0f;
+        ReSTIRSlot z;
+        z.ax = 0.0f; z.ay = 0.0f; z.az = 1.0f;
+        z.W = 0.0f; z.M = 0.0f; z.light_id_p1 = 0u; z.pad0 = 0u; z.pad1 = 0u;
+        cur.area_slot = z;
     }
-
-    pix.prev_normal = pt_float3{hi.hn.x, hi.hn.y, hi.hn.z};
-    pix.prev_t = hi.t;
 }
 
 inline PRNG pcg_restore(uint lo, uint hi, ulong px) {
@@ -1573,7 +1540,8 @@ kernel void direct_v0(device float4* accum            [[buffer(0)]],
                       device const float* env_row_cdf [[buffer(11)]],
                       device const float* env_cond_cdf [[buffer(12)]],
                       device const GPULight* lights   [[buffer(13)]],
-                      device ReSTIRPixel* resv        [[buffer(14)]],
+                      device const ReSTIRPixel* resv  [[buffer(14)]],
+                      device ReSTIRPixel* resv_cur    [[buffer(15)]],
                       uint2 gid [[thread_position_in_grid]]) {
     const uint py = gid.y + U.row_offset;
     if (py >= U.height) return;
@@ -1583,11 +1551,248 @@ kernel void direct_v0(device float4* accum            [[buffer(0)]],
     const HitInfo hi = hitinfo_from_gbuf(g);
     PRNG rng = pcg_restore(g.rng_lo, g.rng_hi, px);
 
+    restir_build(hi, c3(g.rd), rng, int(U.restir_m),
+                 U.restir_temporal != 0u, resv[px], resv_cur[px], spheres,
+                 U.sphere_count, materials, env_texels, env_row_cdf,
+                 env_cond_cdf, lights, MU, U);
+
+    gbuf[px].rng_lo = uint(rng.state & 0xffffffffUL);
+    gbuf[px].rng_hi = uint(rng.state >> 32);
+}
+
+// Phase D2 — mirror of integrator.h's restir_spatial_shade: spatial merge
+// with the unbiased 1/Z correction, the slot's single shadow ray, shading,
+// and the persistent store feeding next frame's temporal reuse.
+kernel void spatial_v0(device float4* accum            [[buffer(0)]],
+                       constant GPUSphere* spheres     [[buffer(1)]],
+                       constant PassUniforms& U        [[buffer(2)]],
+                       device const BVHNode* nodes     [[buffer(3)]],
+                       device const GPUTriangle* tris  [[buffer(4)]],
+                       device const GPUMaterialArgs* materials [[buffer(5)]],
+                       device GBufferPx* gbuf          [[buffer(6)]],
+                       device const ReSTIRPixel* resv_cur [[buffer(7)]],
+                       constant MeshUniforms& MU       [[buffer(8)]],
+                       device ReSTIRPixel* resv        [[buffer(9)]],
+                       device const float* env_texels  [[buffer(10)]],
+                       device const float* env_row_cdf [[buffer(11)]],
+                       device const float* env_cond_cdf [[buffer(12)]],
+                       device const GPULight* lights   [[buffer(13)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    const uint py = gid.y + U.row_offset;
+    if (py >= U.height) return;
+    const ulong px = ulong(py) * U.width + gid.x;
+    GBufferPx g = gbuf[px];
+    if (g.t < 0.0f) return;
+    const HitInfo hi = hitinfo_from_gbuf(g);
+    PRNG rng = pcg_restore(g.rng_lo, g.rng_hi, px);
+    const float3 vdir = -normalize(c3(g.rd));
+    const int M = int(U.restir_m);
+    const float McapF = 20.0f * float(M);
+    const bool can_env = U.env_nee != 0u && U.env_w != 0u &&
+                         hi.mat.transmission <= 0.5f;
+    const bool can_area = U.env_nee != 0u && U.light_count > 0u &&
+                          hi.mat.transmission <= 0.5f;
+    device const ReSTIRPixel& own = resv_cur[px];
     float3 radiance = float3(0.0f);
-    restir_direct(hi, c3(g.rd), rng, int(U.restir_m),
-                  U.restir_temporal != 0u, resv[px], radiance, spheres,
-                  U.sphere_count, nodes, tris, materials, env_texels,
-                  env_row_cdf, env_cond_cdf, lights, MU, U);
+
+    int nxs[PT_RESTIR_NEIGHBORS], nys[PT_RESTIR_NEIGHBORS];
+    bool ok[PT_RESTIR_NEIGHBORS];
+    const int K = U.restir_spatial != 0u ? PT_RESTIR_NEIGHBORS : 0;
+    for (int k = 0; k < K; ++k) {
+        const float u1 = pcg_next_float(rng);
+        const float u2 = pcg_next_float(rng);
+        int nx = int(gid.x) + int((u1 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
+        int ny = int(py) + int((u2 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
+        nx = nx < 0 ? 0 : (nx >= int(U.width) ? int(U.width) - 1 : nx);
+        ny = ny < 0 ? 0 : (ny >= int(U.height) ? int(U.height) - 1 : ny);
+        nxs[k] = nx;
+        nys[k] = ny;
+        ok[k] = false;
+        if (nx == int(gid.x) && ny == int(py)) continue;
+        const GBufferPx gn = gbuf[ulong(ny) * U.width + nx];
+        if (gn.t < 0.0f || gn.transmission > 0.5f) continue;
+        if (fabs(gn.t - hi.t) >= 0.1f * hi.t) continue;
+        const float3 nn = c3(gn.normal);
+        if (dot(nn, hi.hn) <= 0.9f) continue;
+        ok[k] = true;
+    }
+
+    // --- env slot ---
+    if (can_env) {
+        float3 win_dir = float3(own.env_slot.ax, own.env_slot.ay,
+                                own.env_slot.az);
+        float3 win_c = float3(0.0f);
+        float win_mis = 0.0f;
+        float win_that = 0.0f;
+        if (own.env_slot.M > 0.0f && own.env_slot.W > 0.0f) {
+            win_that = target_env_t(hi.mat, hi.hn, hi.hp, vdir, win_dir,
+                                    env_texels, env_row_cdf, env_cond_cdf,
+                                    U, win_c, win_mis);
+        }
+        float wsum = win_that * own.env_slot.W * own.env_slot.M;
+        float Mtot = own.env_slot.M;
+        if (win_that <= 0.0f) wsum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            const float ur = pcg_next_float(rng);
+            if (!ok[k]) continue;
+            device const ReSTIRPixel& nb =
+                resv_cur[ulong(nys[k]) * U.width + nxs[k]];
+            if (nb.env_slot.M <= 0.0f || nb.env_slot.W <= 0.0f) continue;
+            const float3 sdir =
+                float3(nb.env_slot.ax, nb.env_slot.ay, nb.env_slot.az);
+            float3 contrib;
+            float w_mis;
+            const float that =
+                target_env_t(hi.mat, hi.hn, hi.hp, vdir, sdir, env_texels,
+                             env_row_cdf, env_cond_cdf, U, contrib, w_mis);
+            const float wh = that * nb.env_slot.W * nb.env_slot.M;
+            wsum += wh;
+            Mtot += nb.env_slot.M;
+            if (wh > 0.0f && ur < wh / wsum) {
+                win_dir = sdir;
+                win_c = contrib;
+                win_mis = w_mis;
+                win_that = that;
+            }
+        }
+        float Wshade = 0.0f, Wstore = 0.0f;
+        if (wsum > 0.0f && win_that > 0.0f) {
+            float Z = own.env_slot.M;
+            for (int k = 0; k < K; ++k) {
+                if (!ok[k]) continue;
+                device const ReSTIRPixel& nb =
+                    resv_cur[ulong(nys[k]) * U.width + nxs[k]];
+                if (nb.env_slot.M <= 0.0f) continue;
+                const GBufferPx gn = gbuf[ulong(nys[k]) * U.width + nxs[k]];
+                const HitInfo nh = hitinfo_from_gbuf(gn);
+                const float3 nvdir = -normalize(c3(gn.rd));
+                float3 cc;
+                float wm;
+                if (target_env_t(nh.mat, nh.hn, nh.hp, nvdir, win_dir,
+                                 env_texels, env_row_cdf, env_cond_cdf, U,
+                                 cc, wm) > 0.0f) {
+                    Z += nb.env_slot.M;
+                }
+            }
+            if (Z > 0.0f) Wshade = wsum / (Z * win_that);
+            if (Mtot > 0.0f) Wstore = wsum / (Mtot * win_that);
+        }
+        const float Wnew = Wshade;
+        (void)Wstore;
+        // Persist the PRE-spatial reservoir — mirror of integrator.h.
+        resv[px].env_slot = own.env_slot;
+        if (Wnew > 0.0f) {
+            if (!occluded_scene(hi.hp, win_dir, INFINITY, spheres,
+                                U.sphere_count, nodes, tris, MU)) {
+                const float3 c = win_c * win_mis * Wnew;
+                radiance += clamp_contribution(c, U.clamp_indirect);
+            }
+        }
+    } else {
+        for (int k = 0; k < K; ++k) pcg_next_float(rng);
+        ReSTIRSlot z;
+        z.ax = 0.0f; z.ay = 0.0f; z.az = 1.0f;
+        z.W = 0.0f; z.M = 0.0f; z.light_id_p1 = 0u; z.pad0 = 0u; z.pad1 = 0u;
+        resv[px].env_slot = z;
+    }
+
+    // --- area slot ---
+    if (can_area) {
+        float win_ax = own.area_slot.ax, win_ay = own.area_slot.ay,
+              win_az = own.area_slot.az;
+        uint win_id_p1 = own.area_slot.light_id_p1;
+        float3 win_c = float3(0.0f);
+        float win_mis = 0.0f, win_G = 0.0f, win_t = 0.0f;
+        float3 win_dir = float3(0.0f, 0.0f, 1.0f);
+        float win_that = 0.0f;
+        if (own.area_slot.M > 0.0f && own.area_slot.W > 0.0f &&
+            win_id_p1 > 0u && win_id_p1 <= U.light_count) {
+            win_that = target_area_t(hi.mat, hi.hn, hi.hp, vdir,
+                                     lights[int(win_id_p1) - 1], win_ax,
+                                     win_ay, win_az, materials, MU, win_c,
+                                     win_mis, win_G, win_dir, win_t);
+        }
+        float wsum = win_that * own.area_slot.W * own.area_slot.M;
+        float Mtot = own.area_slot.M;
+        if (win_that <= 0.0f) wsum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            const float ur = pcg_next_float(rng);
+            if (!ok[k]) continue;
+            device const ReSTIRPixel& nb =
+                resv_cur[ulong(nys[k]) * U.width + nxs[k]];
+            if (nb.area_slot.M <= 0.0f || nb.area_slot.W <= 0.0f ||
+                nb.area_slot.light_id_p1 == 0u ||
+                nb.area_slot.light_id_p1 > U.light_count)
+                continue;
+            device const GPULight& L =
+                lights[int(nb.area_slot.light_id_p1) - 1];
+            float3 contrib;
+            float w_mis, G, t_o;
+            float3 d_o;
+            const float thatA = target_area_t(
+                hi.mat, hi.hn, hi.hp, vdir, L, nb.area_slot.ax,
+                nb.area_slot.ay, nb.area_slot.az, materials, MU, contrib,
+                w_mis, G, d_o, t_o);
+            const float wh = thatA * nb.area_slot.W * nb.area_slot.M;
+            wsum += wh;
+            Mtot += nb.area_slot.M;
+            if (wh > 0.0f && ur < wh / wsum) {
+                win_ax = nb.area_slot.ax;
+                win_ay = nb.area_slot.ay;
+                win_az = nb.area_slot.az;
+                win_id_p1 = nb.area_slot.light_id_p1;
+                win_c = contrib;
+                win_mis = w_mis;
+                win_G = G;
+                win_dir = d_o;
+                win_t = t_o;
+                win_that = thatA;
+            }
+        }
+        float Wshade = 0.0f, Wstore = 0.0f;
+        if (wsum > 0.0f && win_that > 0.0f && win_id_p1 > 0u) {
+            device const GPULight& Lw = lights[int(win_id_p1) - 1];
+            float Z = own.area_slot.M;
+            for (int k = 0; k < K; ++k) {
+                if (!ok[k]) continue;
+                device const ReSTIRPixel& nb =
+                    resv_cur[ulong(nys[k]) * U.width + nxs[k]];
+                if (nb.area_slot.M <= 0.0f) continue;
+                const GBufferPx gn = gbuf[ulong(nys[k]) * U.width + nxs[k]];
+                const HitInfo nh = hitinfo_from_gbuf(gn);
+                const float3 nvdir = -normalize(c3(gn.rd));
+                float3 cc;
+                float wm, gg, tt;
+                float3 dd;
+                if (target_area_t(nh.mat, nh.hn, nh.hp, nvdir, Lw, win_ax,
+                                  win_ay, win_az, materials, MU, cc, wm, gg,
+                                  dd, tt) > 0.0f) {
+                    Z += nb.area_slot.M;
+                }
+            }
+            if (Z > 0.0f) Wshade = wsum / (Z * win_that);
+            if (Mtot > 0.0f) Wstore = wsum / (Mtot * win_that);
+        }
+        const float Wnew = Wshade;
+        (void)Wstore;
+        resv[px].area_slot = own.area_slot;   // pre-spatial
+        if (Wnew > 0.0f) {
+            if (!occluded_scene(hi.hp, win_dir, win_t * (1.0f - 1e-3f),
+                                spheres, U.sphere_count, nodes, tris, MU)) {
+                const float3 c = win_c * win_mis * (win_G * Wnew);
+                radiance += clamp_contribution(c, U.clamp_indirect);
+            }
+        }
+    } else {
+        for (int k = 0; k < K; ++k) pcg_next_float(rng);
+        ReSTIRSlot z;
+        z.ax = 0.0f; z.ay = 0.0f; z.az = 1.0f;
+        z.W = 0.0f; z.M = 0.0f; z.light_id_p1 = 0u; z.pad0 = 0u; z.pad1 = 0u;
+        resv[px].area_slot = z;
+    }
+
+    resv[px].prev_normal = pt_float3{hi.hn.x, hi.hn.y, hi.hn.z};
+    resv[px].prev_t = hi.t;
     accum[px] += float4(radiance, 0.0f);
 
     gbuf[px].rng_lo = uint(rng.state & 0xffffffffUL);

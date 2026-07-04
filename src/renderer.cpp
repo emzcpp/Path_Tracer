@@ -137,6 +137,9 @@ void ProgressiveRenderer::render_pass_partitioned() {
     if (resv_.size() != std::size_t(w_) * h_) {
         resv_.assign(std::size_t(w_) * h_, ReSTIRPixel{});
     }
+    if (resv_cur_.size() != std::size_t(w_) * h_) {
+        resv_cur_.assign(std::size_t(w_) * h_, ReSTIRPixel{});
+    }
     const auto par_rows = [&](auto&& fn) {
         const unsigned T =
             std::max(1u, std::thread::hardware_concurrency());
@@ -191,7 +194,42 @@ void ProgressiveRenderer::render_pass_partitioned() {
         }
     });
 
-    // Phase D: vertex-0 direct lighting (same estimator, same draws).
+    // Phase D1: candidates + temporal merge -> per-frame reservoirs.
+    // Shared helper builds the surface record from the G-buffer.
+    const auto rec_from_gbuf = [](const GBufferPx& g, HitRecord& rec) {
+        rec.p = point3(g.pos.x, g.pos.y, g.pos.z);
+        rec.normal = vec3(g.normal.x, g.normal.y, g.normal.z);
+        rec.front_face = (g.flags & 1u) != 0u;
+        rec.mat.base_color =
+            color(g.base_color.x, g.base_color.y, g.base_color.z);
+        rec.mat.emission = color(g.emission.x, g.emission.y, g.emission.z);
+        rec.mat.metallic = g.metallic;
+        rec.mat.roughness = g.roughness;
+        rec.mat.ior = g.ior;
+        rec.mat.transmission = g.transmission;
+        rec.t = g.t;
+    };
+    par_rows([&](int y) {
+        for (int x = 0; x < w_; ++x) {
+            const std::uint64_t px = std::uint64_t(y) * w_ + x;
+            GBufferPx& g = gbuf_[px];
+            if (g.t < 0.0f) continue;
+            HitRecord rec;
+            rec_from_gbuf(g, rec);
+            RNG rng(0, px);
+            rng.state =
+                (std::uint64_t(g.rng_hi) << 32) | std::uint64_t(g.rng_lo);
+            const Ray pray(rec.p, vec3(g.rd.x, g.rd.y, g.rd.z));
+            restir_build(rec, pray, rng, env_, lights_, settings_.restir_m,
+                         settings_.restir_temporal != 0, resv_[px],
+                         resv_cur_[px]);
+            g.rng_lo = pt_uint(rng.state & 0xffffffffULL);
+            g.rng_hi = pt_uint(rng.state >> 32);
+        }
+    });
+
+    // Phase D2: spatial merge (unbiased 1/Z) + shadow ray + shading, and
+    // the persistent store that feeds next frame's temporal reuse.
     par_rows([&](int y) {
         color* accum_row = &accum_[std::size_t(y) * w_];
         for (int x = 0; x < w_; ++x) {
@@ -199,26 +237,18 @@ void ProgressiveRenderer::render_pass_partitioned() {
             GBufferPx& g = gbuf_[px];
             if (g.t < 0.0f) continue;
             HitRecord rec;
-            rec.p = point3(g.pos.x, g.pos.y, g.pos.z);
-            rec.normal = vec3(g.normal.x, g.normal.y, g.normal.z);
-            rec.front_face = (g.flags & 1u) != 0u;
-            rec.mat.base_color =
-                color(g.base_color.x, g.base_color.y, g.base_color.z);
-            rec.mat.emission =
-                color(g.emission.x, g.emission.y, g.emission.z);
-            rec.mat.metallic = g.metallic;
-            rec.mat.roughness = g.roughness;
-            rec.mat.ior = g.ior;
-            rec.mat.transmission = g.transmission;
+            rec_from_gbuf(g, rec);
             RNG rng(0, px);
             rng.state =
                 (std::uint64_t(g.rng_hi) << 32) | std::uint64_t(g.rng_lo);
-            rec.t = g.t;
             const Ray pray(rec.p, vec3(g.rd.x, g.rd.y, g.rd.z));
             color rad(0.0f);
-            restir_direct(rec, pray, scene_, rng, env_, lights_,
-                          settings_.restir_m, settings_.restir_temporal != 0,
-                          resv_[px], settings_.clamp_indirect, rad);
+            restir_spatial_shade(rec, pray, scene_, rng, env_, lights_,
+                                 settings_.restir_m,
+                                 settings_.restir_spatial != 0,
+                                 gbuf_.data(), resv_cur_.data(), w_, h_, x,
+                                 y, resv_[px], settings_.clamp_indirect,
+                                 rad);
             accum_row[x] += rad;
             g.rng_lo = pt_uint(rng.state & 0xffffffffULL);
             g.rng_hi = pt_uint(rng.state >> 32);
