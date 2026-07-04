@@ -1530,19 +1530,7 @@ void render_thread_main(ViewerCore& core) {
                     const double budget_px =
                         double(budget) * 1.0e6 / nsPerPxPass_;
                     const double full = double(w) * double(h);
-                    if (core_->settings.restir != 0) {
-                        // ReSTIR frames are whole-frame only: spatial
-                        // reuse reads neighbor rows across the frame, so
-                        // a row slice would read cross-slice-stale
-                        // reservoirs. The four phases are separate
-                        // dispatches, so the GPU still preempts between
-                        // them even when a frame overruns the budget.
-                        int k = int(std::max(1.0, budget_px / full));
-                        k = std::min(k, kcap);
-                        if (target != INT_MAX)
-                            k = std::min(k, target - gpu.passes());
-                        work.passes = std::max(1, k);
-                    } else if (cursor > 0) {
+                    if (cursor > 0) {
                         // Finish the in-progress pass first.
                         work.passes = 1;
                         work.row_start = cursor;

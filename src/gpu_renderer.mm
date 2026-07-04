@@ -167,6 +167,13 @@ struct GpuRenderer::Impl {
     int w = 0, h = 0;        // current accumulation dims
     int passes = 0;          // completed full passes scheduled since reset
     int cursor = 0;          // next row of the in-progress pass (0 = none)
+    // ReSTIR phase-sliced scheduling: which of the four phases the
+    // in-progress frame is in, and the next row within that phase. A
+    // phase must cover the WHOLE frame before the next begins (spatial
+    // reads neighbors across rows), but each phase is row-sliceable —
+    // this restores the Session-G time budget for ReSTIR frames.
+    int restir_phase = 0;    // 0 g_primary, 1 build, 2 spatial, 3 indirect
+    int restir_cursor = 0;
     bool needs_clear = true;
     // Timing of the last completed accumulate batch (written from Metal's
     // completion handler thread, read by the main-thread tick).
@@ -190,6 +197,87 @@ struct GpuRenderer::Impl {
         needs_clear = false;
         passes = 0;
         cursor = 0;
+        restir_phase = 0;
+        restir_cursor = 0;
+    }
+
+    // Encode ONE ReSTIR phase dispatch over rows [pu.row_offset,
+    // pu.row_offset + rows). Shared by the full-frame and phase-sliced
+    // paths so the binding lists exist exactly once.
+    void encode_restir_phase(id<MTLCommandBuffer> cb, int phase,
+                             const PassUniforms& pu, int rows) {
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        const MTLSize grid = MTLSizeMake(w, rows, 1);
+        switch (phase) {
+        case 0:
+            [e setComputePipelineState:g_primary_pso];
+            [e setBuffer:gbuf offset:0 atIndex:0];
+            [e setBuffer:spheres offset:0 atIndex:1];
+            [e setBytes:&pu length:sizeof pu atIndex:2];
+            [e setBuffer:bvh_nodes offset:0 atIndex:3];
+            [e setBuffer:tris offset:0 atIndex:4];
+            [e setBuffer:mat_table offset:0 atIndex:5];
+            [e setBuffer:tri_mat offset:0 atIndex:6];
+            [e setBuffer:tri_light offset:0 atIndex:7];
+            [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
+            break;
+        case 1:
+            [e setComputePipelineState:direct_pso];
+            [e setBuffer:accum offset:0 atIndex:0];
+            [e setBuffer:spheres offset:0 atIndex:1];
+            [e setBytes:&pu length:sizeof pu atIndex:2];
+            [e setBuffer:bvh_nodes offset:0 atIndex:3];
+            [e setBuffer:tris offset:0 atIndex:4];
+            [e setBuffer:mat_table offset:0 atIndex:5];
+            [e setBuffer:gbuf offset:0 atIndex:6];
+            [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
+            [e setBuffer:env_texels offset:0 atIndex:10];
+            [e setBuffer:env_row_cdf offset:0 atIndex:11];
+            [e setBuffer:env_cond_cdf offset:0 atIndex:12];
+            [e setBuffer:lights offset:0 atIndex:13];
+            [e setBuffer:resv offset:0 atIndex:14];
+            [e setBuffer:resv_cur offset:0 atIndex:15];
+            break;
+        case 2:
+            [e setComputePipelineState:spatial_pso];
+            [e setBuffer:accum offset:0 atIndex:0];
+            [e setBuffer:spheres offset:0 atIndex:1];
+            [e setBytes:&pu length:sizeof pu atIndex:2];
+            [e setBuffer:bvh_nodes offset:0 atIndex:3];
+            [e setBuffer:tris offset:0 atIndex:4];
+            [e setBuffer:mat_table offset:0 atIndex:5];
+            [e setBuffer:gbuf offset:0 atIndex:6];
+            [e setBuffer:resv_cur offset:0 atIndex:7];
+            [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
+            [e setBuffer:resv offset:0 atIndex:9];
+            [e setBuffer:env_texels offset:0 atIndex:10];
+            [e setBuffer:env_row_cdf offset:0 atIndex:11];
+            [e setBuffer:env_cond_cdf offset:0 atIndex:12];
+            [e setBuffer:lights offset:0 atIndex:13];
+            break;
+        default:
+            [e setComputePipelineState:indirect_pso];
+            [e setBuffer:accum offset:0 atIndex:0];
+            [e setBuffer:spheres offset:0 atIndex:1];
+            [e setBytes:&pu length:sizeof pu atIndex:2];
+            [e setBuffer:bvh_nodes offset:0 atIndex:3];
+            [e setBuffer:tris offset:0 atIndex:4];
+            [e setBuffer:mat_table offset:0 atIndex:5];
+            [e setBuffer:gbuf offset:0 atIndex:6];
+            [e setBuffer:tri_mat offset:0 atIndex:7];
+            [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
+            [e setBuffer:tri_light offset:0 atIndex:9];
+            [e setBuffer:env_texels offset:0 atIndex:10];
+            [e setBuffer:env_row_cdf offset:0 atIndex:11];
+            [e setBuffer:env_cond_cdf offset:0 atIndex:12];
+            [e setBuffer:lights offset:0 atIndex:13];
+            break;
+        }
+        for (id<MTLBuffer> t : mat_textures) {
+            [e useResource:t usage:MTLResourceUsageRead];
+        }
+        [e dispatchThreads:grid threadsPerThreadgroup:tg_accum];
+        [e endEncoding];
     }
 
     // Full frame (row_count == h): K passes in-kernel — the headless
@@ -230,106 +318,47 @@ struct GpuRenderer::Impl {
             pt_uint(settings.restir_mcap > 1 ? settings.restir_mcap : 1);
 
         if (settings.restir != 0) {
-            // Partitioned pipeline: WHOLE FRAMES ONLY. Spatial reuse reads
-            // neighbor rows across the frame; honoring a row slice here
-            // would mix this frame's reservoirs with last frame's across
-            // the slice boundary. Slice requests are expanded (the viewer
-            // controller never sends them; this is defense in depth).
-            const int kcount = count > 0 ? count : 1;
-            for (int k = 0; k < kcount; ++k) {
+            // ReSTIR scheduling: a frame is FOUR whole-frame phases in
+            // strict order (spatial reads neighbor rows, so a phase must
+            // finish before the next starts) — but each phase is
+            // row-sliceable. Slice requests advance a (phase, cursor)
+            // machine so heavy frames spread across many short command
+            // buffers and the Session-G time budget holds; full-frame
+            // requests encode all four phases for K passes.
+            if (slice) {
+                PassUniforms pu = u;
+                pu.pass_base = pt_uint(passes);
+                pu.pass_count = 1;
+                pu.row_offset = pt_uint(restir_cursor);
+                const int rows =
+                    row_count < h - restir_cursor ? row_count
+                                                  : h - restir_cursor;
+                encode_restir_phase(cb, restir_phase, pu, rows);
+                restir_cursor += rows;
+                if (restir_cursor >= h) {
+                    restir_cursor = 0;
+                    ++restir_phase;
+                    if (restir_phase == 4) {
+                        restir_phase = 0;
+                        passes += 1;
+                    }
+                }
+                return;
+            }
+            for (int k = 0; k < count; ++k) {
                 PassUniforms pu = u;
                 pu.pass_base = pt_uint(passes + k);
                 pu.pass_count = 1;
                 pu.row_offset = 0;
-                const MTLSize grid = MTLSizeMake(w, h, 1);
-                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-                [e setComputePipelineState:g_primary_pso];
-                [e setBuffer:gbuf offset:0 atIndex:0];
-                [e setBuffer:spheres offset:0 atIndex:1];
-                [e setBytes:&pu length:sizeof pu atIndex:2];
-                [e setBuffer:bvh_nodes offset:0 atIndex:3];
-                [e setBuffer:tris offset:0 atIndex:4];
-                [e setBuffer:mat_table offset:0 atIndex:5];
-                [e setBuffer:tri_mat offset:0 atIndex:6];
-                [e setBuffer:tri_light offset:0 atIndex:7];
-                [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
-                for (id<MTLBuffer> t : mat_textures) {
-                    [e useResource:t usage:MTLResourceUsageRead];
+                for (int phase = 0; phase < 4; ++phase) {
+                    encode_restir_phase(cb, phase, pu, h);
                 }
-                [e dispatchThreads:grid threadsPerThreadgroup:tg_accum];
-                [e endEncoding];
-
-                e = [cb computeCommandEncoder];
-                [e setComputePipelineState:direct_pso];
-                [e setBuffer:accum offset:0 atIndex:0];
-                [e setBuffer:spheres offset:0 atIndex:1];
-                [e setBytes:&pu length:sizeof pu atIndex:2];
-                [e setBuffer:bvh_nodes offset:0 atIndex:3];
-                [e setBuffer:tris offset:0 atIndex:4];
-                [e setBuffer:mat_table offset:0 atIndex:5];
-                [e setBuffer:gbuf offset:0 atIndex:6];
-                [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
-                [e setBuffer:env_texels offset:0 atIndex:10];
-                [e setBuffer:env_row_cdf offset:0 atIndex:11];
-                [e setBuffer:env_cond_cdf offset:0 atIndex:12];
-                [e setBuffer:lights offset:0 atIndex:13];
-                [e setBuffer:resv offset:0 atIndex:14];
-                [e setBuffer:resv_cur offset:0 atIndex:15];
-                for (id<MTLBuffer> t : mat_textures) {
-                    [e useResource:t usage:MTLResourceUsageRead];
-                }
-                [e dispatchThreads:grid threadsPerThreadgroup:tg_accum];
-                [e endEncoding];
-
-                e = [cb computeCommandEncoder];
-                [e setComputePipelineState:spatial_pso];
-                [e setBuffer:accum offset:0 atIndex:0];
-                [e setBuffer:spheres offset:0 atIndex:1];
-                [e setBytes:&pu length:sizeof pu atIndex:2];
-                [e setBuffer:bvh_nodes offset:0 atIndex:3];
-                [e setBuffer:tris offset:0 atIndex:4];
-                [e setBuffer:mat_table offset:0 atIndex:5];
-                [e setBuffer:gbuf offset:0 atIndex:6];
-                [e setBuffer:resv_cur offset:0 atIndex:7];
-                [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
-                [e setBuffer:resv offset:0 atIndex:9];
-                [e setBuffer:env_texels offset:0 atIndex:10];
-                [e setBuffer:env_row_cdf offset:0 atIndex:11];
-                [e setBuffer:env_cond_cdf offset:0 atIndex:12];
-                [e setBuffer:lights offset:0 atIndex:13];
-                for (id<MTLBuffer> t : mat_textures) {
-                    [e useResource:t usage:MTLResourceUsageRead];
-                }
-                [e dispatchThreads:grid threadsPerThreadgroup:tg_accum];
-                [e endEncoding];
-
-                e = [cb computeCommandEncoder];
-                [e setComputePipelineState:indirect_pso];
-                [e setBuffer:accum offset:0 atIndex:0];
-                [e setBuffer:spheres offset:0 atIndex:1];
-                [e setBytes:&pu length:sizeof pu atIndex:2];
-                [e setBuffer:bvh_nodes offset:0 atIndex:3];
-                [e setBuffer:tris offset:0 atIndex:4];
-                [e setBuffer:mat_table offset:0 atIndex:5];
-                [e setBuffer:gbuf offset:0 atIndex:6];
-                [e setBuffer:tri_mat offset:0 atIndex:7];
-                [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
-                [e setBuffer:tri_light offset:0 atIndex:9];
-                [e setBuffer:env_texels offset:0 atIndex:10];
-                [e setBuffer:env_row_cdf offset:0 atIndex:11];
-                [e setBuffer:env_cond_cdf offset:0 atIndex:12];
-                [e setBuffer:lights offset:0 atIndex:13];
-                for (id<MTLBuffer> t : mat_textures) {
-                    [e useResource:t usage:MTLResourceUsageRead];
-                }
-                [e dispatchThreads:grid threadsPerThreadgroup:tg_accum];
-                [e endEncoding];
             }
-            passes += kcount;
-            cursor = 0;
+            passes += count;
+            restir_phase = 0;
+            restir_cursor = 0;
             return;
         }
-
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:accumulate_pso];
         [enc setBuffer:accum offset:0 atIndex:0];
@@ -488,7 +517,9 @@ struct GpuRenderer::Impl {
         u.out_w = pt_uint(target.width);
         u.out_h = pt_uint(target.height);
         u.pass_total = pt_uint(passes);
-        u.rows_plus1 = pt_uint(cursor);
+        u.rows_plus1 = pt_uint(settings.restir != 0
+                                   ? (restir_phase == 3 ? restir_cursor : 0)
+                                   : cursor);
 
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:resolve_pso];
@@ -850,7 +881,17 @@ void GpuRenderer::encode_frame(const GPUCamera& cam, const TraceWork& work,
     impl_->last_cb = cb;
 }
 
-int GpuRenderer::partial_row() const { return impl_->cursor; }
+int GpuRenderer::partial_row() const {
+    if (impl_->settings.restir != 0) {
+        // Mid-frame marker for the budget controller: nonzero while any
+        // phase of the frame is incomplete; magnitude = rows left in the
+        // current phase's terms (bounded by h, which is all the
+        // controller needs for sizing the next slice).
+        if (impl_->restir_phase == 0) return impl_->restir_cursor;
+        return impl_->restir_cursor > 0 ? impl_->restir_cursor : 1;
+    }
+    return impl_->cursor;
+}
 float GpuRenderer::last_batch_gpu_ms() const {
     return impl_->last_gpu_ms.load(std::memory_order_relaxed);
 }
