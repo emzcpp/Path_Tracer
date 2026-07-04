@@ -97,6 +97,7 @@ int run_parity(const RenderSettings& settings, int spp,
     }
     gpu->set_env(desc.env.get());
     gpu->set_env_params(desc.env_intensity, desc.env_yaw_deg / 360.0f);
+    if (settings.env_nee != 0) gpu->set_lights(build_light_list(desc));
     auto t0 = Clock::now();
     gpu->render_passes_blocking(to_gpu_camera(camera), spp);
     const double gpu_s = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -108,9 +109,12 @@ int run_parity(const RenderSettings& settings, int spp,
 
     // --- CPU: passes 0..spp-1, then spp..2spp-1 for the noise floor ---
     const Scene scene = make_scene(desc);
+    const std::vector<GPULight> lights = build_light_list(desc);
+    const LightsLookup ll{lights.empty() ? nullptr : lights.data(),
+                          settings.env_nee != 0 ? int(lights.size()) : 0};
     ProgressiveRenderer cpu(scene, settings,
                             std::max(1u, std::thread::hardware_concurrency()),
-                            env_lookup(desc, settings.env_nee != 0));
+                            env_lookup(desc, settings.env_nee != 0), ll);
     t0 = Clock::now();
     for (int s = 0; s < spp; ++s) cpu.render_pass(camera);
     const double cpu_s = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -393,9 +397,13 @@ int main(int argc, char** argv) {
                     desc.env ? ", HDRI env" : ", gradient env");
 
         const Scene scene = make_scene(desc);
+        const std::vector<GPULight> nlights = build_light_list(desc);
+        const LightsLookup nll{nlights.empty() ? nullptr : nlights.data(),
+                               settings.env_nee != 0 ? int(nlights.size())
+                                                     : 0};
         ProgressiveRenderer cpu(scene, settings,
                                 std::max(1u, std::thread::hardware_concurrency()),
-                                env_lookup(desc, settings.env_nee != 0));
+                                env_lookup(desc, settings.env_nee != 0), nll);
         const Camera camera(settings.cam_pos, settings.cam_look_at,
                             settings.cam_up, settings.vfov_deg,
                             settings.aspect());
@@ -413,6 +421,7 @@ int main(int argc, char** argv) {
                                            desc.mesh.get(), err)) {
             gpu->set_env(desc.env.get());
             gpu->set_env_params(desc.env_intensity, desc.env_yaw_deg / 360.0f);
+            if (settings.env_nee != 0) gpu->set_lights(build_light_list(desc));
             gpu->render_passes_blocking(to_gpu_camera(camera), spp);
             gpu_bad = scan(gpu->accum_data(), n * 4);
             gpu_ran = true;
@@ -448,9 +457,13 @@ int main(int argc, char** argv) {
 #endif
 
     const Scene scene = make_scene(desc);
+    const std::vector<GPULight> olights = build_light_list(desc);
+    const LightsLookup oll{olights.empty() ? nullptr : olights.data(),
+                           settings.env_nee != 0 ? int(olights.size()) : 0};
     ProgressiveRenderer renderer(scene, settings,
                                  std::max(1u, std::thread::hardware_concurrency()),
-                                 env_lookup(desc, settings.env_nee != 0));
+                                 env_lookup(desc, settings.env_nee != 0),
+                                 oll);
 
     std::printf("rendering %dx%d @ %d spp, max depth %d\n", settings.width,
                 settings.height, settings.samples_per_pixel, settings.max_depth);

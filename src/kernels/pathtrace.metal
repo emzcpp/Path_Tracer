@@ -575,18 +575,59 @@ inline bool bvh_occluded(device const BVHNode* nodes,
     return false;
 }
 
-inline bool occluded_scene(float3 ro, float3 rd, constant GPUSphere* spheres,
-                           uint n, device const BVHNode* nodes,
+inline bool occluded_scene(float3 ro, float3 rd, float t_max,
+                           constant GPUSphere* spheres, uint n,
+                           device const BVHNode* nodes,
                            device const GPUTriangle* tris,
                            constant MeshUniforms& MU) {
     for (uint i = 0; i < n; ++i) {
         HitRec tmp;
-        if (hit_sphere(spheres[i], ro, rd, 1e-3f, INFINITY, tmp)) return true;
+        if (hit_sphere(spheres[i], ro, rd, 1e-3f, t_max, tmp)) return true;
     }
     if (MU.has_mesh != 0u) {
-        return bvh_occluded(nodes, tris, ro, rd, 1e-3f, INFINITY);
+        return bvh_occluded(nodes, tris, ro, rd, 1e-3f, t_max);
     }
     return false;
+}
+
+// ---- Session J: area-light NEE (mirror of integrator.h) ---------------
+
+inline int light_pick(device const GPULight* lights, int n, float u) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (lights[mid].sel_cdf > u) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+
+inline float3 sample_sphere_light(device const GPULight& L, float3 x,
+                                  float u1, float u2, thread float& pdf_sa,
+                                  thread float& t_light) {
+    pdf_sa = 0.0f;
+    t_light = 0.0f;
+    const float3 cx = c3(L.p0) - x;
+    const float d2 = dot(cx, cx);
+    const float d = sqrt(d2);
+    if (d <= L.radius * 1.0001f) return float3(0.0f, 0.0f, 1.0f);
+    const float sin2max = (L.radius * L.radius) / d2;
+    const float cosmax = sqrt(fmax(0.0f, 1.0f - sin2max));
+    const float one_minus = 1.0f - cosmax;
+    if (one_minus < 1e-8f) return float3(0.0f, 0.0f, 1.0f);
+    const float cost = 1.0f - u1 * one_minus;
+    const float sint = sqrt(fmax(0.0f, 1.0f - cost * cost));
+    const float phi = 6.28318530717958648f * u2;
+    const float3 w = cx / d;
+    float3 t, b;
+    build_onb(w, t, b);
+    const float3 dir = normalize(t * (cos(phi) * sint) +
+                                 b * (sin(phi) * sint) + w * cost);
+    pdf_sa = 1.0f / (6.28318530717958648f * one_minus);
+    const float dc = dot(cx, dir);
+    const float disc = L.radius * L.radius - (d2 - dc * dc);
+    t_light = dc - sqrt(fmax(0.0f, disc));
+    return dir;
 }
 
 // ----------------------------------------------------------- integrator
@@ -722,11 +763,13 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     device const float* env_texels,
                     device const float* env_row_cdf,
                     device const float* env_cond_cdf,
+                    device const GPULight* lights,
                     constant MeshUniforms& MU, constant PassUniforms& U,
                     thread PRNG& rng, uint max_depth) {
     float3 radiance = float3(0.0f);
     float3 throughput = float3(1.0f);
     bool prev_nee = false;   // env NEE ran at the previous path vertex
+    bool prev_nee_light = false;   // area-light NEE ran there too
     float prev_pdf = 0.0f;   // BSDF pdf of the ray we're now following
 
     for (uint depth = 0; depth < max_depth; ++depth) {
@@ -810,10 +853,19 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
         }
 
         {
-            const float3 c = throughput * mat.emission;
-            radiance += depth == 0u
-                            ? c
-                            : clamp_contribution(c, U.clamp_indirect);
+            // Session J interim rule (until Stage-3 MIS) — mirror of
+            // integrator.h: suppress listed-emitter emission when the
+            // previous vertex ran area-light NEE.
+            int light_id = -1;
+            if (!hit_m) light_id = int(spheres[rec.sphere_idx].pad[0]) - 1;
+            const bool suppress =
+                prev_nee_light && depth > 0u && light_id >= 0;
+            if (!suppress) {
+                const float3 c = throughput * mat.emission;
+                radiance += depth == 0u
+                                ? c
+                                : clamp_contribution(c, U.clamp_indirect);
+            }
         }
 
         // ---- Session H: next-event estimation toward the environment.
@@ -837,8 +889,8 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                 const float3 f = eval_bsdf(mat, hn, vdir, ldir, pdf_b);
                 const float nl = dot(hn, ldir);
                 if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
-                    if (!occluded_scene(hp, ldir, spheres, n, nodes, tris,
-                                        MU)) {
+                    if (!occluded_scene(hp, ldir, INFINITY, spheres, n,
+                                        nodes, tris, MU)) {
                         // MIS weight vs the BSDF sampler (power heuristic).
                         const float w =
                             (pdf_env * pdf_env) /
@@ -855,6 +907,39 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             }
         }
         prev_nee = can_nee;
+
+        // ---- Session J: one area-light sample per vertex — mirror of
+        // integrator.h. Same gating as env NEE; power-proportional pick.
+        // Near-specular skip (interim) — mirror of integrator.h.
+        const bool can_nee_light = U.env_nee != 0u && U.light_count > 0u &&
+                                   mat.transmission <= 0.5f &&
+                                   mat.roughness >= 0.1f;
+        if (can_nee_light) {
+            const float us = pcg_next_float(rng);
+            const float u1 = pcg_next_float(rng);
+            const float u2 = pcg_next_float(rng);
+            const int li = light_pick(lights, int(U.light_count), us);
+            device const GPULight& L = lights[li];
+            float pdf_sa = 0.0f, t_light = 0.0f;
+            const float3 ldir =
+                sample_sphere_light(L, hp, u1, u2, pdf_sa, t_light);
+            if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
+                float pdf_b = 0.0f;
+                const float3 vdir = -normalize(rd);
+                const float3 f = eval_bsdf(mat, hn, vdir, ldir, pdf_b);
+                const float nl = dot(hn, ldir);
+                if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
+                    if (!occluded_scene(hp, ldir, t_light * (1.0f - 1e-3f),
+                                        spheres, n, nodes, tris, MU)) {
+                        const float3 Le = c3(L.emission);
+                        const float3 c = throughput * f * nl * Le /
+                                         (pdf_sa * L.sel_pdf);
+                        radiance += clamp_contribution(c, U.clamp_indirect);
+                    }
+                }
+            }
+        }
+        prev_nee_light = can_nee_light;
 
         float3 attenuation, new_dir;
         float scatter_pdf = 0.0f;
@@ -900,6 +985,7 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                        device const float* env_texels  [[buffer(10)]],
                        device const float* env_row_cdf [[buffer(11)]],
                        device const float* env_cond_cdf [[buffer(12)]],
+                       device const GPULight* lights   [[buffer(13)]],
                        uint2 gid [[thread_position_in_grid]]) {
     // The dispatch may cover a row slice [row_offset, row_offset+rows);
     // everything below keys off the FRAME pixel, so slicing is invisible
@@ -923,7 +1009,7 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
 
         total += trace(ro, rd, spheres, U.sphere_count, nodes, tris,
                        materials, tri_mat, env_texels, env_row_cdf,
-                       env_cond_cdf, MU, U, rng, U.max_depth);
+                       env_cond_cdf, lights, MU, U, rng, U.max_depth);
     }
     accum[px] += float4(total, 0.0f);
 }

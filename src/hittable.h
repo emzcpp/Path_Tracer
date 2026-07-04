@@ -34,6 +34,10 @@ struct Material {
 };
 
 struct HitRecord {
+    // Session J: index into the area-light list when the hit surface IS a
+    // listed emitter (-1 otherwise). Drives NEE double-count suppression
+    // and the Stage-3 MIS weight.
+    int light_id = -1;
     point3   p;            // hit point in world space
     vec3     normal;       // always opposes the incoming ray (see below)
     float    t = 0.0f;     // ray parameter at the hit

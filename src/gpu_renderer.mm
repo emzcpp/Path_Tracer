@@ -131,6 +131,9 @@ struct GpuRenderer::Impl {
     std::vector<id<MTLBuffer>> mat_textures;
     id<MTLBuffer> mat_table;
     MeshUniforms mesh_u{};   // has_mesh = 0 by default
+    // Session J: area-light list.
+    id<MTLBuffer> lights;
+    pt_uint light_count = 0;
     // Session F: HDRI environment (env_w == 0 -> gradient fallback).
     id<MTLBuffer> env_texels;
     id<MTLBuffer> env_row_cdf;
@@ -197,6 +200,7 @@ struct GpuRenderer::Impl {
         u.env_yaw_norm = env_yaw_norm;
         u.clamp_indirect = settings.clamp_indirect;
         u.env_nee = pt_uint(settings.env_nee != 0 ? 1 : 0);
+        u.light_count = light_count;
 
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:accumulate_pso];
@@ -216,6 +220,7 @@ struct GpuRenderer::Impl {
         [enc setBuffer:env_texels offset:0 atIndex:10];
         [enc setBuffer:env_row_cdf offset:0 atIndex:11];
         [enc setBuffer:env_cond_cdf offset:0 atIndex:12];
+        [enc setBuffer:lights offset:0 atIndex:13];
         [enc dispatchThreads:MTLSizeMake(w, slice ? row_count : h, 1)
             threadsPerThreadgroup:tg_accum];
         [enc endEncoding];
@@ -450,12 +455,20 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
     im.sphere_count = pt_uint(spheres.size());
 
     im.upload_mesh(mesh);
+    im.lights = im.upload(nullptr, 0);       // none until set_lights
     im.env_texels = im.upload(nullptr, 0);   // gradient until set_env
     im.env_row_cdf = im.upload(nullptr, 0);
     im.env_cond_cdf = im.upload(nullptr, 0);
     im.w = settings.width;
     im.h = settings.height;
     return r;
+}
+
+void GpuRenderer::set_lights(const std::vector<GPULight>& lights) {
+    impl_->lights = impl_->upload(
+        lights.empty() ? nullptr : lights.data(),
+        lights.size() * sizeof(GPULight));
+    impl_->light_count = pt_uint(lights.size());
 }
 
 void GpuRenderer::set_env(const EnvMap* env) {

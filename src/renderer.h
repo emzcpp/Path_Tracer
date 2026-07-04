@@ -30,7 +30,8 @@ public:
     // total_threads includes the calling thread: render_pass() works rows
     // itself, so the pool holds total_threads - 1 workers.
     ProgressiveRenderer(const Scene& scene, const RenderSettings& settings,
-                        unsigned total_threads, const EnvLookup& env = {});
+                        unsigned total_threads, const EnvLookup& env = {},
+                        const LightsLookup& lights = {});
     ~ProgressiveRenderer();
 
     ProgressiveRenderer(const ProgressiveRenderer&) = delete;
@@ -68,6 +69,7 @@ private:
     const Scene& scene_;
     RenderSettings settings_;
     EnvLookup env_;
+    LightsLookup lights_;
 
     int w_ = 0, h_ = 0;
     int pass_count_ = 0;      // completed passes

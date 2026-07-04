@@ -58,6 +58,42 @@ inline EnvLookup env_lookup(const SceneDesc& desc, bool nee = true) {
     return e;
 }
 
+// Session J: enumerate scene emitters for area-light NEE. Emissive
+// spheres now; emissive mesh triangles join in Stage 2. Selection is
+// power-proportional (luminance x surface area), normalized into a CDF
+// carried inside the entries. Rebuilt (cheap, derived data) whenever the
+// spheres or the mesh change — the same discipline as tri_mat.
+inline std::vector<GPULight> build_light_list(const SceneDesc& desc) {
+    std::vector<GPULight> out;
+    std::vector<double> power;
+    for (const SphereData& s : desc.spheres) {
+        const color& e = s.mat.emission;
+        if (e.x <= 0.0f && e.y <= 0.0f && e.z <= 0.0f) continue;
+        GPULight L{};
+        L.kind = 0;
+        L.p0 = {s.center.x, s.center.y, s.center.z};
+        L.radius = s.radius;
+        L.emission = {e.x, e.y, e.z};
+        out.push_back(L);
+        const double lum = 0.2126 * e.x + 0.7152 * e.y + 0.0722 * e.z;
+        power.push_back(lum * double(s.radius) * double(s.radius));
+    }
+    double total = 0.0;
+    for (double p : power) total += p;
+    if (total <= 0.0) {
+        out.clear();
+        return out;
+    }
+    double run = 0.0;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        run += power[i];
+        out[i].sel_cdf = float(run / total);
+        out[i].sel_pdf = float(power[i] / total);
+    }
+    out.back().sel_cdf = 1.0f;
+    return out;
+}
+
 inline SceneDesc build_scene_desc(
     std::shared_ptr<const MeshData> mesh = nullptr) {
     SceneDesc desc;
@@ -140,8 +176,14 @@ inline SceneDesc build_scene_desc(
 
 inline Scene make_scene(const SceneDesc& desc) {
     Scene scene;
+    int next_light = 0;
     for (const SphereData& s : desc.spheres) {
-        scene.add(std::make_unique<Sphere>(s.center, s.radius, s.mat));
+        const color& e = s.mat.emission;
+        const bool lit = e.x > 0.0f || e.y > 0.0f || e.z > 0.0f;
+        // Ids follow build_light_list's enumeration order exactly.
+        scene.add(std::make_unique<Sphere>(s.center, s.radius, s.mat,
+                                           lit ? next_light : -1));
+        if (lit) ++next_light;
     }
     // Mesh LAST: the sphere loop's running-closest then prunes the BVH.
     // The GPU kernel mirrors this order (spheres, then bvh_hit seeded with
@@ -153,6 +195,7 @@ inline Scene make_scene(const SceneDesc& desc) {
 inline std::vector<GPUSphere> flatten_scene(const SceneDesc& desc) {
     std::vector<GPUSphere> out;
     out.reserve(desc.spheres.size());
+    int next_light = 0;
     for (const SphereData& s : desc.spheres) {
         GPUSphere g{};
         g.center = {s.center.x, s.center.y, s.center.z};
@@ -164,6 +207,13 @@ inline std::vector<GPUSphere> flatten_scene(const SceneDesc& desc) {
         g.ior = s.mat.ior;
         g.roughness = s.mat.roughness;
         g.transmission = s.mat.transmission;
+        // Session J: pad[0] = light-list index + 1 (0 = not an emitter);
+        // same enumeration order as build_light_list / make_scene.
+        const color& e = s.mat.emission;
+        if (e.x > 0.0f || e.y > 0.0f || e.z > 0.0f) {
+            g.pad[0] = pt_uint(next_light + 1);
+            ++next_light;
+        }
         out.push_back(g);
     }
     return out;

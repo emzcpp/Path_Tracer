@@ -6,8 +6,9 @@
 
 class Sphere : public Hittable {
 public:
-    Sphere(const point3& center, float radius, const Material& mat)
-        : center_(center), radius_(radius), mat_(mat) {}
+    Sphere(const point3& center, float radius, const Material& mat,
+           int light_id = -1)
+        : center_(center), radius_(radius), mat_(mat), light_id_(light_id) {}
 
     // Ray–sphere: solve |o + t*d - c|^2 = r^2, a quadratic in t.
     // With oc = o - c and half_b = oc·d, the discriminant simplifies to
@@ -34,6 +35,7 @@ public:
         rec.p = r.at(root);
         rec.set_face_normal(r, (rec.p - center_) / radius_);
         rec.mat = mat_;
+        rec.light_id = light_id_;
         return true;
     }
 
@@ -41,4 +43,5 @@ private:
     point3   center_;
     float    radius_;
     Material mat_;
+    int      light_id_ = -1;   // Session J: index into the area-light list
 };

@@ -9,6 +9,7 @@
 #include <limits>
 
 #include "hittable.h"
+#include "kernel_types.h"
 #include "material.h"
 #include "ray.h"
 #include "rng.h"
@@ -138,6 +139,62 @@ inline float env_pdf(const EnvLookup& env, const vec3& dir) {
            (2.0f * 3.14159265358979f * 3.14159265358979f * st);
 }
 
+// ---- Session J: area-light NEE (mirrored in pathtrace.metal) -----------
+// Scene emitters (emissive spheres now, mesh triangles in Stage 2) get the
+// same treatment the env got in Session H: a deliberate shadow-rayed
+// sample per vertex instead of waiting for a BSDF ray to stumble onto
+// them. ONE light is picked per vertex, power-proportionally (1/sel_pdf
+// in the estimator).
+
+struct LightsLookup {
+    const GPULight* lights = nullptr;
+    int count = 0;
+};
+
+// Binary search of the strided per-entry selection CDF: first light whose
+// sel_cdf exceeds u. Identical loop on both backends.
+inline int light_pick(const GPULight* lights, int n, float u) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (lights[mid].sel_cdf > u) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+
+// Uniform solid-angle sampling of the cone a sphere light subtends from x
+// (better behaved than area sampling: every sampled direction hits the
+// light). Returns the direction; pdf_sa and the analytic distance to the
+// sphere along it. pdf_sa = 0 flags degenerate cases (x inside/on the
+// sphere, or a cone too small for float) — caller skips.
+inline vec3 sample_sphere_light(const GPULight& L, const vec3& x, float u1,
+                                float u2, float& pdf_sa, float& t_light) {
+    pdf_sa = 0.0f;
+    t_light = 0.0f;
+    const vec3 cx = vec3(L.p0.x, L.p0.y, L.p0.z) - x;
+    const float d2 = dot(cx, cx);
+    const float d = std::sqrt(d2);
+    if (d <= L.radius * 1.0001f) return vec3(0.0f, 0.0f, 1.0f);
+    const float sin2max = (L.radius * L.radius) / d2;
+    const float cosmax = std::sqrt(std::fmax(0.0f, 1.0f - sin2max));
+    const float one_minus = 1.0f - cosmax;
+    if (one_minus < 1e-8f) return vec3(0.0f, 0.0f, 1.0f);
+    const float cost = 1.0f - u1 * one_minus;
+    const float sint = std::sqrt(std::fmax(0.0f, 1.0f - cost * cost));
+    const float phi = 6.28318530717958648f * u2;
+    const vec3 w = cx / d;
+    vec3 t, b;
+    build_onb(w, t, b);
+    const vec3 dir = normalize(t * (std::cos(phi) * sint) +
+                               b * (std::sin(phi) * sint) + w * cost);
+    pdf_sa = 1.0f / (6.28318530717958648f * one_minus);
+    const float dc = dot(cx, dir);
+    const float disc = L.radius * L.radius - (d2 - dc * dc);
+    t_light = dc - std::sqrt(std::fmax(0.0f, disc));
+    return dir;
+}
+
 // Direction -> lat-long UV -> radiance. Falls back to the gradient when no
 // map is loaded (--no HDRI, legacy scenes, CPU-viewer default).
 inline color miss_radiance(const EnvLookup& env, const Ray& r) {
@@ -160,10 +217,12 @@ inline color clamp_contribution(const color& c, float m) {
 }
 
 inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
-                   const EnvLookup& env, float clamp_indirect) {
+                   const EnvLookup& env, const LightsLookup& lights,
+                   float clamp_indirect) {
     color radiance(0.0f);      // light collected so far
     color throughput(1.0f);    // fraction of it that survives back to the eye
     bool prev_nee = false;     // env NEE ran at the previous path vertex
+    bool prev_nee_light = false;   // area-light NEE ran there too
     float prev_pdf = 0.0f;     // BSDF pdf of the ray we're now following
 
     for (int depth = 0; depth < max_depth; ++depth) {
@@ -192,9 +251,18 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
         // try to continue the path. Indirect pickups are firefly-clamped;
         // depth 0 (directly visible lights/background) never is.
         {
-            const color c = throughput * rec.mat.emission;
-            radiance +=
-                depth == 0 ? c : clamp_contribution(c, clamp_indirect);
+            // Session J interim rule (until Stage-3 MIS): a vertex that ran
+            // area-light NEE already collected direct emission from every
+            // LISTED emitter, so its continuation's hit on one must not add
+            // that emission again. Camera rays, delta chains, and emitters
+            // NOT in the list (none once Stage 2 lands) stay untouched.
+            const bool suppress =
+                prev_nee_light && depth > 0 && rec.light_id >= 0;
+            if (!suppress) {
+                const color c = throughput * rec.mat.emission;
+                radiance +=
+                    depth == 0 ? c : clamp_contribution(c, clamp_indirect);
+            }
         }
 
         // ---- Session H: next-event estimation toward the environment.
@@ -235,6 +303,44 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
             }
         }
         prev_nee = can_nee;
+
+        // ---- Session J: one area-light sample per vertex. Same gating as
+        // env NEE (delta glass excluded); selection is power-proportional.
+        // Near-specular skip (interim, as in env Stage 2): sampling a
+        // lamp through a spiked GGX lobe produces jackpot noise; BSDF
+        // sampling owns those vertices until Stage-3 MIS weights the
+        // trade smoothly.
+        const bool can_nee_light = env.nee && lights.count > 0 &&
+                                   rec.mat.transmission <= 0.5f &&
+                                   rec.mat.roughness >= 0.1f;
+        if (can_nee_light) {
+            const float us = rng.next_float();
+            const float u1 = rng.next_float();
+            const float u2 = rng.next_float();
+            const int li = light_pick(lights.lights, lights.count, us);
+            const GPULight& L = lights.lights[li];
+            float pdf_sa = 0.0f, t_light = 0.0f;
+            const vec3 ldir =
+                sample_sphere_light(L, rec.p, u1, u2, pdf_sa, t_light);
+            if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
+                float pdf_b = 0.0f;
+                const vec3 vdir = -normalize(ray.dir);
+                const color f = eval_bsdf(rec.mat, rec, vdir, ldir, pdf_b);
+                const float nl = dot(rec.normal, ldir);
+                if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
+                    const Ray shadow(rec.p, ldir);
+                    if (!world.occluded(shadow, 1e-3f,
+                                        t_light * (1.0f - 1e-3f))) {
+                        const color Le(L.emission.x, L.emission.y,
+                                       L.emission.z);
+                        const color c = throughput * f * nl * Le /
+                                        (pdf_sa * L.sel_pdf);
+                        radiance += clamp_contribution(c, clamp_indirect);
+                    }
+                }
+            }
+        }
+        prev_nee_light = can_nee_light;
 
         color attenuation;
         Ray scattered;

@@ -140,6 +140,10 @@ public:
     // Session F: HDRI environment. set_env swaps the texel buffer (nullptr
     // reverts to the gradient dome); set_env_params updates intensity/yaw
     // only (cheap, per-edit).
+    // Session J: swap the area-light list (emissive spheres/triangles).
+    // Same buffer-swap discipline; count rides in PassUniforms.
+    void set_lights(const std::vector<GPULight>& lights);
+
     void set_env(const EnvMap* env);
     void set_env_params(float intensity, float yaw_norm);
     void set_env_nee(bool on);   // Session H: NEE+MIS vs brute force

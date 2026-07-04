@@ -57,7 +57,10 @@ struct PassUniforms {
     pt_uint row_offset;
     // Session H: 1 = env NEE+MIS, 0 = brute-force ground truth.
     pt_uint env_nee;
-    pt_uint pad_h0, pad_h1, pad_h2;
+    // Session J: number of area lights (emissive spheres/triangles) in the
+    // light list; 0 = none (area NEE off).
+    pt_uint light_count;
+    pt_uint pad_h1, pad_h2;
 };
 
 struct ResolveUniforms {
@@ -118,6 +121,24 @@ struct GPUMaterialArgs {
     pt_uint emis_w, emis_h, norm_w, norm_h;
 };
 
+// Session J: one scene emitter for area-light NEE. Shared POD, built on
+// host, bit-identical arrays on both backends (the BVH discipline).
+// kind 0 = sphere (p0 = center, radius; e1/e2/uv unused).
+// kind 1 = triangle (p0/e1/e2 copied from the LEAF-ORDER GPUTriangle at
+// list-build time — rebuilt on every BVH re-bake; uv lanes + mat_id let
+// the estimator evaluate the actual textured Le at the sampled point).
+// sel_cdf is the cumulative power-proportional selection distribution
+// (binary-searched); sel_pdf this light's own selection probability.
+struct GPULight {
+    pt_float3 p0;       float radius;
+    pt_float3 e1;       float u0;
+    pt_float3 e2;       float v0;
+    pt_float3 emission; float sel_cdf;   // sphere Le / tri MEAN Le (selection)
+    float u1, v1, u2, v2;
+    pt_uint kind;       pt_uint mat_id;
+    float sel_pdf;      pt_uint pad0;
+};
+
 #ifndef __METAL_VERSION__
 static_assert(sizeof(pt_float3) == 12, "pt_float3 must be 12 bytes");
 static_assert(sizeof(GPUSphere) == 64, "GPUSphere must be one cacheline");
@@ -127,6 +148,7 @@ static_assert(sizeof(ResolveUniforms) == 24, "ResolveUniforms layout drifted");
 static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");
 static_assert(sizeof(GPUTriangle) == 144, "GPUTriangle must be nine 16B rows");
 static_assert(sizeof(MeshUniforms) == 32, "MeshUniforms layout drifted");
+static_assert(sizeof(GPULight) == 96, "GPULight must be six 16B rows");
 static_assert(sizeof(GPUMaterialArgs) == 64,
               "GPUMaterialArgs must be four 8B pointers + eight uints");
 #endif

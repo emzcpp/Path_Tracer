@@ -372,7 +372,12 @@ void apply_mesh_transform(ViewerCore& core) {
 // Sphere edits are trivial: the tracer intersects the analytic sphere list
 // directly (no BVH involved), so an edit is a 4.6KB buffer swap.
 void apply_sphere_edit(ViewerCore& core) {
-    if (core.gpu) core.gpu->update_spheres(flatten_scene(core.desc));
+    if (core.gpu) {
+        core.gpu->update_spheres(flatten_scene(core.desc));
+        // Session J: emitters may have changed (moved / re-colored /
+        // added / deleted) — the light list is derived data.
+        core.gpu->set_lights(build_light_list(core.desc));
+    }
     core.mark_scene_dirty();
 }
 
@@ -783,12 +788,18 @@ void print_selection(const ViewerCore& core) {
 void render_thread_main(ViewerCore& core) {
     // Leave one core for the UI thread so event handling stays snappy.
     const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
+    const std::vector<GPULight> lights = build_light_list(core.desc);
+    const LightsLookup ll{lights.empty() ? nullptr : lights.data(),
+                          core.settings.env_nee != 0 ? int(lights.size())
+                                                     : 0};
     RenderSettings cpu_settings = core.settings;
     // The CPU viewer is a preview context: same preview-only clamp policy.
     cpu_settings.clamp_indirect =
         core.preview_clamp_on ? core.preview_clamp_value : 0.0f;
     ProgressiveRenderer renderer(core.scene, cpu_settings, hw - 1,
-                                 env_lookup(core.desc, core.settings.env_nee != 0));
+                                 env_lookup(core.desc,
+                                            core.settings.env_nee != 0),
+                                 ll);
 
     const auto settle =
         std::chrono::duration<float, std::milli>(core.settings.settle_ms);
@@ -2256,6 +2267,7 @@ int run_viewer(const RenderSettings& settings, bool use_gpu,
                 core->gpu->set_env_params(desc.env_intensity,
                                           desc.env_yaw_deg / 360.0f);
             }
+            if (core->gpu) core->gpu->set_lights(build_light_list(desc));
             if (!core->gpu) {
                 std::fprintf(stderr,
                              "GPU init failed (%s) — using CPU backend\n",
