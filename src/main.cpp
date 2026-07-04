@@ -111,7 +111,8 @@ int run_parity(const RenderSettings& settings, int spp,
     const Scene scene = make_scene(desc);
     const std::vector<GPULight> lights = build_light_list(desc);
     const LightsLookup ll{lights.empty() ? nullptr : lights.data(),
-                          settings.env_nee != 0 ? int(lights.size()) : 0};
+                          settings.env_nee != 0 ? int(lights.size()) : 0,
+                          desc.mesh.get()};
     ProgressiveRenderer cpu(scene, settings,
                             std::max(1u, std::thread::hardware_concurrency()),
                             env_lookup(desc, settings.env_nee != 0), ll);
@@ -400,7 +401,8 @@ int main(int argc, char** argv) {
         const std::vector<GPULight> nlights = build_light_list(desc);
         const LightsLookup nll{nlights.empty() ? nullptr : nlights.data(),
                                settings.env_nee != 0 ? int(nlights.size())
-                                                     : 0};
+                                                     : 0,
+                               desc.mesh.get()};
         ProgressiveRenderer cpu(scene, settings,
                                 std::max(1u, std::thread::hardware_concurrency()),
                                 env_lookup(desc, settings.env_nee != 0), nll);
@@ -459,7 +461,8 @@ int main(int argc, char** argv) {
     const Scene scene = make_scene(desc);
     const std::vector<GPULight> olights = build_light_list(desc);
     const LightsLookup oll{olights.empty() ? nullptr : olights.data(),
-                           settings.env_nee != 0 ? int(olights.size()) : 0};
+                           settings.env_nee != 0 ? int(olights.size()) : 0,
+                           desc.mesh.get()};
     ProgressiveRenderer renderer(scene, settings,
                                  std::max(1u, std::thread::hardware_concurrency()),
                                  env_lookup(desc, settings.env_nee != 0),

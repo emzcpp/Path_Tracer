@@ -63,9 +63,45 @@ inline EnvLookup env_lookup(const SceneDesc& desc, bool nee = true) {
 // power-proportional (luminance x surface area), normalized into a CDF
 // carried inside the entries. Rebuilt (cheap, derived data) whenever the
 // spheres or the mesh change — the same discipline as tri_mat.
-inline std::vector<GPULight> build_light_list(const SceneDesc& desc) {
+// `live_*` (viewer): the re-baked leaf-order arrays after a gizmo edit;
+// defaults use the MeshData's own (load-time) arrays. Triangle entries
+// ALWAYS precede sphere entries and follow tri_light's ordinal order.
+inline std::vector<GPULight> build_light_list(
+    const SceneDesc& desc, const std::vector<GPUTriangle>* live_tris = nullptr,
+    const std::vector<std::uint32_t>* live_tri_mat = nullptr,
+    const std::vector<std::uint32_t>* live_tri_light = nullptr) {
     std::vector<GPULight> out;
     std::vector<double> power;
+    if (desc.mesh && desc.mesh->light_tri_count > 0) {
+        const std::vector<GPUTriangle>& tris =
+            live_tris ? *live_tris : desc.mesh->tris;
+        const std::vector<std::uint32_t>& tri_mat =
+            live_tri_mat ? *live_tri_mat : desc.mesh->tri_mat;
+        const std::vector<std::uint32_t>& tri_light =
+            live_tri_light ? *live_tri_light : desc.mesh->tri_light;
+        for (std::size_t i = 0; i < tris.size(); ++i) {
+            if (tri_light[i] == 0u) continue;
+            const GPUTriangle& T = tris[i];
+            GPULight L{};
+            L.kind = 1;
+            L.p0 = T.p0;
+            L.e1 = T.e1;
+            L.e2 = T.e2;
+            L.u0 = T.u0; L.v0 = T.v0;
+            L.u1 = T.u1; L.v1 = T.v1;
+            L.u2 = T.u2; L.v2 = T.v2;
+            L.mat_id = tri_mat[i];
+            const float probe =
+                tri_emissive_probe(desc.mesh->materials[tri_mat[i]], T) *
+                desc.mesh->emissive_scale;
+            L.emission = {probe, probe, probe};   // selection only; Le textured
+            out.push_back(L);
+            const vec3 cr = cross(vec3(T.e1.x, T.e1.y, T.e1.z),
+                                  vec3(T.e2.x, T.e2.y, T.e2.z));
+            power.push_back(double(probe) * 0.5 * double(cr.length()) +
+                            1e-12);
+        }
+    }
     for (const SphereData& s : desc.spheres) {
         const color& e = s.mat.emission;
         if (e.x <= 0.0f && e.y <= 0.0f && e.z <= 0.0f) continue;
@@ -176,7 +212,8 @@ inline SceneDesc build_scene_desc(
 
 inline Scene make_scene(const SceneDesc& desc) {
     Scene scene;
-    int next_light = 0;
+    int next_light =
+        desc.mesh ? int(desc.mesh->light_tri_count) : 0;   // tris first
     for (const SphereData& s : desc.spheres) {
         const color& e = s.mat.emission;
         const bool lit = e.x > 0.0f || e.y > 0.0f || e.z > 0.0f;
@@ -195,7 +232,8 @@ inline Scene make_scene(const SceneDesc& desc) {
 inline std::vector<GPUSphere> flatten_scene(const SceneDesc& desc) {
     std::vector<GPUSphere> out;
     out.reserve(desc.spheres.size());
-    int next_light = 0;
+    int next_light =
+        desc.mesh ? int(desc.mesh->light_tri_count) : 0;   // tris first
     for (const SphereData& s : desc.spheres) {
         GPUSphere g{};
         g.center = {s.center.x, s.center.y, s.center.z};

@@ -298,6 +298,18 @@ MeshMaterial bake_material(const cgltf_material* mat,
         mat->normal_texture.texture ? mat->normal_texture.texture->image
                                     : nullptr,
         glb_dir, /*srgb=*/false, one, cache);
+
+    if (out.emissive.valid()) {
+        double sum = 0.0;
+        const std::size_t n = out.emissive.texels.size() / 4;
+        for (std::size_t i = 0; i < n; ++i) {
+            sum += (0.2126 * out.emissive.texels[i * 4] +
+                    0.7152 * out.emissive.texels[i * 4 + 1] +
+                    0.0722 * out.emissive.texels[i * 4 + 2]) /
+                   65535.0;
+        }
+        out.mean_emission = float(sum / double(n));
+    }
     return out;
 }
 
@@ -445,6 +457,17 @@ std::shared_ptr<const MeshData> load_glb(const std::string& path,
 
     // ---- BVH (permutes tris AND material ids into leaf order) ----
     info.bvh = build_bvh(out->tris, out->nodes, &out->tri_mat);
+
+    // ---- Session J: per-triangle light ordinals (leaf order) ----
+    out->tri_light.assign(out->tris.size(), 0u);
+    std::uint32_t next = 0;
+    for (std::size_t i = 0; i < out->tris.size(); ++i) {
+        if (tri_emissive_probe(out->materials[out->tri_mat[i]],
+                               out->tris[i]) > 1e-4f) {
+            out->tri_light[i] = ++next;
+        }
+    }
+    out->light_tri_count = next;
     return out;
 }
 

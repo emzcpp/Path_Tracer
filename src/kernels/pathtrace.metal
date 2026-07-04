@@ -592,6 +592,34 @@ inline bool occluded_scene(float3 ro, float3 rd, float t_max,
 
 // ---- Session J: area-light NEE (mirror of integrator.h) ---------------
 
+inline float3 sample_tri_light(device const GPULight& L, float3 x, float u1,
+                               float u2, thread float& pdf_sa,
+                               thread float& t_light, thread float& bu,
+                               thread float& bv) {
+    pdf_sa = 0.0f;
+    t_light = 0.0f;
+    const float su = sqrt(u1);
+    bu = 1.0f - su;
+    bv = u2 * su;
+    const float3 p0 = c3(L.p0);
+    const float3 e1 = c3(L.e1);
+    const float3 e2 = c3(L.e2);
+    const float3 y = p0 + bu * e1 + bv * e2;
+    const float3 d = y - x;
+    const float r2 = dot(d, d);
+    if (r2 < 1e-12f) return float3(0.0f, 0.0f, 1.0f);
+    const float r = sqrt(r2);
+    const float3 dir = d / r;
+    const float3 cr = cross_pt(e1, e2);
+    const float two_area = length(cr);
+    if (two_area < 1e-12f) return float3(0.0f, 0.0f, 1.0f);
+    const float cos_l = fabs(dot(cr, dir)) / two_area;
+    if (cos_l < 1e-6f) return float3(0.0f, 0.0f, 1.0f);
+    pdf_sa = r2 / (cos_l * 0.5f * two_area);
+    t_light = r;
+    return dir;
+}
+
 inline int light_pick(device const GPULight* lights, int n, float u) {
     int lo = 0, hi = n - 1;
     while (lo < hi) {
@@ -764,6 +792,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     device const float* env_row_cdf,
                     device const float* env_cond_cdf,
                     device const GPULight* lights,
+                    device const uint* tri_light,
                     constant MeshUniforms& MU, constant PassUniforms& U,
                     thread PRNG& rng, uint max_depth) {
     float3 radiance = float3(0.0f);
@@ -858,6 +887,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             // previous vertex ran area-light NEE.
             int light_id = -1;
             if (!hit_m) light_id = int(spheres[rec.sphere_idx].pad[0]) - 1;
+            else light_id = int(tri_light[th.tri]) - 1;
             const bool suppress =
                 prev_nee_light && depth > 0u && light_id >= 0;
             if (!suppress) {
@@ -921,8 +951,12 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             const int li = light_pick(lights, int(U.light_count), us);
             device const GPULight& L = lights[li];
             float pdf_sa = 0.0f, t_light = 0.0f;
+            float bu = 0.0f, bv = 0.0f;
             const float3 ldir =
-                sample_sphere_light(L, hp, u1, u2, pdf_sa, t_light);
+                L.kind == 0u
+                    ? sample_sphere_light(L, hp, u1, u2, pdf_sa, t_light)
+                    : sample_tri_light(L, hp, u1, u2, pdf_sa, t_light, bu,
+                                       bv);
             if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
                 float pdf_b = 0.0f;
                 const float3 vdir = -normalize(rd);
@@ -931,7 +965,21 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                 if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
                     if (!occluded_scene(hp, ldir, t_light * (1.0f - 1e-3f),
                                         spheres, n, nodes, tris, MU)) {
-                        const float3 Le = c3(L.emission);
+                        float3 Le = c3(L.emission);
+                        if (L.kind == 1u) {
+                            // Textured Le at the sampled point — same
+                            // bilinear + emissive_scale as shading.
+                            const float b0 = 1.0f - bu - bv;
+                            const float tu =
+                                b0 * L.u0 + bu * L.u1 + bv * L.u2;
+                            const float tv =
+                                b0 * L.v0 + bu * L.v1 + bv * L.v2;
+                            device const GPUMaterialArgs& LM =
+                                materials[L.mat_id];
+                            Le = sample_bilinear(LM.emis, LM.emis_w,
+                                                 LM.emis_h, tu, tv) *
+                                 MU.emissive_scale;
+                        }
                         const float3 c = throughput * f * nl * Le /
                                          (pdf_sa * L.sel_pdf);
                         radiance += clamp_contribution(c, U.clamp_indirect);
@@ -986,6 +1034,7 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                        device const float* env_row_cdf [[buffer(11)]],
                        device const float* env_cond_cdf [[buffer(12)]],
                        device const GPULight* lights   [[buffer(13)]],
+                       device const uint* tri_light    [[buffer(14)]],
                        uint2 gid [[thread_position_in_grid]]) {
     // The dispatch may cover a row slice [row_offset, row_offset+rows);
     // everything below keys off the FRAME pixel, so slicing is invisible
@@ -1009,7 +1058,8 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
 
         total += trace(ro, rd, spheres, U.sphere_count, nodes, tris,
                        materials, tri_mat, env_texels, env_row_cdf,
-                       env_cond_cdf, lights, MU, U, rng, U.max_depth);
+                       env_cond_cdf, lights, tri_light, MU, U, rng,
+                       U.max_depth);
     }
     accum[px] += float4(total, 0.0f);
 }

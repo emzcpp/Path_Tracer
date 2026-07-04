@@ -40,6 +40,11 @@ struct MeshMaterial {
     Texture16 mr;         // linear: G = roughness, B = metallic
     Texture16 emissive;   // linear (sRGB-decoded), emissiveFactor baked in
     Texture16 normal;     // LINEAR tangent-space normal map (never sRGB)
+    // Session J: mean emissive luminance over the texture (0 = not an
+    // emitter). Drives which triangles join the area-light list and their
+    // power-proportional selection weight; the estimator itself evaluates
+    // the ACTUAL textured Le at each sampled point.
+    float mean_emission = 0.0f;
 };
 
 struct MeshData {
@@ -50,6 +55,12 @@ struct MeshData {
     // permutes both together — including on every gizmo re-bake).
     std::vector<MeshMaterial> materials;
     std::vector<std::uint32_t> tri_mat;
+    // Session J: per-triangle light ordinal + 1 (0 = not an emitter), in
+    // the SAME leaf order as tris/tri_mat. Triangle lights enumerate FIRST
+    // in the global light list, so these ordinals are stable when sphere
+    // edits change the list. Rebuilt whenever the BVH is (re-bakes).
+    std::vector<std::uint32_t> tri_light;
+    std::uint32_t light_tri_count = 0;
     float emissive_scale = 1.0f;   // user knob on top of the baked factor
 
     struct Info {           // --mesh-info diagnostics
@@ -63,6 +74,25 @@ struct MeshData {
         BvhStats bvh;
     } info;
 };
+
+// Session J: per-triangle emissive probe — the luminance of the
+// material's emissive texture at the triangle's three vertex UVs and
+// centroid. Inclusion/power decisions from this affect only VARIANCE
+// (unlisted emitters keep full BSDF-hit emission), never bias — but the
+// loader, the viewer's re-bake, and build_light_list must all use this
+// ONE rule so tri_light ordinals and list entries stay consistent.
+inline float tri_emissive_probe(const MeshMaterial& m,
+                                const GPUTriangle& T) {
+    if (!m.emissive.valid() || m.mean_emission <= 0.0f) return 0.0f;
+    const float us[4] = {T.u0, T.u1, T.u2, (T.u0 + T.u1 + T.u2) / 3.0f};
+    const float vs[4] = {T.v0, T.v1, T.v2, (T.v0 + T.v1 + T.v2) / 3.0f};
+    float sum = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        const color c = sample_bilinear(m.emissive, us[i], vs[i]);
+        sum += 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+    }
+    return sum * 0.25f;
+}
 
 // nullptr + `error` filled on any parse/decode failure.
 std::shared_ptr<const MeshData> load_glb(const std::string& path,

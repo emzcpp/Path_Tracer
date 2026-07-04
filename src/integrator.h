@@ -9,8 +9,10 @@
 #include <limits>
 
 #include "hittable.h"
+#include "gltf_loader.h"
 #include "kernel_types.h"
 #include "material.h"
+#include "texture.h"
 #include "ray.h"
 #include "rng.h"
 
@@ -149,6 +151,10 @@ inline float env_pdf(const EnvLookup& env, const vec3& dir) {
 struct LightsLookup {
     const GPULight* lights = nullptr;
     int count = 0;
+    // For triangle lights: the mesh whose materials hold the emissive
+    // textures — Le is evaluated at the sampled point (textured emitters
+    // must converge to brute force exactly; a constant Le would not).
+    const MeshData* mesh = nullptr;
 };
 
 // Binary search of the strided per-entry selection CDF: first light whose
@@ -192,6 +198,37 @@ inline vec3 sample_sphere_light(const GPULight& L, const vec3& x, float u1,
     const float dc = dot(cx, dir);
     const float disc = L.radius * L.radius - (d2 - dc * dc);
     t_light = dc - std::sqrt(std::fmax(0.0f, disc));
+    return dir;
+}
+
+// Uniform-area triangle sampling, converted to a solid-angle pdf via the
+// r^2 / cos(theta_light) Jacobian (THE classic mesh-light bug when wrong).
+// Two-sided: the integrator collects emission on either face, so |cos|.
+// bu/bv are the sampled barycentrics over (e1, e2) for the Le lookup.
+inline vec3 sample_tri_light(const GPULight& L, const vec3& x, float u1,
+                             float u2, float& pdf_sa, float& t_light,
+                             float& bu, float& bv) {
+    pdf_sa = 0.0f;
+    t_light = 0.0f;
+    const float su = std::sqrt(u1);
+    bu = 1.0f - su;
+    bv = u2 * su;
+    const vec3 p0(L.p0.x, L.p0.y, L.p0.z);
+    const vec3 e1(L.e1.x, L.e1.y, L.e1.z);
+    const vec3 e2(L.e2.x, L.e2.y, L.e2.z);
+    const vec3 y = p0 + bu * e1 + bv * e2;
+    const vec3 d = y - x;
+    const float r2 = dot(d, d);
+    if (r2 < 1e-12f) return vec3(0.0f, 0.0f, 1.0f);
+    const float r = std::sqrt(r2);
+    const vec3 dir = d / r;
+    const vec3 cr = cross(e1, e2);
+    const float two_area = cr.length();
+    if (two_area < 1e-12f) return vec3(0.0f, 0.0f, 1.0f);
+    const float cos_l = std::fabs(dot(cr, dir)) / two_area;
+    if (cos_l < 1e-6f) return vec3(0.0f, 0.0f, 1.0f);
+    pdf_sa = r2 / (cos_l * 0.5f * two_area);
+    t_light = r;
     return dir;
 }
 
@@ -320,8 +357,12 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
             const int li = light_pick(lights.lights, lights.count, us);
             const GPULight& L = lights.lights[li];
             float pdf_sa = 0.0f, t_light = 0.0f;
+            float bu = 0.0f, bv = 0.0f;
             const vec3 ldir =
-                sample_sphere_light(L, rec.p, u1, u2, pdf_sa, t_light);
+                L.kind == 0u
+                    ? sample_sphere_light(L, rec.p, u1, u2, pdf_sa, t_light)
+                    : sample_tri_light(L, rec.p, u1, u2, pdf_sa, t_light,
+                                       bu, bv);
             if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
                 float pdf_b = 0.0f;
                 const vec3 vdir = -normalize(ray.dir);
@@ -331,8 +372,20 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                     const Ray shadow(rec.p, ldir);
                     if (!world.occluded(shadow, 1e-3f,
                                         t_light * (1.0f - 1e-3f))) {
-                        const color Le(L.emission.x, L.emission.y,
-                                       L.emission.z);
+                        color Le(L.emission.x, L.emission.y, L.emission.z);
+                        if (L.kind == 1u) {
+                            // Textured Le at the sampled point (same
+                            // bilinear + emissive_scale as shading).
+                            const float b0 = 1.0f - bu - bv;
+                            const float tu =
+                                b0 * L.u0 + bu * L.u1 + bv * L.u2;
+                            const float tv =
+                                b0 * L.v0 + bu * L.v1 + bv * L.v2;
+                            const MeshMaterial& mm =
+                                lights.mesh->materials[L.mat_id];
+                            Le = sample_bilinear(mm.emissive, tu, tv) *
+                                 lights.mesh->emissive_scale;
+                        }
                         const color c = throughput * f * nl * Le /
                                         (pdf_sa * L.sel_pdf);
                         radiance += clamp_contribution(c, clamp_indirect);

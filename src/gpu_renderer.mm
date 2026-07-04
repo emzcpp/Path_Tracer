@@ -123,6 +123,7 @@ struct GpuRenderer::Impl {
     id<MTLBuffer> bvh_nodes;
     id<MTLBuffer> tris;
     id<MTLBuffer> tri_mat;   // per-triangle material id, leaf order
+    id<MTLBuffer> tri_light; // per-triangle light ordinal + 1 (0 = none)
     // Session I bindless: one raw ushort buffer per texture, referenced
     // from the GPUMaterialArgs table by gpuAddress. Kept in this vector so
     // (a) ARC retains them and (b) encode marks them resident
@@ -221,6 +222,7 @@ struct GpuRenderer::Impl {
         [enc setBuffer:env_row_cdf offset:0 atIndex:11];
         [enc setBuffer:env_cond_cdf offset:0 atIndex:12];
         [enc setBuffer:lights offset:0 atIndex:13];
+        [enc setBuffer:tri_light offset:0 atIndex:14];
         [enc dispatchThreads:MTLSizeMake(w, slice ? row_count : h, 1)
             threadsPerThreadgroup:tg_accum];
         [enc endEncoding];
@@ -298,6 +300,7 @@ struct GpuRenderer::Impl {
             bvh_nodes = upload(nullptr, 0);
             tris = upload(nullptr, 0);
             tri_mat = upload(nullptr, 0);
+            tri_light = upload(nullptr, 0);
             mat_textures.clear();
             mat_table = upload(nullptr, 0);
             return;
@@ -308,6 +311,8 @@ struct GpuRenderer::Impl {
                       mesh->tris.size() * sizeof(GPUTriangle));
         tri_mat = upload(mesh->tri_mat.data(),
                          mesh->tri_mat.size() * sizeof(std::uint32_t));
+        tri_light = upload(mesh->tri_light.data(),
+                           mesh->tri_light.size() * sizeof(std::uint32_t));
 
         // Bindless material table: raw ushort buffers per channel, their
         // Metal-3 gpuAddress written into GPUMaterialArgs entries. New
@@ -739,9 +744,12 @@ void GpuRenderer::update_spheres(const std::vector<GPUSphere>& spheres) {
 
 void GpuRenderer::update_mesh_geometry(const std::vector<GPUTriangle>& tris,
                                        const std::vector<BVHNode>& nodes,
-                                       const std::vector<pt_uint>& tri_mat) {
+                                       const std::vector<pt_uint>& tri_mat,
+                                       const std::vector<pt_uint>& tri_light) {
     impl_->tri_mat = impl_->upload(tri_mat.data(),
                                    tri_mat.size() * sizeof(pt_uint));
+    impl_->tri_light = impl_->upload(tri_light.data(),
+                                     tri_light.size() * sizeof(pt_uint));
     impl_->tris =
         [impl_->device newBufferWithBytes:tris.data()
                                    length:tris.size() * sizeof(GPUTriangle)

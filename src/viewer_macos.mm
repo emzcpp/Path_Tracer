@@ -134,6 +134,7 @@ struct ViewerCore {
     std::vector<GPUTriangle> mesh_object_tris;
     std::vector<std::uint32_t> mesh_object_tri_mat;   // parallel, pre-BVH
     std::vector<std::uint32_t> mesh_tri_mat;          // live, leaf order
+    std::vector<std::uint32_t> mesh_tri_light;        // live, re-derived
     std::vector<GPUTriangle> mesh_tris;
     std::vector<BVHNode> mesh_nodes;
     float mesh_model[16] = {1, 0, 0, 0, 0, 1, 0, 0,
@@ -332,6 +333,20 @@ void mat_normal_transform(const float* m, float out[9]) {
 // rebuild the BVH (the existing builder — milliseconds at 15k tris) and
 // hand the new arrays to the GPU. Pick reads the same arrays, so selection
 // stays consistent with what renders.
+// Session J: the light list + per-tri ordinals are derived data — rebuilt
+// whenever spheres OR mesh geometry change, from the LIVE leaf-order
+// arrays (the load-time arrays go stale after a gizmo re-bake).
+void refresh_lights(ViewerCore& core) {
+    if (!core.gpu) return;
+    if (core.desc.mesh && !core.mesh_tris.empty()) {
+        core.gpu->set_lights(build_light_list(core.desc, &core.mesh_tris,
+                                              &core.mesh_tri_mat,
+                                              &core.mesh_tri_light));
+    } else {
+        core.gpu->set_lights(build_light_list(core.desc));
+    }
+}
+
 void apply_mesh_transform(ViewerCore& core) {
     if (core.mesh_object_tris.empty()) return;
     const float* M = core.mesh_model;
@@ -361,9 +376,24 @@ void apply_mesh_transform(ViewerCore& core) {
     }
     core.mesh_tri_mat = core.mesh_object_tri_mat;
     build_bvh(core.mesh_tris, core.mesh_nodes, &core.mesh_tri_mat);
+    // Re-derive light ordinals for the new leaf order (same rule as the
+    // loader: materials with mean emission are emitters).
+    core.mesh_tri_light.assign(core.mesh_tris.size(), 0u);
+    if (core.desc.mesh) {
+        std::uint32_t next = 0;
+        for (std::size_t i = 0; i < core.mesh_tris.size(); ++i) {
+            if (tri_emissive_probe(
+                    core.desc.mesh->materials[core.mesh_tri_mat[i]],
+                    core.mesh_tris[i]) > 1e-4f) {
+                core.mesh_tri_light[i] = ++next;
+            }
+        }
+    }
     if (core.gpu)
         core.gpu->update_mesh_geometry(core.mesh_tris, core.mesh_nodes,
-                                       core.mesh_tri_mat);
+                                       core.mesh_tri_mat,
+                                       core.mesh_tri_light);
+    refresh_lights(core);
     core.mark_scene_dirty();
     core.mesh_apply_pending = false;
     core.last_mesh_apply = Clock::now();
@@ -376,7 +406,7 @@ void apply_sphere_edit(ViewerCore& core) {
         core.gpu->update_spheres(flatten_scene(core.desc));
         // Session J: emitters may have changed (moved / re-colored /
         // added / deleted) — the light list is derived data.
-        core.gpu->set_lights(build_light_list(core.desc));
+        refresh_lights(core);
     }
     core.mark_scene_dirty();
 }
@@ -409,8 +439,10 @@ void remove_mesh(ViewerCore& core) {
     core.mesh_object_tri_mat.clear();
     core.mesh_tris.clear();
     core.mesh_tri_mat.clear();
+    core.mesh_tri_light.clear();
     core.mesh_nodes.clear();
     if (core.gpu) core.gpu->set_mesh(nullptr);
+    refresh_lights(core);
     core.mark_scene_dirty();
 }
 
@@ -550,8 +582,10 @@ void restore_state(ViewerCore& core, const SceneState& s) {
             core.mesh_object_tri_mat.clear();
             core.mesh_tris.clear();
             core.mesh_tri_mat.clear();
+            core.mesh_tri_light.clear();
             core.mesh_nodes.clear();
             if (core.gpu) core.gpu->set_mesh(nullptr);
+            refresh_lights(core);
         }
     }
     core.desc.mesh_name = s.mesh_name;
@@ -696,8 +730,10 @@ bool apply_snapshot(ViewerCore& core, SceneSnapshot&& snap,
             core.mesh_object_tri_mat.clear();
             core.mesh_tris.clear();
             core.mesh_tri_mat.clear();
+            core.mesh_tri_light.clear();
             core.mesh_nodes.clear();
             if (core.gpu) core.gpu->set_mesh(nullptr);
+            refresh_lights(core);
         }
     } else {
         if (!mesh_same) {
@@ -791,7 +827,8 @@ void render_thread_main(ViewerCore& core) {
     const std::vector<GPULight> lights = build_light_list(core.desc);
     const LightsLookup ll{lights.empty() ? nullptr : lights.data(),
                           core.settings.env_nee != 0 ? int(lights.size())
-                                                     : 0};
+                                                     : 0,
+                          core.desc.mesh.get()};
     RenderSettings cpu_settings = core.settings;
     // The CPU viewer is a preview context: same preview-only clamp policy.
     cpu_settings.clamp_indirect =
@@ -2255,6 +2292,7 @@ int run_viewer(const RenderSettings& settings, bool use_gpu,
             core->mesh_object_tri_mat = desc.mesh->tri_mat;
             core->mesh_tris = desc.mesh->tris;
             core->mesh_tri_mat = desc.mesh->tri_mat;
+            core->mesh_tri_light = desc.mesh->tri_light;
             core->mesh_nodes = desc.mesh->nodes;
         }
         core->use_gpu = use_gpu;

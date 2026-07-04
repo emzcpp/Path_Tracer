@@ -231,6 +231,11 @@ public:
         rec.normal = front ? ns : -ns;
         rec.front_face = front;
         rec.mat = eval_mesh_material(*data_, data_->tri_mat[best.tri], u, v);
+        // Session J: triangle lights enumerate first, so the stored
+        // ordinal+1 IS the global light id + 1.
+        rec.light_id = data_->tri_light.empty()
+                           ? -1
+                           : int(data_->tri_light[best.tri]) - 1;
         return true;
     }
 
