@@ -201,6 +201,34 @@ inline vec3 sample_sphere_light(const GPULight& L, const vec3& x, float u1,
     return dir;
 }
 
+// Solid-angle pdf the area-light sampler would assign to the direction
+// x -> (hit at distance t on light L) — the MIS counterpart for BSDF rays
+// that land on an emitter. Mirrors sample_sphere_light / sample_tri_light
+// exactly; 0 = the sampler could not produce this direction (BSDF keeps
+// full weight, consistent with the sampler contributing nothing there).
+inline float light_dir_pdf(const GPULight& L, const vec3& x, const vec3& dir,
+                           float t_hit) {
+    if (L.kind == 0u) {
+        const vec3 cx = vec3(L.p0.x, L.p0.y, L.p0.z) - x;
+        const float d2 = dot(cx, cx);
+        const float d = std::sqrt(d2);
+        if (d <= L.radius * 1.0001f) return 0.0f;
+        const float sin2max = (L.radius * L.radius) / d2;
+        const float cosmax = std::sqrt(std::fmax(0.0f, 1.0f - sin2max));
+        const float one_minus = 1.0f - cosmax;
+        if (one_minus < 1e-8f) return 0.0f;
+        return 1.0f / (6.28318530717958648f * one_minus);
+    }
+    const vec3 e1(L.e1.x, L.e1.y, L.e1.z);
+    const vec3 e2(L.e2.x, L.e2.y, L.e2.z);
+    const vec3 cr = cross(e1, e2);
+    const float two_area = cr.length();
+    if (two_area < 1e-12f) return 0.0f;
+    const float cos_l = std::fabs(dot(cr, dir)) / two_area;
+    if (cos_l < 1e-6f) return 0.0f;
+    return (t_hit * t_hit) / (cos_l * 0.5f * two_area);
+}
+
 // Uniform-area triangle sampling, converted to a solid-angle pdf via the
 // r^2 / cos(theta_light) Jacobian (THE classic mesh-light bug when wrong).
 // Two-sided: the integrator collects emission on either face, so |cos|.
@@ -288,18 +316,23 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
         // try to continue the path. Indirect pickups are firefly-clamped;
         // depth 0 (directly visible lights/background) never is.
         {
-            // Session J interim rule (until Stage-3 MIS): a vertex that ran
-            // area-light NEE already collected direct emission from every
-            // LISTED emitter, so its continuation's hit on one must not add
-            // that emission again. Camera rays, delta chains, and emitters
-            // NOT in the list (none once Stage 2 lands) stay untouched.
-            const bool suppress =
-                prev_nee_light && depth > 0 && rec.light_id >= 0;
-            if (!suppress) {
-                const color c = throughput * rec.mat.emission;
-                radiance +=
-                    depth == 0 ? c : clamp_contribution(c, clamp_indirect);
+            // MIS (power heuristic): a BSDF ray that lands on a LISTED
+            // emitter weights its emission against the pdf area-light NEE
+            // would have assigned this direction (x selection pdf). Camera
+            // rays, delta chains, and unlisted emitters keep full weight.
+            float w = 1.0f;
+            if (prev_nee_light && depth > 0 && rec.light_id >= 0 &&
+                prev_pdf > 0.0f) {
+                const GPULight& L = lights.lights[rec.light_id];
+                const float pl = light_dir_pdf(L, ray.origin,
+                                               normalize(ray.dir), rec.t) *
+                                 L.sel_pdf;
+                w = (prev_pdf * prev_pdf) /
+                    (prev_pdf * prev_pdf + pl * pl + 1e-20f);
             }
+            const color c = throughput * rec.mat.emission * w;
+            radiance +=
+                depth == 0 ? c : clamp_contribution(c, clamp_indirect);
         }
 
         // ---- Session H: next-event estimation toward the environment.
@@ -343,13 +376,10 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
 
         // ---- Session J: one area-light sample per vertex. Same gating as
         // env NEE (delta glass excluded); selection is power-proportional.
-        // Near-specular skip (interim, as in env Stage 2): sampling a
-        // lamp through a spiked GGX lobe produces jackpot noise; BSDF
-        // sampling owns those vertices until Stage-3 MIS weights the
-        // trade smoothly.
+        // Delta glass skipped; near-specular handled by the MIS weights
+        // (sharp lobes hand themselves to BSDF sampling smoothly).
         const bool can_nee_light = env.nee && lights.count > 0 &&
-                                   rec.mat.transmission <= 0.5f &&
-                                   rec.mat.roughness >= 0.1f;
+                                   rec.mat.transmission <= 0.5f;
         if (can_nee_light) {
             const float us = rng.next_float();
             const float u1 = rng.next_float();
@@ -386,8 +416,12 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                             Le = sample_bilinear(mm.emissive, tu, tv) *
                                  lights.mesh->emissive_scale;
                         }
-                        const color c = throughput * f * nl * Le /
-                                        (pdf_sa * L.sel_pdf);
+                        // MIS weight vs the BSDF sampler.
+                        const float pl = pdf_sa * L.sel_pdf;
+                        const float w =
+                            (pl * pl) / (pl * pl + pdf_b * pdf_b + 1e-20f);
+                        const color c = throughput * f * nl * Le *
+                                        (w / pl);
                         radiance += clamp_contribution(c, clamp_indirect);
                     }
                 }

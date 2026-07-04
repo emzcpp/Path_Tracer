@@ -592,6 +592,29 @@ inline bool occluded_scene(float3 ro, float3 rd, float t_max,
 
 // ---- Session J: area-light NEE (mirror of integrator.h) ---------------
 
+inline float light_dir_pdf(device const GPULight& L, float3 x, float3 dir,
+                           float t_hit) {
+    if (L.kind == 0u) {
+        const float3 cx = c3(L.p0) - x;
+        const float d2 = dot(cx, cx);
+        const float d = sqrt(d2);
+        if (d <= L.radius * 1.0001f) return 0.0f;
+        const float sin2max = (L.radius * L.radius) / d2;
+        const float cosmax = sqrt(fmax(0.0f, 1.0f - sin2max));
+        const float one_minus = 1.0f - cosmax;
+        if (one_minus < 1e-8f) return 0.0f;
+        return 1.0f / (6.28318530717958648f * one_minus);
+    }
+    const float3 e1 = c3(L.e1);
+    const float3 e2 = c3(L.e2);
+    const float3 cr = cross_pt(e1, e2);
+    const float two_area = length(cr);
+    if (two_area < 1e-12f) return 0.0f;
+    const float cos_l = fabs(dot(cr, dir)) / two_area;
+    if (cos_l < 1e-6f) return 0.0f;
+    return (t_hit * t_hit) / (cos_l * 0.5f * two_area);
+}
+
 inline float3 sample_tri_light(device const GPULight& L, float3 x, float u1,
                                float u2, thread float& pdf_sa,
                                thread float& t_light, thread float& bu,
@@ -882,20 +905,25 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
         }
 
         {
-            // Session J interim rule (until Stage-3 MIS) — mirror of
-            // integrator.h: suppress listed-emitter emission when the
-            // previous vertex ran area-light NEE.
+            // MIS (power heuristic) — mirror of integrator.h: BSDF hits on
+            // LISTED emitters weight against the area-NEE pdf for this
+            // direction (x selection pdf).
             int light_id = -1;
             if (!hit_m) light_id = int(spheres[rec.sphere_idx].pad[0]) - 1;
             else light_id = int(tri_light[th.tri]) - 1;
-            const bool suppress =
-                prev_nee_light && depth > 0u && light_id >= 0;
-            if (!suppress) {
-                const float3 c = throughput * mat.emission;
-                radiance += depth == 0u
-                                ? c
-                                : clamp_contribution(c, U.clamp_indirect);
+            float w = 1.0f;
+            if (prev_nee_light && depth > 0u && light_id >= 0 &&
+                prev_pdf > 0.0f) {
+                device const GPULight& L = lights[light_id];
+                const float pl =
+                    light_dir_pdf(L, ro, normalize(rd), closest) * L.sel_pdf;
+                w = (prev_pdf * prev_pdf) /
+                    (prev_pdf * prev_pdf + pl * pl + 1e-20f);
             }
+            const float3 c = throughput * mat.emission * w;
+            radiance += depth == 0u
+                            ? c
+                            : clamp_contribution(c, U.clamp_indirect);
         }
 
         // ---- Session H: next-event estimation toward the environment.
@@ -940,10 +968,10 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
 
         // ---- Session J: one area-light sample per vertex — mirror of
         // integrator.h. Same gating as env NEE; power-proportional pick.
-        // Near-specular skip (interim) — mirror of integrator.h.
+        // Delta glass skipped; near-specular handled by the MIS weights
+        // — mirror of integrator.h.
         const bool can_nee_light = U.env_nee != 0u && U.light_count > 0u &&
-                                   mat.transmission <= 0.5f &&
-                                   mat.roughness >= 0.1f;
+                                   mat.transmission <= 0.5f;
         if (can_nee_light) {
             const float us = pcg_next_float(rng);
             const float u1 = pcg_next_float(rng);
@@ -980,8 +1008,12 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                                                  LM.emis_h, tu, tv) *
                                  MU.emissive_scale;
                         }
-                        const float3 c = throughput * f * nl * Le /
-                                         (pdf_sa * L.sel_pdf);
+                        // MIS weight vs the BSDF sampler.
+                        const float pl = pdf_sa * L.sel_pdf;
+                        const float w =
+                            (pl * pl) / (pl * pl + pdf_b * pdf_b + 1e-20f);
+                        const float3 c = throughput * f * nl * Le *
+                                         (w / pl);
                         radiance += clamp_contribution(c, U.clamp_indirect);
                     }
                 }

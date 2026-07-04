@@ -102,7 +102,14 @@ shadow rays at every non-delta bounce, combined with BSDF sampling by the
 power heuristic — the sun's energy arrives every sample instead of by
 lottery, unbiased (verified to converge to brute force within MC noise on
 the image mean and per-band energy). `--brute` (or the panel checkbox)
-switches back to brute-force ground truth. Residual sparse speckle from
+switches back to brute-force ground truth. Scene lights get the same
+treatment (Session J): emissive spheres AND emissive mesh triangles are
+next-event-estimated — one power-selected light sample per bounce (cone
+sampling for spheres, uniform-area with the r^2/cos Jacobian for
+triangles, textured Le at the sampled point) — and unified with env NEE
+and BSDF sampling under one power-heuristic MIS. Only triangles whose
+emissive texture actually glows join the light list (4-point UV probe);
+the list rebuilds automatically on any light edit or gizmo re-bake. Residual sparse speckle from
 sun-through-glass caustic paths is inherent (delta chains can't be
 shadow-rayed) — the preview clamp still covers those. Fireflies from bright HDRI suns are
 legitimate brute-force variance; the indirect clamp that calms them is
