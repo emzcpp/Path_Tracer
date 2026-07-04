@@ -116,6 +116,11 @@ struct GpuRenderer::Impl {
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> accumulate_pso;
     id<MTLComputePipelineState> resolve_pso;
+    // Session K: partitioned pipeline (ReSTIR scaffolding).
+    id<MTLComputePipelineState> g_primary_pso;
+    id<MTLComputePipelineState> direct_pso;
+    id<MTLComputePipelineState> indirect_pso;
+    id<MTLBuffer> gbuf;   // GBufferPx per pixel, allocated at full res
     id<MTLBuffer> accum;     // full-res float4, StorageModeShared
     id<MTLBuffer> spheres;   // bound as constant GPUSphere*
     // Mesh data (placeholder-sized when no mesh — Metal requires every
@@ -202,6 +207,88 @@ struct GpuRenderer::Impl {
         u.clamp_indirect = settings.clamp_indirect;
         u.env_nee = pt_uint(settings.env_nee != 0 ? 1 : 0);
         u.light_count = light_count;
+
+        if (settings.restir != 0) {
+            // Partitioned: K sequential (g_primary -> direct -> indirect)
+            // triples, one per pass — phases are pixel-local, so a row
+            // slice runs all three for its rows in order.
+            const int kcount = slice ? 1 : count;
+            for (int k = 0; k < kcount; ++k) {
+                PassUniforms pu = u;
+                pu.pass_base = pt_uint(passes + (slice ? 0 : k));
+                pu.pass_count = 1;
+                const MTLSize grid =
+                    MTLSizeMake(w, slice ? row_count : h, 1);
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:g_primary_pso];
+                [e setBuffer:gbuf offset:0 atIndex:0];
+                [e setBuffer:spheres offset:0 atIndex:1];
+                [e setBytes:&pu length:sizeof pu atIndex:2];
+                [e setBuffer:bvh_nodes offset:0 atIndex:3];
+                [e setBuffer:tris offset:0 atIndex:4];
+                [e setBuffer:mat_table offset:0 atIndex:5];
+                [e setBuffer:tri_mat offset:0 atIndex:6];
+                [e setBuffer:tri_light offset:0 atIndex:7];
+                [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
+                for (id<MTLBuffer> t : mat_textures) {
+                    [e useResource:t usage:MTLResourceUsageRead];
+                }
+                [e dispatchThreads:grid threadsPerThreadgroup:tg_accum];
+                [e endEncoding];
+
+                e = [cb computeCommandEncoder];
+                [e setComputePipelineState:direct_pso];
+                [e setBuffer:accum offset:0 atIndex:0];
+                [e setBuffer:spheres offset:0 atIndex:1];
+                [e setBytes:&pu length:sizeof pu atIndex:2];
+                [e setBuffer:bvh_nodes offset:0 atIndex:3];
+                [e setBuffer:tris offset:0 atIndex:4];
+                [e setBuffer:mat_table offset:0 atIndex:5];
+                [e setBuffer:gbuf offset:0 atIndex:6];
+                [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
+                [e setBuffer:env_texels offset:0 atIndex:10];
+                [e setBuffer:env_row_cdf offset:0 atIndex:11];
+                [e setBuffer:env_cond_cdf offset:0 atIndex:12];
+                [e setBuffer:lights offset:0 atIndex:13];
+                for (id<MTLBuffer> t : mat_textures) {
+                    [e useResource:t usage:MTLResourceUsageRead];
+                }
+                [e dispatchThreads:grid threadsPerThreadgroup:tg_accum];
+                [e endEncoding];
+
+                e = [cb computeCommandEncoder];
+                [e setComputePipelineState:indirect_pso];
+                [e setBuffer:accum offset:0 atIndex:0];
+                [e setBuffer:spheres offset:0 atIndex:1];
+                [e setBytes:&pu length:sizeof pu atIndex:2];
+                [e setBuffer:bvh_nodes offset:0 atIndex:3];
+                [e setBuffer:tris offset:0 atIndex:4];
+                [e setBuffer:mat_table offset:0 atIndex:5];
+                [e setBuffer:gbuf offset:0 atIndex:6];
+                [e setBuffer:tri_mat offset:0 atIndex:7];
+                [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
+                [e setBuffer:tri_light offset:0 atIndex:9];
+                [e setBuffer:env_texels offset:0 atIndex:10];
+                [e setBuffer:env_row_cdf offset:0 atIndex:11];
+                [e setBuffer:env_cond_cdf offset:0 atIndex:12];
+                [e setBuffer:lights offset:0 atIndex:13];
+                for (id<MTLBuffer> t : mat_textures) {
+                    [e useResource:t usage:MTLResourceUsageRead];
+                }
+                [e dispatchThreads:grid threadsPerThreadgroup:tg_accum];
+                [e endEncoding];
+            }
+            if (slice) {
+                cursor = row_start + row_count;
+                if (cursor >= h) {
+                    passes += 1;
+                    cursor = 0;
+                }
+            } else {
+                passes += count;
+            }
+            return;
+        }
 
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:accumulate_pso];
@@ -428,6 +515,12 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
     im.tg_accum = pick_tg(im.accumulate_pso);
     im.tg_resolve = pick_tg(im.resolve_pso);
 
+    im.g_primary_pso = make_pipeline(device, lib, @"g_primary", error);
+    im.direct_pso = make_pipeline(device, lib, @"direct_v0", error);
+    im.indirect_pso = make_pipeline(device, lib, @"indirect_v0", error);
+    if (!im.g_primary_pso || !im.direct_pso || !im.indirect_pso)
+        return nullptr;
+
     im.raster_mesh_pso = make_raster_pso(@"raster_mesh_vs", error);
     im.raster_sphere_pso = make_raster_pso(@"raster_sphere_vs", error);
     if (!im.raster_mesh_pso || !im.raster_sphere_pso) return nullptr;
@@ -452,6 +545,10 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
     im.accum = [device
         newBufferWithLength:size_t(settings.width) * settings.height *
                             sizeof(float) * 4
+                    options:MTLResourceStorageModeShared];
+    im.gbuf = [device
+        newBufferWithLength:size_t(settings.width) * settings.height *
+                            sizeof(GBufferPx)
                     options:MTLResourceStorageModeShared];
     // Guarded like update_spheres: --only-model scenes have no spheres,
     // and a zero-length newBufferWithBytes returns NIL (unbound buffer(1)).
@@ -515,6 +612,12 @@ void GpuRenderer::reset(int w, int h) {
     if (needed > impl_->accum.length) {
         impl_->accum =
             [impl_->device newBufferWithLength:needed
+                                       options:MTLResourceStorageModeShared];
+    }
+    const size_t gneeded = size_t(w) * h * sizeof(GBufferPx);
+    if (gneeded > impl_->gbuf.length) {
+        impl_->gbuf =
+            [impl_->device newBufferWithLength:gneeded
                                        options:MTLResourceStorageModeShared];
     }
     impl_->w = w;

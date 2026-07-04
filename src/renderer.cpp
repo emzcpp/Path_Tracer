@@ -1,6 +1,8 @@
 #include "renderer.h"
 
+#include <atomic>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 
 #include "image.h"
@@ -41,6 +43,11 @@ void ProgressiveRenderer::reset(int w, int h) {
 void ProgressiveRenderer::render_pass(const Camera& camera) {
     current_pass_ = pass_count_;
     camera_ = camera;
+    if (settings_.restir != 0) {
+        render_pass_partitioned();
+        ++pass_count_;
+        return;
+    }
     {
         std::lock_guard lk(m_);
         next_row_ = 0;
@@ -110,6 +117,147 @@ void ProgressiveRenderer::render_row(int y) {
         out[x * 4 + 2] = encode_channel(c.z);
         out[x * 4 + 3] = 255;
     }
+}
+
+// Session K (ReSTIR Stage 0.5): the partitioned pass — three sequential
+// row-parallel phases with barriers, mirroring the GPU pipeline. Phase A
+// finds primary hits into the G-buffer (jitter draws), phase D adds
+// vertex-0 direct lighting via the SAME sample_direct and the SAME rng
+// stream (state travels through the G-buffer), phase I continues the
+// path with the first hit injected and vertex-0 direct skipped.
+void ProgressiveRenderer::render_pass_partitioned() {
+    if (gbuf_.size() != std::size_t(w_) * h_) {
+        gbuf_.assign(std::size_t(w_) * h_, GBufferPx{});
+    }
+    const auto par_rows = [&](auto&& fn) {
+        const unsigned T =
+            std::max(1u, std::thread::hardware_concurrency());
+        std::atomic<int> next{0};
+        std::vector<std::thread> ts;
+        ts.reserve(T);
+        for (unsigned i = 0; i < T; ++i) {
+            ts.emplace_back([&] {
+                for (int y = next.fetch_add(1); y < h_;
+                     y = next.fetch_add(1)) {
+                    fn(y);
+                }
+            });
+        }
+        for (auto& t : ts) t.join();
+    };
+    const float inv_w = 1.0f / float(w_);
+    const float inv_h = 1.0f / float(h_);
+    const float inv_n = 1.0f / float(current_pass_ + 1);
+
+    // Phase A: primary hits.
+    par_rows([&](int y) {
+        for (int x = 0; x < w_; ++x) {
+            const std::uint64_t px = std::uint64_t(y) * w_ + x;
+            RNG rng(mix64(px ^ (std::uint64_t(current_pass_) << 32)), px);
+            const float u = (x + rng.next_float()) * inv_w;
+            const float v = 1.0f - (y + rng.next_float()) * inv_h;
+            const Ray r = camera_.get_ray(u, v);
+            GBufferPx& g = gbuf_[px];
+            HitRecord rec;
+            if (scene_.hit(r, 1e-3f,
+                           std::numeric_limits<float>::infinity(), rec)) {
+                g.pos = {rec.p.x, rec.p.y, rec.p.z};
+                g.t = rec.t;
+                g.normal = {rec.normal.x, rec.normal.y, rec.normal.z};
+                g.flags = rec.front_face ? 1u : 0u;
+                g.base_color = {rec.mat.base_color.x, rec.mat.base_color.y,
+                                rec.mat.base_color.z};
+                g.metallic = rec.mat.metallic;
+                g.emission = {rec.mat.emission.x, rec.mat.emission.y,
+                              rec.mat.emission.z};
+                g.ior = rec.mat.ior;
+                g.roughness = rec.mat.roughness;
+                g.transmission = rec.mat.transmission;
+                g.light_id_p1 = pt_uint(rec.light_id + 1);
+            } else {
+                g.t = -1.0f;
+            }
+            g.rd = {r.dir.x, r.dir.y, r.dir.z};
+            g.rng_lo = pt_uint(rng.state & 0xffffffffULL);
+            g.rng_hi = pt_uint(rng.state >> 32);
+        }
+    });
+
+    // Phase D: vertex-0 direct lighting (same estimator, same draws).
+    par_rows([&](int y) {
+        color* accum_row = &accum_[std::size_t(y) * w_];
+        for (int x = 0; x < w_; ++x) {
+            const std::uint64_t px = std::uint64_t(y) * w_ + x;
+            GBufferPx& g = gbuf_[px];
+            if (g.t < 0.0f) continue;
+            HitRecord rec;
+            rec.p = point3(g.pos.x, g.pos.y, g.pos.z);
+            rec.normal = vec3(g.normal.x, g.normal.y, g.normal.z);
+            rec.front_face = (g.flags & 1u) != 0u;
+            rec.mat.base_color =
+                color(g.base_color.x, g.base_color.y, g.base_color.z);
+            rec.mat.emission =
+                color(g.emission.x, g.emission.y, g.emission.z);
+            rec.mat.metallic = g.metallic;
+            rec.mat.roughness = g.roughness;
+            rec.mat.ior = g.ior;
+            rec.mat.transmission = g.transmission;
+            RNG rng(0, px);
+            rng.state =
+                (std::uint64_t(g.rng_hi) << 32) | std::uint64_t(g.rng_lo);
+            const Ray pray(rec.p, vec3(g.rd.x, g.rd.y, g.rd.z));
+            color rad(0.0f);
+            bool v_nee = false, v_nee_light = false;
+            sample_direct(rec, pray, scene_, rng, env_, lights_,
+                          settings_.clamp_indirect, color(1.0f), rad, v_nee,
+                          v_nee_light);
+            accum_row[x] += rad;
+            g.rng_lo = pt_uint(rng.state & 0xffffffffULL);
+            g.rng_hi = pt_uint(rng.state >> 32);
+        }
+    });
+
+    // Phase I: indirect continuation (+ display encode).
+    par_rows([&](int y) {
+        color* accum_row = &accum_[std::size_t(y) * w_];
+        std::uint8_t* out = &rgba_[std::size_t(y) * w_ * 4];
+        for (int x = 0; x < w_; ++x) {
+            const std::uint64_t px = std::uint64_t(y) * w_ + x;
+            const GBufferPx& g = gbuf_[px];
+            RNG rng(0, px);
+            rng.state =
+                (std::uint64_t(g.rng_hi) << 32) | std::uint64_t(g.rng_lo);
+            const Ray pray(point3(g.pos.x, g.pos.y, g.pos.z),
+                           vec3(g.rd.x, g.rd.y, g.rd.z));
+            if (g.t < 0.0f) {
+                // Primary miss: the monolithic depth-0 env branch.
+                accum_row[x] += miss_radiance(env_, pray);
+            } else {
+                HitRecord pre;
+                pre.p = pray.origin;
+                pre.t = g.t;
+                pre.normal = vec3(g.normal.x, g.normal.y, g.normal.z);
+                pre.front_face = (g.flags & 1u) != 0u;
+                pre.mat.base_color =
+                    color(g.base_color.x, g.base_color.y, g.base_color.z);
+                pre.mat.emission =
+                    color(g.emission.x, g.emission.y, g.emission.z);
+                pre.mat.metallic = g.metallic;
+                pre.mat.roughness = g.roughness;
+                pre.mat.ior = g.ior;
+                pre.mat.transmission = g.transmission;
+                pre.light_id = int(g.light_id_p1) - 1;
+                accum_row[x] +=
+                    trace(pray, scene_, rng, settings_.max_depth, env_,
+                          lights_, settings_.clamp_indirect, &pre, true);
+            }
+            const color c = accum_row[x] * inv_n;
+            out[x * 4 + 0] = encode_channel(c.x);
+            out[x * 4 + 1] = encode_channel(c.y);
+            out[x * 4 + 2] = encode_channel(c.z);
+            out[x * 4 + 3] = 255;
+        }
+    });
 }
 
 bool ProgressiveRenderer::save_png(const std::string& path) const {

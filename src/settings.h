@@ -53,6 +53,11 @@ struct RenderSettings {
     // converge to the same image, NEE just gets there far cleaner.
     int env_nee = 1;
 
+    // Session K: 1 = partitioned direct/indirect pipeline (ReSTIR
+    // scaffolding; Stage 0.5 reproduces plain NEE+MIS through it),
+    // 0 = the monolithic integrator.
+    int restir = 0;
+
     // Execution
     int thread_count = 0;         // 0 = use all hardware threads
 

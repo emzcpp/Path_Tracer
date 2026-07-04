@@ -66,10 +66,12 @@ private:
     void work_rows();
     void render_row(int y);
 
+    void render_pass_partitioned();
     const Scene& scene_;
     RenderSettings settings_;
     EnvLookup env_;
     LightsLookup lights_;
+    std::vector<GBufferPx> gbuf_;   // Session K: per-pixel primary hits
 
     int w_ = 0, h_ = 0;
     int pass_count_ = 0;      // completed passes

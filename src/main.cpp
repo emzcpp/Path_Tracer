@@ -273,6 +273,8 @@ int main(int argc, char** argv) {
             nan_check = true;
         } else if (std::strcmp(argv[i], "--brute") == 0) {
             brute = true;
+        } else if (std::strcmp(argv[i], "--restir") == 0) {
+            settings.restir = 1;
         } else if (std::strcmp(argv[i], "--model-height") == 0 && i + 1 < argc) {
             char* end = nullptr;
             model_height = std::strtof(argv[++i], &end);

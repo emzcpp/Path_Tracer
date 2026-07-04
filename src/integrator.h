@@ -281,60 +281,19 @@ inline color clamp_contribution(const color& c, float m) {
     return mx > m ? c * (m / mx) : c;
 }
 
-inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
-                   const EnvLookup& env, const LightsLookup& lights,
-                   float clamp_indirect) {
-    color radiance(0.0f);      // light collected so far
-    color throughput(1.0f);    // fraction of it that survives back to the eye
-    bool prev_nee = false;     // env NEE ran at the previous path vertex
-    bool prev_nee_light = false;   // area-light NEE ran there too
-    float prev_pdf = 0.0f;     // BSDF pdf of the ray we're now following
-
-    for (int depth = 0; depth < max_depth; ++depth) {
-        HitRecord rec;
-        // t_min = 1e-3: a bounced ray starts ON a surface; float error can
-        // put its origin a hair inside, and t_min=0 would let it re-hit the
-        // same surface at t≈0 ("shadow acne" — dark speckles everywhere).
-        if (!world.hit(ray, 1e-3f, std::numeric_limits<float>::infinity(), rec)) {
-            // MIS (power heuristic): vertices that ran env NEE weight
-            // their continuation's env hit by the BSDF-sampling share;
-            // camera rays and delta/glass continuations (no NEE there)
-            // see the env in full.
-            float w = 1.0f;
-            if (prev_nee) {
-                const float pe = env_pdf(env, ray.dir);
-                w = (prev_pdf * prev_pdf) /
-                    (prev_pdf * prev_pdf + pe * pe + 1e-20f);
-            }
-            const color c = throughput * miss_radiance(env, ray) * w;
-            radiance +=
-                (depth == 0 ? c : clamp_contribution(c, clamp_indirect));
-            return radiance;
-        }
-
-        // Collect whatever this surface emits (zero for non-lights), THEN
-        // try to continue the path. Indirect pickups are firefly-clamped;
-        // depth 0 (directly visible lights/background) never is.
-        {
-            // MIS (power heuristic): a BSDF ray that lands on a LISTED
-            // emitter weights its emission against the pdf area-light NEE
-            // would have assigned this direction (x selection pdf). Camera
-            // rays, delta chains, and unlisted emitters keep full weight.
-            float w = 1.0f;
-            if (prev_nee_light && depth > 0 && rec.light_id >= 0 &&
-                prev_pdf > 0.0f) {
-                const GPULight& L = lights.lights[rec.light_id];
-                const float pl = light_dir_pdf(L, ray.origin,
-                                               normalize(ray.dir), rec.t) *
-                                 L.sel_pdf;
-                w = (prev_pdf * prev_pdf) /
-                    (prev_pdf * prev_pdf + pl * pl + 1e-20f);
-            }
-            const color c = throughput * rec.mat.emission * w;
-            radiance +=
-                depth == 0 ? c : clamp_contribution(c, clamp_indirect);
-        }
-
+// Vertex direct lighting — the env-NEE + area-NEE blocks, factored so
+// the monolithic trace and the partitioned direct phase (ReSTIR Stage
+// 0.5+) share ONE estimator: divergence between the two pipelines is
+// structurally impossible at this layer. APPENDS into `radiance` in the
+// original order (bit-preserving for the monolithic caller); consumes
+// the same rng draws under the same conditions. The can_nee_* outputs
+// feed the caller's MIS bookkeeping for its continuation ray.
+inline void sample_direct(const HitRecord& rec, const Ray& ray,
+                          const Hittable& world, RNG& rng,
+                          const EnvLookup& env, const LightsLookup& lights,
+                          float clamp_indirect, const color& throughput,
+                          color& radiance, bool& can_nee_out,
+                          bool& can_nee_light_out) {
         // ---- Session H: next-event estimation toward the environment.
         // Deliberately sample the env distribution (the sun), evaluate the
         // BSDF for that direction, and add the contribution if the shadow
@@ -372,7 +331,7 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                 }
             }
         }
-        prev_nee = can_nee;
+        can_nee_out = can_nee;
 
         // ---- Session J: one area-light sample per vertex. Same gating as
         // env NEE (delta glass excluded); selection is power-proportional.
@@ -427,7 +386,90 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                 }
             }
         }
-        prev_nee_light = can_nee_light;
+        can_nee_light_out = can_nee_light;
+}
+
+inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
+                   const EnvLookup& env, const LightsLookup& lights,
+                   float clamp_indirect,
+                   // Session K: partitioned pipeline injects the primary
+                   // hit and skips vertex-0 direct (the direct phase
+                   // computed it with the same rng draws).
+                   const HitRecord* pre = nullptr,
+                   bool skip_v0_direct = false) {
+    color radiance(0.0f);      // light collected so far
+    color throughput(1.0f);    // fraction of it that survives back to the eye
+    bool prev_nee = false;     // env NEE ran at the previous path vertex
+    bool prev_nee_light = false;   // area-light NEE ran there too
+    float prev_pdf = 0.0f;     // BSDF pdf of the ray we're now following
+
+    for (int depth = 0; depth < max_depth; ++depth) {
+        HitRecord rec;
+        // t_min = 1e-3: a bounced ray starts ON a surface; float error can
+        // put its origin a hair inside, and t_min=0 would let it re-hit the
+        // same surface at t≈0 ("shadow acne" — dark speckles everywhere).
+        bool hit_any;
+        if (depth == 0 && pre) {
+            rec = *pre;
+            hit_any = true;
+        } else {
+            hit_any = world.hit(ray, 1e-3f,
+                                std::numeric_limits<float>::infinity(), rec);
+        }
+        if (!hit_any) {
+            // MIS (power heuristic): vertices that ran env NEE weight
+            // their continuation's env hit by the BSDF-sampling share;
+            // camera rays and delta/glass continuations (no NEE there)
+            // see the env in full.
+            float w = 1.0f;
+            if (prev_nee) {
+                const float pe = env_pdf(env, ray.dir);
+                w = (prev_pdf * prev_pdf) /
+                    (prev_pdf * prev_pdf + pe * pe + 1e-20f);
+            }
+            const color c = throughput * miss_radiance(env, ray) * w;
+            radiance +=
+                (depth == 0 ? c : clamp_contribution(c, clamp_indirect));
+            return radiance;
+        }
+
+        // Collect whatever this surface emits (zero for non-lights), THEN
+        // try to continue the path. Indirect pickups are firefly-clamped;
+        // depth 0 (directly visible lights/background) never is.
+        {
+            // MIS (power heuristic): a BSDF ray that lands on a LISTED
+            // emitter weights its emission against the pdf area-light NEE
+            // would have assigned this direction (x selection pdf). Camera
+            // rays, delta chains, and unlisted emitters keep full weight.
+            float w = 1.0f;
+            if (prev_nee_light && depth > 0 && rec.light_id >= 0 &&
+                prev_pdf > 0.0f) {
+                const GPULight& L = lights.lights[rec.light_id];
+                const float pl = light_dir_pdf(L, ray.origin,
+                                               normalize(ray.dir), rec.t) *
+                                 L.sel_pdf;
+                w = (prev_pdf * prev_pdf) /
+                    (prev_pdf * prev_pdf + pl * pl + 1e-20f);
+            }
+            const color c = throughput * rec.mat.emission * w;
+            radiance +=
+                depth == 0 ? c : clamp_contribution(c, clamp_indirect);
+        }
+
+        if (depth == 0 && skip_v0_direct) {
+            // The direct phase already ran sample_direct with these draws;
+            // reproduce only its condition flags for the MIS bookkeeping.
+            prev_nee = env.nee && env.row_cdf != nullptr &&
+                       rec.mat.transmission <= 0.5f;
+            prev_nee_light = env.nee && lights.count > 0 &&
+                             rec.mat.transmission <= 0.5f;
+        } else {
+            bool v_nee = false, v_nee_light = false;
+            sample_direct(rec, ray, world, rng, env, lights, clamp_indirect,
+                          throughput, radiance, v_nee, v_nee_light);
+            prev_nee = v_nee;
+            prev_nee_light = v_nee_light;
+        }
 
         color attenuation;
         Ray scattered;

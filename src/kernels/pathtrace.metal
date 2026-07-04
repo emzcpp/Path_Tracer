@@ -806,126 +806,102 @@ inline float3 clamp_contribution(float3 c, float m) {
     return mx > m ? c * (m / mx) : c;
 }
 
-inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
-                    uint n, device const BVHNode* nodes,
-                    device const GPUTriangle* tris,
-                    device const GPUMaterialArgs* materials,
-                    device const uint* tri_mat,
-                    device const float* env_texels,
-                    device const float* env_row_cdf,
-                    device const float* env_cond_cdf,
-                    device const GPULight* lights,
-                    device const uint* tri_light,
-                    constant MeshUniforms& MU, constant PassUniforms& U,
-                    thread PRNG& rng, uint max_depth) {
-    float3 radiance = float3(0.0f);
-    float3 throughput = float3(1.0f);
-    bool prev_nee = false;   // env NEE ran at the previous path vertex
-    bool prev_nee_light = false;   // area-light NEE ran there too
-    float prev_pdf = 0.0f;   // BSDF pdf of the ray we're now following
+// First-hit evaluation: closest hit across spheres + mesh, surface
+// reconstruction (normal mapping included), material eval, and the light
+// id of the hit emitter. Factored (Session K / ReSTIR Stage 0.5) so the
+// monolithic kernel and the partitioned g_primary phase share ONE
+// implementation — divergence between pipelines is impossible here.
+struct HitInfo {
+    float t;
+    float3 hp, hn;
+    EvalMat mat;
+    bool front;
+    int light_id;
+};
 
-    for (uint depth = 0; depth < max_depth; ++depth) {
-        // Closest hit: spheres first, then the mesh BVH seeded with the
-        // sphere winner's t — mirrors the CPU's Scene ordering (mesh added
-        // last), so tie-breaking is identical on both backends.
-        HitRec rec;
-        const bool hit_s = hit_scene(spheres, n, ro, rd, 1e-3f, INFINITY, rec);
-        float closest = hit_s ? rec.t : INFINITY;
-        TriHit th;
-        bool hit_m = false;
-        if (MU.has_mesh != 0u) {
-            hit_m = bvh_hit(nodes, tris, ro, rd, 1e-3f, closest, th);
-        }
-        if (!hit_s && !hit_m) {
-            // MIS (power heuristic): vertices that ran env NEE weight
-            // their continuation's env hit by the BSDF-sampling share;
-            // camera rays and delta/glass continuations (no NEE there)
-            // see the env in full.
-            float w = 1.0f;
-            if (prev_nee) {
-                const float pe =
-                    env_pdf(env_row_cdf, env_cond_cdf, int(U.env_w),
-                            int(U.env_h), U.env_yaw_norm, rd);
-                w = (prev_pdf * prev_pdf) /
-                    (prev_pdf * prev_pdf + pe * pe + 1e-20f);
+inline bool scene_hit_eval(float3 ro, float3 rd, constant GPUSphere* spheres,
+                           uint n, device const BVHNode* nodes,
+                           device const GPUTriangle* tris,
+                           device const GPUMaterialArgs* materials,
+                           device const uint* tri_mat,
+                           device const uint* tri_light,
+                           constant MeshUniforms& MU, thread HitInfo& out) {
+    HitRec rec;
+    const bool hit_s = hit_scene(spheres, n, ro, rd, 1e-3f, INFINITY, rec);
+    float closest = hit_s ? rec.t : INFINITY;
+    TriHit th;
+    bool hit_m = false;
+    if (MU.has_mesh != 0u) {
+        hit_m = bvh_hit(nodes, tris, ro, rd, 1e-3f, closest, th);
+    }
+    if (!hit_s && !hit_m) return false;
+
+    out.t = closest;
+    if (hit_m) {
+        const GPUTriangle T = tris[th.tri];
+        out.hp = ro + closest * rd;
+        // Sidedness from the GEOMETRIC normal; the interpolated shading
+        // normal only bends the scatter lobe. Mirrors mesh.h.
+        const float3 ng = cross_pt(c3(T.e1), c3(T.e2));
+        out.front = dot(rd, ng) < 0.0f;
+        const float w = 1.0f - th.u - th.v;
+        float3 ns = normalize(w * c3(T.n0) + th.u * c3(T.n1) +
+                              th.v * c3(T.n2));
+        const float u = w * T.u0 + th.u * T.u1 + th.v * T.u2;
+        const float v = w * T.v0 + th.u * T.v1 + th.v * T.v2;
+        const uint mid = tri_mat[th.tri];
+        // Tangent-space normal mapping — mirror of mesh.h. glTF:
+        // LINEAR texels, +Y up, [0,1] -> [-1,1]; bitangent takes the
+        // .w handedness sign.
+        device const GPUMaterialArgs& NM = materials[mid];
+        if (NM.norm_w != 0u) {
+            const float3 tn =
+                sample_bilinear(NM.norm, NM.norm_w, NM.norm_h, u, v);
+            const float3 tN = float3(2.0f * tn.x - 1.0f,
+                                     2.0f * tn.y - 1.0f,
+                                     2.0f * tn.z - 1.0f);
+            float3 tang = w * c3(T.t0) + th.u * c3(T.t1) +
+                          th.v * c3(T.t2);
+            tang = tang - ns * dot(ns, tang);
+            const float tl = length(tang);
+            if (tl > 1e-6f) {
+                tang = tang / tl;
+                const float3 bit = cross_pt(ns, tang) * T.w0;
+                ns = normalize(tN.x * tang + tN.y * bit + tN.z * ns);
             }
-            const float3 c = throughput *
-                             miss_radiance(env_texels, U.env_w, U.env_h,
-                                           U.env_intensity, U.env_yaw_norm,
-                                           rd) *
-                             w;
-            radiance +=
-                (depth == 0u ? c : clamp_contribution(c, U.clamp_indirect));
-            return radiance;
         }
+        out.hn = out.front ? ns : -ns;
+        out.mat = eval_mesh_material(materials, mid, MU, u, v);
+        out.light_id = int(tri_light[th.tri]) - 1;
+    } else {
+        out.hp = rec.p;
+        out.hn = rec.normal;
+        out.front = rec.front_face;
+        out.mat = eval_sphere(spheres[rec.sphere_idx]);
+        out.light_id = int(spheres[rec.sphere_idx].pad[0]) - 1;
+    }
+    return true;
+}
 
-        EvalMat mat;
-        float3 hp, hn;
-        bool front;
-        if (hit_m) {
-            const GPUTriangle T = tris[th.tri];
-            hp = ro + closest * rd;
-            // Sidedness from the GEOMETRIC normal; the interpolated shading
-            // normal only bends the scatter lobe. Mirrors mesh.h.
-            const float3 ng = cross_pt(c3(T.e1), c3(T.e2));
-            front = dot(rd, ng) < 0.0f;
-            const float w = 1.0f - th.u - th.v;
-            float3 ns = normalize(w * c3(T.n0) + th.u * c3(T.n1) +
-                                  th.v * c3(T.n2));
-            const float u = w * T.u0 + th.u * T.u1 + th.v * T.u2;
-            const float v = w * T.v0 + th.u * T.v1 + th.v * T.v2;
-            const uint mid = tri_mat[th.tri];
-            // Tangent-space normal mapping — mirror of mesh.h. glTF:
-            // LINEAR texels, +Y up, [0,1] -> [-1,1]; bitangent takes the
-            // .w handedness sign.
-            device const GPUMaterialArgs& NM = materials[mid];
-            if (NM.norm_w != 0u) {
-                const float3 tn =
-                    sample_bilinear(NM.norm, NM.norm_w, NM.norm_h, u, v);
-                const float3 tN = float3(2.0f * tn.x - 1.0f,
-                                         2.0f * tn.y - 1.0f,
-                                         2.0f * tn.z - 1.0f);
-                float3 tang = w * c3(T.t0) + th.u * c3(T.t1) +
-                              th.v * c3(T.t2);
-                tang = tang - ns * dot(ns, tang);
-                const float tl = length(tang);
-                if (tl > 1e-6f) {
-                    tang = tang / tl;
-                    const float3 bit = cross_pt(ns, tang) * T.w0;
-                    ns = normalize(tN.x * tang + tN.y * bit + tN.z * ns);
-                }
-            }
-            hn = front ? ns : -ns;
-            mat = eval_mesh_material(materials, mid, MU, u, v);
-        } else {
-            hp = rec.p;
-            hn = rec.normal;
-            front = rec.front_face;
-            mat = eval_sphere(spheres[rec.sphere_idx]);
-        }
-
-        {
-            // MIS (power heuristic) — mirror of integrator.h: BSDF hits on
-            // LISTED emitters weight against the area-NEE pdf for this
-            // direction (x selection pdf).
-            int light_id = -1;
-            if (!hit_m) light_id = int(spheres[rec.sphere_idx].pad[0]) - 1;
-            else light_id = int(tri_light[th.tri]) - 1;
-            float w = 1.0f;
-            if (prev_nee_light && depth > 0u && light_id >= 0 &&
-                prev_pdf > 0.0f) {
-                device const GPULight& L = lights[light_id];
-                const float pl =
-                    light_dir_pdf(L, ro, normalize(rd), closest) * L.sel_pdf;
-                w = (prev_pdf * prev_pdf) /
-                    (prev_pdf * prev_pdf + pl * pl + 1e-20f);
-            }
-            const float3 c = throughput * mat.emission * w;
-            radiance += depth == 0u
-                            ? c
-                            : clamp_contribution(c, U.clamp_indirect);
-        }
-
+// Vertex direct lighting — mirror of integrator.h's sample_direct: ONE
+// estimator shared by the monolithic kernel and the partitioned direct
+// phase. Appends into `radiance` in the original order; same rng draws
+// under the same conditions.
+inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
+                          float3 rd, thread PRNG& rng, float3 throughput,
+                          thread float3& radiance,
+                          constant GPUSphere* spheres, uint n,
+                          device const BVHNode* nodes,
+                          device const GPUTriangle* tris,
+                          device const GPUMaterialArgs* materials,
+                          device const float* env_texels,
+                          device const float* env_row_cdf,
+                          device const float* env_cond_cdf,
+                          device const GPULight* lights,
+                          constant MeshUniforms& MU,
+                          constant PassUniforms& U,
+                          thread bool& can_nee_out,
+                          thread bool& can_nee_light_out) {
         // ---- Session H: next-event estimation toward the environment.
         // Deliberately sample the env distribution (the sun), evaluate the
         // BSDF for that direction, and add the contribution if the shadow
@@ -964,7 +940,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                 }
             }
         }
-        prev_nee = can_nee;
+        can_nee_out = can_nee;
 
         // ---- Session J: one area-light sample per vertex — mirror of
         // integrator.h. Same gating as env NEE; power-proportional pick.
@@ -1019,7 +995,111 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                 }
             }
         }
-        prev_nee_light = can_nee_light;
+        can_nee_light_out = can_nee_light;
+}
+
+inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
+                    uint n, device const BVHNode* nodes,
+                    device const GPUTriangle* tris,
+                    device const GPUMaterialArgs* materials,
+                    device const uint* tri_mat,
+                    device const float* env_texels,
+                    device const float* env_row_cdf,
+                    device const float* env_cond_cdf,
+                    device const GPULight* lights,
+                    device const uint* tri_light,
+                    constant MeshUniforms& MU, constant PassUniforms& U,
+                    thread PRNG& rng, uint max_depth,
+                    // Session K: partitioned pipeline injects the primary
+                    // hit (g_primary already found it) and skips vertex-0
+                    // direct lighting (the direct phase computed it with
+                    // the same rng draws).
+                    bool has_pre, thread const HitInfo& pre,
+                    bool skip_v0_direct) {
+    float3 radiance = float3(0.0f);
+    float3 throughput = float3(1.0f);
+    bool prev_nee = false;   // env NEE ran at the previous path vertex
+    bool prev_nee_light = false;   // area-light NEE ran there too
+    float prev_pdf = 0.0f;   // BSDF pdf of the ray we're now following
+
+    for (uint depth = 0; depth < max_depth; ++depth) {
+        // Closest hit: spheres first, then the mesh BVH seeded with the
+        // sphere winner's t — mirrors the CPU's Scene ordering (mesh added
+        // last), so tie-breaking is identical on both backends.
+        HitInfo hi;
+        bool hit_any;
+        if (depth == 0u && has_pre) {
+            hi = pre;
+            hit_any = pre.t >= 0.0f;
+        } else {
+            hit_any = scene_hit_eval(ro, rd, spheres, n, nodes, tris,
+                                     materials, tri_mat, tri_light, MU, hi);
+        }
+        if (!hit_any) {
+            // MIS (power heuristic): vertices that ran env NEE weight
+            // their continuation's env hit by the BSDF-sampling share;
+            // camera rays and delta/glass continuations (no NEE there)
+            // see the env in full.
+            float w = 1.0f;
+            if (prev_nee) {
+                const float pe =
+                    env_pdf(env_row_cdf, env_cond_cdf, int(U.env_w),
+                            int(U.env_h), U.env_yaw_norm, rd);
+                w = (prev_pdf * prev_pdf) /
+                    (prev_pdf * prev_pdf + pe * pe + 1e-20f);
+            }
+            const float3 c = throughput *
+                             miss_radiance(env_texels, U.env_w, U.env_h,
+                                           U.env_intensity, U.env_yaw_norm,
+                                           rd) *
+                             w;
+            radiance +=
+                (depth == 0u ? c : clamp_contribution(c, U.clamp_indirect));
+            return radiance;
+        }
+
+        const EvalMat mat = hi.mat;
+        const float3 hp = hi.hp;
+        const float3 hn = hi.hn;
+        const bool front = hi.front;
+        const float closest = hi.t;
+
+        {
+            // MIS (power heuristic) — mirror of integrator.h: BSDF hits on
+            // LISTED emitters weight against the area-NEE pdf for this
+            // direction (x selection pdf).
+            const int light_id = hi.light_id;
+            float w = 1.0f;
+            if (prev_nee_light && depth > 0u && light_id >= 0 &&
+                prev_pdf > 0.0f) {
+                device const GPULight& L = lights[light_id];
+                const float pl =
+                    light_dir_pdf(L, ro, normalize(rd), closest) * L.sel_pdf;
+                w = (prev_pdf * prev_pdf) /
+                    (prev_pdf * prev_pdf + pl * pl + 1e-20f);
+            }
+            const float3 c = throughput * mat.emission * w;
+            radiance += depth == 0u
+                            ? c
+                            : clamp_contribution(c, U.clamp_indirect);
+        }
+
+        if (depth == 0u && skip_v0_direct) {
+            // The direct phase already ran sample_direct with these draws;
+            // reproduce only its condition flags for the MIS bookkeeping.
+            prev_nee = U.env_nee != 0u && U.env_w != 0u &&
+                       mat.transmission <= 0.5f;
+            prev_nee_light = U.env_nee != 0u && U.light_count > 0u &&
+                             mat.transmission <= 0.5f;
+        } else {
+            bool v_nee = false, v_nee_light = false;
+            sample_direct(hp, hn, mat, rd, rng, throughput, radiance,
+                          spheres, n, nodes, tris, materials, env_texels,
+                          env_row_cdf, env_cond_cdf, lights, MU, U, v_nee,
+                          v_nee_light);
+            prev_nee = v_nee;
+            prev_nee_light = v_nee_light;
+        }
 
         float3 attenuation, new_dir;
         float scatter_pdf = 0.0f;
@@ -1088,12 +1168,173 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
         const float3 rd = c3(U.cam.lower_left) + u * c3(U.cam.horizontal) +
                           v * c3(U.cam.vertical) - ro;
 
+        HitInfo no_pre;
         total += trace(ro, rd, spheres, U.sphere_count, nodes, tris,
                        materials, tri_mat, env_texels, env_row_cdf,
                        env_cond_cdf, lights, tri_light, MU, U, rng,
-                       U.max_depth);
+                       U.max_depth, false, no_pre, false);
     }
     accum[px] += float4(total, 0.0f);
+}
+
+// ============ Session K: partitioned pipeline (ReSTIR Stage 0.5) ========
+// Three phases reproducing the monolithic estimator exactly: g_primary
+// (jitter + first hit -> G-buffer + rng state), direct_v0 (vertex-0
+// direct lighting via the SAME sample_direct and the SAME draws), and
+// indirect_v0 (the path continuation with the first hit injected and
+// vertex-0 direct skipped). Phase order is enforced by command-queue
+// ordering; the rng stream travels through the G-buffer.
+
+inline PRNG pcg_restore(uint lo, uint hi, ulong px) {
+    PRNG r;
+    r.state = (ulong(hi) << 32) | ulong(lo);
+    r.inc = (px << 1) | 1UL;
+    return r;
+}
+
+kernel void g_primary(device GBufferPx* gbuf          [[buffer(0)]],
+                      constant GPUSphere* spheres     [[buffer(1)]],
+                      constant PassUniforms& U        [[buffer(2)]],
+                      device const BVHNode* nodes     [[buffer(3)]],
+                      device const GPUTriangle* tris  [[buffer(4)]],
+                      device const GPUMaterialArgs* materials [[buffer(5)]],
+                      device const uint* tri_mat      [[buffer(6)]],
+                      device const uint* tri_light    [[buffer(7)]],
+                      constant MeshUniforms& MU       [[buffer(8)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    const uint py = gid.y + U.row_offset;
+    if (py >= U.height) return;
+    const ulong px = ulong(py) * U.width + gid.x;
+    const float inv_w = 1.0f / float(U.width);
+    const float inv_h = 1.0f / float(U.height);
+    const ulong pass = ulong(U.pass_base);
+    PRNG rng = pcg_init(mix64(px ^ (pass << 32)), px);
+    const float u = (float(gid.x) + pcg_next_float(rng)) * inv_w;
+    const float v = 1.0f - (float(py) + pcg_next_float(rng)) * inv_h;
+    const float3 ro = c3(U.cam.origin);
+    const float3 rd = c3(U.cam.lower_left) + u * c3(U.cam.horizontal) +
+                      v * c3(U.cam.vertical) - ro;
+
+    GBufferPx g;
+    HitInfo hi;
+    if (scene_hit_eval(ro, rd, spheres, U.sphere_count, nodes, tris,
+                       materials, tri_mat, tri_light, MU, hi)) {
+        g.pos = pt_float3{hi.hp.x, hi.hp.y, hi.hp.z};
+        g.t = hi.t;
+        g.normal = pt_float3{hi.hn.x, hi.hn.y, hi.hn.z};
+        g.flags = hi.front ? 1u : 0u;
+        g.base_color = pt_float3{hi.mat.base_color.x, hi.mat.base_color.y,
+                                 hi.mat.base_color.z};
+        g.metallic = hi.mat.metallic;
+        g.emission = pt_float3{hi.mat.emission.x, hi.mat.emission.y,
+                               hi.mat.emission.z};
+        g.ior = hi.mat.ior;
+        g.roughness = hi.mat.roughness;
+        g.transmission = hi.mat.transmission;
+        g.light_id_p1 = uint(hi.light_id + 1);
+    } else {
+        g.t = -1.0f;
+        g.pos = pt_float3{0.0f, 0.0f, 0.0f};
+        g.normal = pt_float3{0.0f, 1.0f, 0.0f};
+        g.flags = 0u;
+        g.base_color = pt_float3{0.0f, 0.0f, 0.0f};
+        g.metallic = 0.0f;
+        g.emission = pt_float3{0.0f, 0.0f, 0.0f};
+        g.ior = 1.5f;
+        g.roughness = 1.0f;
+        g.transmission = 0.0f;
+        g.light_id_p1 = 0u;
+    }
+    g.rd = pt_float3{rd.x, rd.y, rd.z};
+    g.rng_lo = uint(rng.state & 0xffffffffUL);
+    g.rng_hi = uint(rng.state >> 32);
+    gbuf[px] = g;
+}
+
+inline HitInfo hitinfo_from_gbuf(thread const GBufferPx& g) {
+    HitInfo hi;
+    hi.t = g.t;
+    hi.hp = c3(g.pos);
+    hi.hn = c3(g.normal);
+    hi.front = (g.flags & 1u) != 0u;
+    hi.mat.base_color = c3(g.base_color);
+    hi.mat.emission = c3(g.emission);
+    hi.mat.metallic = g.metallic;
+    hi.mat.roughness = g.roughness;
+    hi.mat.ior = g.ior;
+    hi.mat.transmission = g.transmission;
+    hi.light_id = int(g.light_id_p1) - 1;
+    return hi;
+}
+
+kernel void direct_v0(device float4* accum            [[buffer(0)]],
+                      constant GPUSphere* spheres     [[buffer(1)]],
+                      constant PassUniforms& U        [[buffer(2)]],
+                      device const BVHNode* nodes     [[buffer(3)]],
+                      device const GPUTriangle* tris  [[buffer(4)]],
+                      device const GPUMaterialArgs* materials [[buffer(5)]],
+                      device GBufferPx* gbuf          [[buffer(6)]],
+                      constant MeshUniforms& MU       [[buffer(8)]],
+                      device const float* env_texels  [[buffer(10)]],
+                      device const float* env_row_cdf [[buffer(11)]],
+                      device const float* env_cond_cdf [[buffer(12)]],
+                      device const GPULight* lights   [[buffer(13)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    const uint py = gid.y + U.row_offset;
+    if (py >= U.height) return;
+    const ulong px = ulong(py) * U.width + gid.x;
+    GBufferPx g = gbuf[px];
+    if (g.t < 0.0f) return;
+    const HitInfo hi = hitinfo_from_gbuf(g);
+    PRNG rng = pcg_restore(g.rng_lo, g.rng_hi, px);
+
+    float3 radiance = float3(0.0f);
+    bool v_nee = false, v_nee_light = false;
+    sample_direct(hi.hp, hi.hn, hi.mat, c3(g.rd), rng, float3(1.0f),
+                  radiance, spheres, U.sphere_count, nodes, tris, materials,
+                  env_texels, env_row_cdf, env_cond_cdf, lights, MU, U,
+                  v_nee, v_nee_light);
+    accum[px] += float4(radiance, 0.0f);
+
+    gbuf[px].rng_lo = uint(rng.state & 0xffffffffUL);
+    gbuf[px].rng_hi = uint(rng.state >> 32);
+}
+
+kernel void indirect_v0(device float4* accum           [[buffer(0)]],
+                        constant GPUSphere* spheres    [[buffer(1)]],
+                        constant PassUniforms& U       [[buffer(2)]],
+                        device const BVHNode* nodes    [[buffer(3)]],
+                        device const GPUTriangle* tris [[buffer(4)]],
+                        device const GPUMaterialArgs* materials [[buffer(5)]],
+                        device const GBufferPx* gbuf   [[buffer(6)]],
+                        device const uint* tri_mat     [[buffer(7)]],
+                        constant MeshUniforms& MU      [[buffer(8)]],
+                        device const uint* tri_light   [[buffer(9)]],
+                        device const float* env_texels [[buffer(10)]],
+                        device const float* env_row_cdf [[buffer(11)]],
+                        device const float* env_cond_cdf [[buffer(12)]],
+                        device const GPULight* lights  [[buffer(13)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    const uint py = gid.y + U.row_offset;
+    if (py >= U.height) return;
+    const ulong px = ulong(py) * U.width + gid.x;
+    const GBufferPx g = gbuf[px];
+    PRNG rng = pcg_restore(g.rng_lo, g.rng_hi, px);
+    const float3 rd = c3(g.rd);
+
+    if (g.t < 0.0f) {
+        // Primary miss: full env, exactly the monolithic depth-0 branch.
+        const float3 c = miss_radiance(env_texels, U.env_w, U.env_h,
+                                       U.env_intensity, U.env_yaw_norm, rd);
+        accum[px] += float4(c, 0.0f);
+        return;
+    }
+    const HitInfo pre = hitinfo_from_gbuf(g);
+    const float3 c =
+        trace(c3(g.pos), rd, spheres, U.sphere_count, nodes, tris, materials,
+              tri_mat, env_texels, env_row_cdf, env_cond_cdf, lights,
+              tri_light, MU, U, rng, U.max_depth, true, pre, true);
+    accum[px] += float4(c, 0.0f);
 }
 
 // accum/passes -> gamma 1/2.2 -> drawable. Nearest-neighbor coordinate

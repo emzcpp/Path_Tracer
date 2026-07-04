@@ -139,6 +139,22 @@ struct GPULight {
     float sel_pdf;      pt_uint pad0;
 };
 
+// Session K (ReSTIR Stage 0.5): per-pixel primary-hit record. Written by
+// the g_primary phase, consumed by the direct phase (vertex-0 lighting)
+// and the indirect continuation. rng_lo/hi carry the PCG stream state
+// across phases so every draw lands exactly where the monolithic kernel
+// puts it (the stream increment derives from the pixel id). t < 0 marks
+// a primary miss.
+struct GBufferPx {
+    pt_float3 pos;        float t;
+    pt_float3 normal;     pt_uint flags;      // bit0: front_face
+    pt_float3 rd;         float roughness;    // primary ray direction
+    pt_float3 base_color; float metallic;
+    pt_float3 emission;   float ior;
+    float transmission;   pt_uint rng_lo, rng_hi;
+    pt_uint light_id_p1;                      // hit emitter id + 1 (0 = none)
+};
+
 #ifndef __METAL_VERSION__
 static_assert(sizeof(pt_float3) == 12, "pt_float3 must be 12 bytes");
 static_assert(sizeof(GPUSphere) == 64, "GPUSphere must be one cacheline");
@@ -149,6 +165,7 @@ static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");
 static_assert(sizeof(GPUTriangle) == 144, "GPUTriangle must be nine 16B rows");
 static_assert(sizeof(MeshUniforms) == 32, "MeshUniforms layout drifted");
 static_assert(sizeof(GPULight) == 96, "GPULight must be six 16B rows");
+static_assert(sizeof(GBufferPx) == 96, "GBufferPx must be six 16B rows");
 static_assert(sizeof(GPUMaterialArgs) == 64,
               "GPUMaterialArgs must be four 8B pointers + eight uints");
 #endif
