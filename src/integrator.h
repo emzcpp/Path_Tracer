@@ -389,6 +389,137 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
         can_nee_light_out = can_nee_light;
 }
 
+// ---- Session K Stage 1: RIS direct lighting (partitioned pipeline) ----
+// Weighted reservoir sampling over M candidates per light slot. The
+// candidates come from the SAME source distributions plain NEE uses (env
+// CDF / power-weighted light pick); each is weighted target/source with
+// target = luminance of the unshadowed MIS-weighted contribution; ONE
+// shadow ray resolves the winner with the RIS factor w_sum/(M * target).
+// The BSDF strategy stays in the path continuation exactly as validated
+// — RIS only sharpens the light-slot estimators, so the MIS partition of
+// unity is untouched and unbiasedness follows for any positive target.
+// Mirrored in pathtrace.metal.
+inline void sample_direct_ris(const HitRecord& rec, const Ray& ray,
+                              const Hittable& world, RNG& rng,
+                              const EnvLookup& env,
+                              const LightsLookup& lights, int M,
+                              float clamp_indirect, color& radiance) {
+    const bool can_env = env.nee && env.row_cdf != nullptr &&
+                         rec.mat.transmission <= 0.5f;
+    const bool can_area = env.nee && lights.count > 0 &&
+                          rec.mat.transmission <= 0.5f;
+    const vec3 vdir = -normalize(ray.dir);
+
+    // --- env slot ---
+    if (can_env) {
+        float wsum = 0.0f;
+        vec3 win_dir(0.0f, 0.0f, 1.0f);
+        color win_c(0.0f);
+        float win_mis = 0.0f, win_that = 0.0f;
+        for (int i = 0; i < M; ++i) {
+            const float u1 = rng.next_float();
+            const float u2 = rng.next_float();
+            const float ur = rng.next_float();
+            float pl = 0.0f;
+            const vec3 ldir = env_sample(env, u1, u2, pl);
+            float w_i = 0.0f, that = 0.0f, w_mis = 0.0f;
+            color contrib(0.0f);
+            if (pl > 1e-12f) {
+                float pb = 0.0f;
+                const color f = eval_bsdf(rec.mat, rec, vdir, ldir, pb);
+                const float nl = dot(rec.normal, ldir);
+                if (nl > 1e-6f &&
+                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
+                    contrib =
+                        f * nl * miss_radiance(env, Ray(rec.p, ldir));
+                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
+                    that = luminance(contrib * w_mis);
+                    w_i = that / pl;
+                }
+            }
+            wsum += w_i;
+            if (w_i > 0.0f && ur < w_i / wsum) {
+                win_dir = ldir;
+                win_c = contrib;
+                win_mis = w_mis;
+                win_that = that;
+            }
+        }
+        if (wsum > 0.0f && win_that > 0.0f) {
+            if (!world.occluded(Ray(rec.p, win_dir), 1e-3f,
+                                std::numeric_limits<float>::infinity())) {
+                const color c =
+                    win_c * win_mis * (wsum / (float(M) * win_that));
+                radiance += clamp_contribution(c, clamp_indirect);
+            }
+        }
+    }
+
+    // --- area-light slot ---
+    if (can_area) {
+        float wsum = 0.0f;
+        vec3 win_dir(0.0f, 0.0f, 1.0f);
+        color win_c(0.0f);
+        float win_mis = 0.0f, win_that = 0.0f, win_t = 0.0f;
+        for (int i = 0; i < M; ++i) {
+            const float us = rng.next_float();
+            const float u1 = rng.next_float();
+            const float u2 = rng.next_float();
+            const float ur = rng.next_float();
+            const int li = light_pick(lights.lights, lights.count, us);
+            const GPULight& L = lights.lights[li];
+            float pdf_sa = 0.0f, t_light = 0.0f;
+            float bu = 0.0f, bv = 0.0f;
+            const vec3 ldir =
+                L.kind == 0u
+                    ? sample_sphere_light(L, rec.p, u1, u2, pdf_sa, t_light)
+                    : sample_tri_light(L, rec.p, u1, u2, pdf_sa, t_light,
+                                       bu, bv);
+            float w_i = 0.0f, that = 0.0f, w_mis = 0.0f;
+            color contrib(0.0f);
+            const float pl = pdf_sa * L.sel_pdf;
+            if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
+                float pb = 0.0f;
+                const color f = eval_bsdf(rec.mat, rec, vdir, ldir, pb);
+                const float nl = dot(rec.normal, ldir);
+                if (nl > 1e-6f &&
+                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
+                    color Le(L.emission.x, L.emission.y, L.emission.z);
+                    if (L.kind == 1u) {
+                        const float b0 = 1.0f - bu - bv;
+                        const float tu = b0 * L.u0 + bu * L.u1 + bv * L.u2;
+                        const float tv = b0 * L.v0 + bu * L.v1 + bv * L.v2;
+                        const MeshMaterial& mm =
+                            lights.mesh->materials[L.mat_id];
+                        Le = sample_bilinear(mm.emissive, tu, tv) *
+                             lights.mesh->emissive_scale;
+                    }
+                    contrib = f * nl * Le;
+                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
+                    that = luminance(contrib * w_mis);
+                    w_i = that / pl;
+                }
+            }
+            wsum += w_i;
+            if (w_i > 0.0f && ur < w_i / wsum) {
+                win_dir = ldir;
+                win_c = contrib;
+                win_mis = w_mis;
+                win_that = that;
+                win_t = t_light;
+            }
+        }
+        if (wsum > 0.0f && win_that > 0.0f) {
+            if (!world.occluded(Ray(rec.p, win_dir), 1e-3f,
+                                win_t * (1.0f - 1e-3f))) {
+                const color c =
+                    win_c * win_mis * (wsum / (float(M) * win_that));
+                radiance += clamp_contribution(c, clamp_indirect);
+            }
+        }
+    }
+}
+
 inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                    const EnvLookup& env, const LightsLookup& lights,
                    float clamp_indirect,

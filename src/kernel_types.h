@@ -60,7 +60,9 @@ struct PassUniforms {
     // Session J: number of area lights (emissive spheres/triangles) in the
     // light list; 0 = none (area NEE off).
     pt_uint light_count;
-    pt_uint pad_h1, pad_h2;
+    // Session K: RIS candidate count per light slot (partitioned pipeline).
+    pt_uint restir_m;
+    pt_uint pad_h2;
 };
 
 struct ResolveUniforms {

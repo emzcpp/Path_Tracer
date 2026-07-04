@@ -1185,6 +1185,142 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
 // vertex-0 direct skipped). Phase order is enforced by command-queue
 // ordering; the rng stream travels through the G-buffer.
 
+// ---- Session K Stage 1: RIS direct lighting — mirror of integrator.h.
+inline void sample_direct_ris(float3 hp, float3 hn,
+                              thread const EvalMat& mat, float3 rd,
+                              thread PRNG& rng, int M,
+                              thread float3& radiance,
+                              constant GPUSphere* spheres, uint n,
+                              device const BVHNode* nodes,
+                              device const GPUTriangle* tris,
+                              device const GPUMaterialArgs* materials,
+                              device const float* env_texels,
+                              device const float* env_row_cdf,
+                              device const float* env_cond_cdf,
+                              device const GPULight* lights,
+                              constant MeshUniforms& MU,
+                              constant PassUniforms& U) {
+    const bool can_env = U.env_nee != 0u && U.env_w != 0u &&
+                         mat.transmission <= 0.5f;
+    const bool can_area = U.env_nee != 0u && U.light_count > 0u &&
+                          mat.transmission <= 0.5f;
+    const float3 vdir = -normalize(rd);
+
+    // --- env slot ---
+    if (can_env) {
+        float wsum = 0.0f;
+        float3 win_dir = float3(0.0f, 0.0f, 1.0f);
+        float3 win_c = float3(0.0f);
+        float win_mis = 0.0f, win_that = 0.0f;
+        for (int i = 0; i < M; ++i) {
+            const float u1 = pcg_next_float(rng);
+            const float u2 = pcg_next_float(rng);
+            const float ur = pcg_next_float(rng);
+            float pl = 0.0f;
+            const float3 ldir =
+                env_sample(env_row_cdf, env_cond_cdf, int(U.env_w),
+                           int(U.env_h), U.env_yaw_norm, u1, u2, pl);
+            float w_i = 0.0f, that = 0.0f, w_mis = 0.0f;
+            float3 contrib = float3(0.0f);
+            if (pl > 1e-12f) {
+                float pb = 0.0f;
+                const float3 f = eval_bsdf(mat, hn, vdir, ldir, pb);
+                const float nl = dot(hn, ldir);
+                if (nl > 1e-6f &&
+                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
+                    contrib = f * nl *
+                              miss_radiance(env_texels, U.env_w, U.env_h,
+                                            U.env_intensity, U.env_yaw_norm,
+                                            ldir);
+                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
+                    that = luminance(contrib * w_mis);
+                    w_i = that / pl;
+                }
+            }
+            wsum += w_i;
+            if (w_i > 0.0f && ur < w_i / wsum) {
+                win_dir = ldir;
+                win_c = contrib;
+                win_mis = w_mis;
+                win_that = that;
+            }
+        }
+        if (wsum > 0.0f && win_that > 0.0f) {
+            if (!occluded_scene(hp, win_dir, INFINITY, spheres, n, nodes,
+                                tris, MU)) {
+                const float3 c =
+                    win_c * win_mis * (wsum / (float(M) * win_that));
+                radiance += clamp_contribution(c, U.clamp_indirect);
+            }
+        }
+    }
+
+    // --- area-light slot ---
+    if (can_area) {
+        float wsum = 0.0f;
+        float3 win_dir = float3(0.0f, 0.0f, 1.0f);
+        float3 win_c = float3(0.0f);
+        float win_mis = 0.0f, win_that = 0.0f, win_t = 0.0f;
+        for (int i = 0; i < M; ++i) {
+            const float us = pcg_next_float(rng);
+            const float u1 = pcg_next_float(rng);
+            const float u2 = pcg_next_float(rng);
+            const float ur = pcg_next_float(rng);
+            const int li = light_pick(lights, int(U.light_count), us);
+            device const GPULight& L = lights[li];
+            float pdf_sa = 0.0f, t_light = 0.0f;
+            float bu = 0.0f, bv = 0.0f;
+            const float3 ldir =
+                L.kind == 0u
+                    ? sample_sphere_light(L, hp, u1, u2, pdf_sa, t_light)
+                    : sample_tri_light(L, hp, u1, u2, pdf_sa, t_light, bu,
+                                       bv);
+            float w_i = 0.0f, that = 0.0f, w_mis = 0.0f;
+            float3 contrib = float3(0.0f);
+            const float pl = pdf_sa * L.sel_pdf;
+            if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
+                float pb = 0.0f;
+                const float3 f = eval_bsdf(mat, hn, vdir, ldir, pb);
+                const float nl = dot(hn, ldir);
+                if (nl > 1e-6f &&
+                    (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
+                    float3 Le = c3(L.emission);
+                    if (L.kind == 1u) {
+                        const float b0 = 1.0f - bu - bv;
+                        const float tu = b0 * L.u0 + bu * L.u1 + bv * L.u2;
+                        const float tv = b0 * L.v0 + bu * L.v1 + bv * L.v2;
+                        device const GPUMaterialArgs& LM =
+                            materials[L.mat_id];
+                        Le = sample_bilinear(LM.emis, LM.emis_w, LM.emis_h,
+                                             tu, tv) *
+                             MU.emissive_scale;
+                    }
+                    contrib = f * nl * Le;
+                    w_mis = (pl * pl) / (pl * pl + pb * pb + 1e-20f);
+                    that = luminance(contrib * w_mis);
+                    w_i = that / pl;
+                }
+            }
+            wsum += w_i;
+            if (w_i > 0.0f && ur < w_i / wsum) {
+                win_dir = ldir;
+                win_c = contrib;
+                win_mis = w_mis;
+                win_that = that;
+                win_t = t_light;
+            }
+        }
+        if (wsum > 0.0f && win_that > 0.0f) {
+            if (!occluded_scene(hp, win_dir, win_t * (1.0f - 1e-3f),
+                                spheres, n, nodes, tris, MU)) {
+                const float3 c =
+                    win_c * win_mis * (wsum / (float(M) * win_that));
+                radiance += clamp_contribution(c, U.clamp_indirect);
+            }
+        }
+    }
+}
+
 inline PRNG pcg_restore(uint lo, uint hi, ulong px) {
     PRNG r;
     r.state = (ulong(hi) << 32) | ulong(lo);
@@ -1289,11 +1425,10 @@ kernel void direct_v0(device float4* accum            [[buffer(0)]],
     PRNG rng = pcg_restore(g.rng_lo, g.rng_hi, px);
 
     float3 radiance = float3(0.0f);
-    bool v_nee = false, v_nee_light = false;
-    sample_direct(hi.hp, hi.hn, hi.mat, c3(g.rd), rng, float3(1.0f),
-                  radiance, spheres, U.sphere_count, nodes, tris, materials,
-                  env_texels, env_row_cdf, env_cond_cdf, lights, MU, U,
-                  v_nee, v_nee_light);
+    sample_direct_ris(hi.hp, hi.hn, hi.mat, c3(g.rd), rng,
+                      int(U.restir_m), radiance, spheres, U.sphere_count,
+                      nodes, tris, materials, env_texels, env_row_cdf,
+                      env_cond_cdf, lights, MU, U);
     accum[px] += float4(radiance, 0.0f);
 
     gbuf[px].rng_lo = uint(rng.state & 0xffffffffUL);

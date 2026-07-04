@@ -57,6 +57,8 @@ struct RenderSettings {
     // scaffolding; Stage 0.5 reproduces plain NEE+MIS through it),
     // 0 = the monolithic integrator.
     int restir = 0;
+    // RIS candidates per light slot (env / area) at the primary vertex.
+    int restir_m = 8;
 
     // Execution
     int thread_count = 0;         // 0 = use all hardware threads

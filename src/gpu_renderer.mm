@@ -207,6 +207,7 @@ struct GpuRenderer::Impl {
         u.clamp_indirect = settings.clamp_indirect;
         u.env_nee = pt_uint(settings.env_nee != 0 ? 1 : 0);
         u.light_count = light_count;
+        u.restir_m = pt_uint(settings.restir_m > 0 ? settings.restir_m : 1);
 
         if (settings.restir != 0) {
             // Partitioned: K sequential (g_primary -> direct -> indirect)

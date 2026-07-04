@@ -207,10 +207,9 @@ void ProgressiveRenderer::render_pass_partitioned() {
                 (std::uint64_t(g.rng_hi) << 32) | std::uint64_t(g.rng_lo);
             const Ray pray(rec.p, vec3(g.rd.x, g.rd.y, g.rd.z));
             color rad(0.0f);
-            bool v_nee = false, v_nee_light = false;
-            sample_direct(rec, pray, scene_, rng, env_, lights_,
-                          settings_.clamp_indirect, color(1.0f), rad, v_nee,
-                          v_nee_light);
+            sample_direct_ris(rec, pray, scene_, rng, env_, lights_,
+                              settings_.restir_m, settings_.clamp_indirect,
+                              rad);
             accum_row[x] += rad;
             g.rng_lo = pt_uint(rng.state & 0xffffffffULL);
             g.rng_hi = pt_uint(rng.state >> 32);
