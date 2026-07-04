@@ -59,15 +59,25 @@ struct RenderSettings {
     int restir = 0;
     // RIS candidates per light slot (env / area) at the primary vertex.
     int restir_m = 8;
-    // Stage 2: temporal reservoir reuse (within one accumulation run —
-    // reservoirs reset with the accumulation through the central reset,
-    // which is the ghosting guarantee). M-capped at 20x.
-    int restir_temporal = 1;
+    // Stage 2: temporal reservoir reuse. DEFAULT OFF pending the
+    // prev-surface balance correction: the Mtot-style temporal combine
+    // biases +5.7% on scenes with emitters very close to surfaces (the
+    // target mismatch under sub-pixel jitter is large at close range;
+    // benign scenes measure ~0.0%). The fix needs last frame's G-buffer
+    // so history can carry proper balance-heuristic weights — scoped for
+    // a follow-up session. Toggle lives in the panel for A/B.
+    int restir_temporal = 0;
     // Stage 3: spatial reservoir reuse (K random neighbors per frame)
     // combined with Talbot balance-heuristic MIS weights — unbiased for
     // any sampler-support overlap (the earlier 1/Z counting variant
     // measured +1.3% bias from support asymmetry and was replaced).
     int restir_spatial = 1;
+    int restir_k = 3;          // spatial neighbors (max 3)
+    int restir_radius = 16;    // spatial radius, pixels
+    int restir_mcap = 20;      // temporal history cap, x candidate count
+    // Reservoir + G-buffer memory guard: above this budget the viewer
+    // clamps resolution scale instead of silently allocating (~304 B/px).
+    int restir_mem_budget_mb = 1500;
 
     // Execution
     int thread_count = 0;         // 0 = use all hardware threads

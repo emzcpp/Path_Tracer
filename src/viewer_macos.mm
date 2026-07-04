@@ -989,6 +989,18 @@ void render_thread_main(ViewerCore& core) {
         frame_selected(*self.core);
         return;
     }
+    if (event.keyCode == 5) {    // G — toggle ReSTIR DI
+        if (self.core->use_gpu) {
+            self.core->settings.restir = self.core->settings.restir ? 0 : 1;
+            if (self.core->gpu) self.core->gpu->set_restir(self.core->settings);
+            self.core->mark_scene_dirty();
+            std::printf("estimator: %s\n", self.core->settings.restir
+                                                ? "ReSTIR DI"
+                                                : "NEE+MIS");
+            std::fflush(stdout);
+        }
+        return;
+    }
     if (event.keyCode == 9) {    // V — cycle fast-nav: off / solid / wire
         if (self.core->use_gpu) {
             self.core->fastnav = (self.core->fastnav + 1) % 3;
@@ -1383,9 +1395,36 @@ void render_thread_main(ViewerCore& core) {
     // out at the scaled size. FINAL never drops below full res but does
     // follow the slider upward. The dims change flows through the same
     // reset machinery as everything else; no cost at 1x.
-    const float scale = final_mode
-        ? std::fmax(1.0f, core_->interactive_scale)
-        : core_->interactive_scale;
+    float scale = final_mode ? std::fmax(1.0f, core_->interactive_scale)
+                             : core_->interactive_scale;
+    // ReSTIR memory guard (never silent): reservoirs + G-buffer cost
+    // ~304 B/px; above the budget, clamp the resolution scale instead of
+    // silently allocating gigabytes.
+    if (core_->settings.restir != 0) {
+        const double per_px = double(sizeof(GBufferPx)) +
+                              2.0 * sizeof(ReSTIRPixel) + 4.0 * sizeof(float);
+        const double budget_px =
+            double(core_->settings.restir_mem_budget_mb) * 1024.0 * 1024.0 /
+            per_px;
+        const double want_px = double(core_->settings.width) * scale *
+                               double(core_->settings.height) * scale;
+        if (want_px > budget_px) {
+            const float smax = float(std::sqrt(
+                budget_px / (double(core_->settings.width) *
+                             core_->settings.height)));
+            const float clamped = std::fmax(0.25f, smax);
+            if (clamped < scale) {
+                std::printf("ReSTIR memory guard: scale %.2fx -> %.2fx "
+                            "(budget %d MB; raise restir_mem_budget_mb to "
+                            "override)\n",
+                            scale, clamped,
+                            core_->settings.restir_mem_budget_mb);
+                std::fflush(stdout);
+                core_->interactive_scale = clamped;
+                scale = final_mode ? std::fmax(1.0f, clamped) : clamped;
+            }
+        }
+    }
     const int base_w = std::max(64, int(core_->settings.width * scale)) & ~1;
     const int base_h = std::max(36, int(core_->settings.height * scale)) & ~1;
     const int w = moving ? base_w / core_->settings.preview_divisor : base_w;
@@ -1491,7 +1530,19 @@ void render_thread_main(ViewerCore& core) {
                     const double budget_px =
                         double(budget) * 1.0e6 / nsPerPxPass_;
                     const double full = double(w) * double(h);
-                    if (cursor > 0) {
+                    if (core_->settings.restir != 0) {
+                        // ReSTIR frames are whole-frame only: spatial
+                        // reuse reads neighbor rows across the frame, so
+                        // a row slice would read cross-slice-stale
+                        // reservoirs. The four phases are separate
+                        // dispatches, so the GPU still preempts between
+                        // them even when a frame overruns the budget.
+                        int k = int(std::max(1.0, budget_px / full));
+                        k = std::min(k, kcap);
+                        if (target != INT_MAX)
+                            k = std::min(k, target - gpu.passes());
+                        work.passes = std::max(1, k);
+                    } else if (cursor > 0) {
                         // Finish the in-progress pass first.
                         work.passes = 1;
                         work.row_start = cursor;
@@ -1638,6 +1689,23 @@ void render_thread_main(ViewerCore& core) {
         ImGui::Text("%d spp · %.0f passes/s · %.1fs", gpu.passes(), gpuRate_,
                     accum_s);
     }
+    // Estimator + ReSTIR memory telemetry (the design-review commitment).
+    if (core_->settings.restir != 0) {
+        const double px = double(gpu.width()) * gpu.height();
+        const double mb =
+            px *
+            (sizeof(GBufferPx) + 2.0 * sizeof(ReSTIRPixel) +
+             4.0 * sizeof(float)) /
+            (1024.0 * 1024.0);
+        ImGui::Text("estimator: ReSTIR (M=%d%s%s) · buffers %.0f MB",
+                    core_->settings.restir_m,
+                    core_->settings.restir_temporal ? " +T" : "",
+                    core_->settings.restir_spatial ? " +S" : "", mb);
+    } else {
+        ImGui::Text("estimator: %s",
+                    core_->settings.env_nee ? "NEE+MIS" : "brute force");
+    }
+
     // Session G telemetry: per-CB GPU time vs budget, main-thread tick
     // time, and the shape of the last submitted slice.
     if (gpuMsEma_ > 0.0f) {
@@ -1970,6 +2038,48 @@ void render_thread_main(ViewerCore& core) {
                 "Samples the HDRI's bright regions (the sun) directly with\n"
                 "shadow rays every bounce — same converged image as brute\n"
                 "force, far less speckle. Off = brute-force ground truth.");
+        }
+    }
+    {
+        bool changed = false;
+        bool r_on = s.restir != 0;
+        if (ImGui::Checkbox("ReSTIR DI (G)", &r_on)) {
+            s.restir = r_on ? 1 : 0;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Reservoir-based direct lighting: audition M light samples\n"
+                "per slot, reuse winners across frames and neighbors. Same\n"
+                "converged image as NEE+MIS, far cleaner with many lights.");
+        }
+        if (r_on) {
+            changed |= ImGui::SliderInt("candidates M", &s.restir_m, 1, 32);
+            bool t_on = s.restir_temporal != 0;
+            if (ImGui::Checkbox("temporal reuse", &t_on)) {
+                s.restir_temporal = t_on ? 1 : 0;
+                changed = true;
+            }
+            ImGui::SameLine();
+            bool sp_on = s.restir_spatial != 0;
+            if (ImGui::Checkbox("spatial reuse", &sp_on)) {
+                s.restir_spatial = sp_on ? 1 : 0;
+                changed = true;
+            }
+            if (t_on) {
+                changed |=
+                    ImGui::SliderInt("M-cap x", &s.restir_mcap, 5, 60);
+            }
+            if (sp_on) {
+                changed |=
+                    ImGui::SliderInt("neighbors", &s.restir_k, 0, 3);
+                changed |= ImGui::SliderInt("radius px", &s.restir_radius,
+                                            4, 64);
+            }
+        }
+        if (changed) {
+            gpu.set_restir(s);
+            dirty = true;
         }
     }
     ImGui::Checkbox("firefly clamp (preview only)", &core_->preview_clamp_on);

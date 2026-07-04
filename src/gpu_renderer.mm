@@ -218,18 +218,30 @@ struct GpuRenderer::Impl {
         u.restir_m = pt_uint(settings.restir_m > 0 ? settings.restir_m : 1);
         u.restir_temporal = pt_uint(settings.restir_temporal != 0 ? 1 : 0);
         u.restir_spatial = pt_uint(settings.restir_spatial != 0 ? 1 : 0);
+        u.restir_k = pt_uint(
+            settings.restir_k < 0
+                ? 0
+                : (settings.restir_k > PT_RESTIR_NEIGHBORS
+                       ? PT_RESTIR_NEIGHBORS
+                       : settings.restir_k));
+        u.restir_radius =
+            pt_uint(settings.restir_radius > 1 ? settings.restir_radius : 1);
+        u.restir_mcap =
+            pt_uint(settings.restir_mcap > 1 ? settings.restir_mcap : 1);
 
         if (settings.restir != 0) {
-            // Partitioned: K sequential (g_primary -> direct -> indirect)
-            // triples, one per pass — phases are pixel-local, so a row
-            // slice runs all three for its rows in order.
-            const int kcount = slice ? 1 : count;
+            // Partitioned pipeline: WHOLE FRAMES ONLY. Spatial reuse reads
+            // neighbor rows across the frame; honoring a row slice here
+            // would mix this frame's reservoirs with last frame's across
+            // the slice boundary. Slice requests are expanded (the viewer
+            // controller never sends them; this is defense in depth).
+            const int kcount = count > 0 ? count : 1;
             for (int k = 0; k < kcount; ++k) {
                 PassUniforms pu = u;
-                pu.pass_base = pt_uint(passes + (slice ? 0 : k));
+                pu.pass_base = pt_uint(passes + k);
                 pu.pass_count = 1;
-                const MTLSize grid =
-                    MTLSizeMake(w, slice ? row_count : h, 1);
+                pu.row_offset = 0;
+                const MTLSize grid = MTLSizeMake(w, h, 1);
                 id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
                 [e setComputePipelineState:g_primary_pso];
                 [e setBuffer:gbuf offset:0 atIndex:0];
@@ -313,15 +325,8 @@ struct GpuRenderer::Impl {
                 [e dispatchThreads:grid threadsPerThreadgroup:tg_accum];
                 [e endEncoding];
             }
-            if (slice) {
-                cursor = row_start + row_count;
-                if (cursor >= h) {
-                    passes += 1;
-                    cursor = 0;
-                }
-            } else {
-                passes += count;
-            }
+            passes += kcount;
+            cursor = 0;
             return;
         }
 
@@ -889,6 +894,16 @@ void GpuRenderer::set_clamp_indirect(float clamp) {
 
 void GpuRenderer::set_env_nee(bool on) {
     impl_->settings.env_nee = on ? 1 : 0;
+}
+
+void GpuRenderer::set_restir(const RenderSettings& s) {
+    impl_->settings.restir = s.restir;
+    impl_->settings.restir_m = s.restir_m;
+    impl_->settings.restir_temporal = s.restir_temporal;
+    impl_->settings.restir_spatial = s.restir_spatial;
+    impl_->settings.restir_k = s.restir_k;
+    impl_->settings.restir_radius = s.restir_radius;
+    impl_->settings.restir_mcap = s.restir_mcap;
 }
 
 void GpuRenderer::update_spheres(const std::vector<GPUSphere>& spheres) {

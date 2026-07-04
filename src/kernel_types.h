@@ -65,7 +65,10 @@ struct PassUniforms {
     pt_uint restir_m;
     pt_uint restir_temporal;
     pt_uint restir_spatial;
-    pt_uint pad_k0, pad_k1, pad_k2;
+    // Consolidation session: the remaining ReSTIR knobs, made runtime.
+    pt_uint restir_k;        // spatial neighbors (<= PT_RESTIR_NEIGHBORS)
+    pt_uint restir_radius;   // spatial radius, pixels
+    pt_uint restir_mcap;     // temporal M-cap multiplier (x M)
 };
 
 struct ResolveUniforms {

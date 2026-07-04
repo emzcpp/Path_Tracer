@@ -474,14 +474,14 @@ inline float target_area(const HitRecord& rec, const vec3& vdir,
 // (resv_cur). No shadow rays here; shading happens after spatial reuse.
 inline void restir_build(const HitRecord& rec, const Ray& ray, RNG& rng,
                          const EnvLookup& env, const LightsLookup& lights,
-                         int M, bool temporal, const ReSTIRPixel& hist,
-                         ReSTIRPixel& cur) {
+                         int M, bool temporal, int mcap,
+                         const ReSTIRPixel& hist, ReSTIRPixel& cur) {
     const bool can_env = env.nee && env.row_cdf != nullptr &&
                          rec.mat.transmission <= 0.5f;
     const bool can_area = env.nee && lights.count > 0 &&
                           rec.mat.transmission <= 0.5f;
     const vec3 vdir = -normalize(ray.dir);
-    const float McapF = 20.0f * float(M);
+    const float McapF = float(mcap) * float(M);
     const bool hist_ok =
         temporal && hist.prev_t > 0.0f && rec.t > 0.0f &&
         std::fabs(hist.prev_t - rec.t) < 0.1f * rec.t &&
@@ -639,8 +639,9 @@ inline void restir_build(const HitRecord& rec, const Ray& ray, RNG& rng,
 inline void restir_spatial_shade(
     const HitRecord& rec, const Ray& ray, const Hittable& world, RNG& rng,
     const EnvLookup& env, const LightsLookup& lights, int M, bool spatial,
-    const GBufferPx* gbuf, const ReSTIRPixel* cur_all, int w, int h, int x,
-    int y, ReSTIRPixel& persist, float clamp_indirect, color& radiance) {
+    int spatial_k, int spatial_radius, const GBufferPx* gbuf,
+    const ReSTIRPixel* cur_all, int w, int h, int x, int y,
+    ReSTIRPixel& persist, float clamp_indirect, color& radiance) {
     const bool can_env = env.nee && env.row_cdf != nullptr &&
                          rec.mat.transmission <= 0.5f;
     const bool can_area = env.nee && lights.count > 0 &&
@@ -653,12 +654,15 @@ inline void restir_spatial_shade(
     // neighbor, always consumed.
     int nxs[PT_RESTIR_NEIGHBORS], nys[PT_RESTIR_NEIGHBORS];
     bool ok[PT_RESTIR_NEIGHBORS];
-    const int K = spatial ? PT_RESTIR_NEIGHBORS : 0;
+    const int K = spatial ? (spatial_k < PT_RESTIR_NEIGHBORS
+                                 ? spatial_k
+                                 : PT_RESTIR_NEIGHBORS)
+                          : 0;
     for (int k = 0; k < K; ++k) {
         const float u1 = rng.next_float();
         const float u2 = rng.next_float();
-        int nx = x + int((u1 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
-        int ny = y + int((u2 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
+        int nx = x + int((u1 * 2.0f - 1.0f) * float(spatial_radius));
+        int ny = y + int((u2 * 2.0f - 1.0f) * float(spatial_radius));
         nx = nx < 0 ? 0 : (nx >= w ? w - 1 : nx);
         ny = ny < 0 ? 0 : (ny >= h ? h - 1 : ny);
         nxs[k] = nx;
@@ -692,20 +696,37 @@ inline void restir_spatial_shade(
 
     // --- env slot ---
     if (can_env) {
+        // Selectable inputs need a winner (W > 0); the balance
+        // DENOMINATORS must count every input that audited samples
+        // (M > 0) even when it found nothing — excluding an M>0/W=0
+        // reservoir inflates the other inputs' MIS weights (+10%
+        // measured on occlusion-heavy interiors).
         const ReSTIRSlot* pslot[1 + PT_RESTIR_NEIGHBORS];
         int psurf[1 + PT_RESTIR_NEIGHBORS];
         int np = 0;
-        if (own.env_slot.M > 0.0f && own.env_slot.W > 0.0f) {
-            pslot[np] = &own.env_slot;
-            psurf[np] = -1;
-            ++np;
+        int dsurf[1 + PT_RESTIR_NEIGHBORS];
+        float dM[1 + PT_RESTIR_NEIGHBORS];
+        int nd = 0;
+        if (own.env_slot.M > 0.0f) {
+            dsurf[nd] = -1;
+            dM[nd] = own.env_slot.M;
+            ++nd;
+            if (own.env_slot.W > 0.0f) {
+                pslot[np] = &own.env_slot;
+                psurf[np] = -1;
+                ++np;
+            }
         }
         int pidx[PT_RESTIR_NEIGHBORS];
         for (int k = 0; k < K; ++k) {
             pidx[k] = -1;
             if (!ok[k]) continue;
             const ReSTIRPixel& nb = cur_all[std::size_t(nys[k]) * w + nxs[k]];
-            if (nb.env_slot.M <= 0.0f || nb.env_slot.W <= 0.0f) continue;
+            if (nb.env_slot.M <= 0.0f) continue;
+            dsurf[nd] = k;
+            dM[nd] = nb.env_slot.M;
+            ++nd;
+            if (nb.env_slot.W <= 0.0f) continue;
             pslot[np] = &nb.env_slot;
             psurf[np] = k;
             pidx[k] = np;
@@ -728,12 +749,12 @@ inline void restir_spatial_shade(
             const float that_own = phat_env(-1, sdir, c, wm);
             if (that_own <= 0.0f) return 0.0f;
             float denom = 0.0f, self = 0.0f;
-            for (int j = 0; j < np; ++j) {
+            for (int j = 0; j < nd; ++j) {
                 color cc;
                 float wmm;
-                const float p = phat_env(psurf[j], sdir, cc, wmm);
-                denom += pslot[j]->M * p;
-                if (j == i) self = p;
+                const float p = phat_env(dsurf[j], sdir, cc, wmm);
+                denom += dM[j] * p;
+                if (dsurf[j] == psurf[i]) self = p;
             }
             if (denom <= 0.0f || self <= 0.0f) return 0.0f;
             sdir_o = sdir;
@@ -788,6 +809,14 @@ inline void restir_spatial_shade(
             return sl.M > 0.0f && sl.W > 0.0f && sl.light_id_p1 > 0u &&
                    int(sl.light_id_p1) <= lights.count;
         };
+        int dsurf[1 + PT_RESTIR_NEIGHBORS];
+        float dM[1 + PT_RESTIR_NEIGHBORS];
+        int nd = 0;
+        if (own.area_slot.M > 0.0f) {
+            dsurf[nd] = -1;
+            dM[nd] = own.area_slot.M;
+            ++nd;
+        }
         if (slot_valid(own.area_slot)) {
             pslot[np] = &own.area_slot;
             psurf[np] = -1;
@@ -798,6 +827,11 @@ inline void restir_spatial_shade(
             pidx[k] = -1;
             if (!ok[k]) continue;
             const ReSTIRPixel& nb = cur_all[std::size_t(nys[k]) * w + nxs[k]];
+            if (nb.area_slot.M > 0.0f) {
+                dsurf[nd] = k;
+                dM[nd] = nb.area_slot.M;
+                ++nd;
+            }
             if (!slot_valid(nb.area_slot)) continue;
             pslot[np] = &nb.area_slot;
             psurf[np] = k;
@@ -827,14 +861,14 @@ inline void restir_spatial_shade(
                 phat_area(-1, *pslot[i], c, wm, G, d, t);
             if (that_own <= 0.0f) return 0.0f;
             float denom = 0.0f, self = 0.0f;
-            for (int j = 0; j < np; ++j) {
+            for (int j = 0; j < nd; ++j) {
                 color cc;
                 float wmm, gg, tt;
                 vec3 dd;
                 const float p =
-                    phat_area(psurf[j], *pslot[i], cc, wmm, gg, dd, tt);
-                denom += pslot[j]->M * p;
-                if (j == i) self = p;
+                    phat_area(dsurf[j], *pslot[i], cc, wmm, gg, dd, tt);
+                denom += dM[j] * p;
+                if (dsurf[j] == psurf[i]) self = p;
             }
             if (denom <= 0.0f || self <= 0.0f) return 0.0f;
             c_o = c;

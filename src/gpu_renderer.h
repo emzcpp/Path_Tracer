@@ -148,6 +148,9 @@ public:
     void set_env(const EnvMap* env);
     void set_env_params(float intensity, float yaw_norm);
     void set_env_nee(bool on);   // Session H: NEE+MIS vs brute force
+    // Consolidation: live ReSTIR estimator controls (copies the restir_*
+    // fields; takes effect on the next encoded batch).
+    void set_restir(const RenderSettings& s);
 
     // Bridged id<MTLDevice>, for CAMetalLayer.device.
     void* metal_device() const;

@@ -221,8 +221,8 @@ void ProgressiveRenderer::render_pass_partitioned() {
                 (std::uint64_t(g.rng_hi) << 32) | std::uint64_t(g.rng_lo);
             const Ray pray(rec.p, vec3(g.rd.x, g.rd.y, g.rd.z));
             restir_build(rec, pray, rng, env_, lights_, settings_.restir_m,
-                         settings_.restir_temporal != 0, resv_[px],
-                         resv_cur_[px]);
+                         settings_.restir_temporal != 0,
+                         settings_.restir_mcap, resv_[px], resv_cur_[px]);
             g.rng_lo = pt_uint(rng.state & 0xffffffffULL);
             g.rng_hi = pt_uint(rng.state >> 32);
         }
@@ -246,6 +246,7 @@ void ProgressiveRenderer::render_pass_partitioned() {
             restir_spatial_shade(rec, pray, scene_, rng, env_, lights_,
                                  settings_.restir_m,
                                  settings_.restir_spatial != 0,
+                                 settings_.restir_k, settings_.restir_radius,
                                  gbuf_.data(), resv_cur_.data(), w_, h_, x,
                                  y, resv_[px], settings_.clamp_indirect,
                                  rad);

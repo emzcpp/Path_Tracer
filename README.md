@@ -109,7 +109,18 @@ sampling for spheres, uniform-area with the r^2/cos Jacobian for
 triangles, textured Le at the sampled point) — and unified with env NEE
 and BSDF sampling under one power-heuristic MIS. Only triangles whose
 emissive texture actually glows join the light list (4-point UV probe);
-the list rebuilds automatically on any light edit or gizmo re-bake. Residual sparse speckle from
+the list rebuilds automatically on any light edit or gizmo re-bake.
+
+ReSTIR DI (`--restir`, `G` key, panel controls): reservoir-based direct
+lighting — M candidates per light slot (RIS), spatial neighbor reuse with
+Talbot balance-heuristic MIS (unbiased; +0.09% vs brute on a 36-light
+scene, 1.5x cleaner than NEE+MIS at equal spp). Temporal reuse exists but
+defaults OFF pending a prev-surface balance correction (biases on
+emitters very close to surfaces). Reservoir+G-buffer memory (~304 B/px)
+is shown in the stats panel and guarded by restir_mem_budget_mb (scale is
+clamped, never silently allocated). ReSTIR frames schedule whole-frame
+(spatial reuse reads across rows); brute force and NEE+MIS remain the
+referees. Residual sparse speckle from
 sun-through-glass caustic paths is inherent (delta chains can't be
 shadow-rayed) — the preview clamp still covers those. Fireflies from bright HDRI suns are
 legitimate brute-force variance; the indirect clamp that calms them is

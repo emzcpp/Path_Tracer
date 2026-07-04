@@ -1282,7 +1282,7 @@ inline void restir_build(thread const HitInfo& hi, float3 rd,
     const bool can_area = U.env_nee != 0u && U.light_count > 0u &&
                           hi.mat.transmission <= 0.5f;
     const float3 vdir = -normalize(rd);
-    const float McapF = 20.0f * float(M);
+    const float McapF = float(U.restir_mcap) * float(M);
     const float3 pn = c3(hist.prev_normal);
     const bool hist_ok =
         temporal && hist.prev_t > 0.0f && hi.t > 0.0f &&
@@ -1595,13 +1595,17 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
 
     int nxs[PT_RESTIR_NEIGHBORS], nys[PT_RESTIR_NEIGHBORS];
     bool ok[PT_RESTIR_NEIGHBORS];
-    const int K = U.restir_spatial != 0u ? PT_RESTIR_NEIGHBORS : 0;
+    const int K = U.restir_spatial != 0u
+                      ? (int(U.restir_k) < PT_RESTIR_NEIGHBORS
+                             ? int(U.restir_k)
+                             : PT_RESTIR_NEIGHBORS)
+                      : 0;
     for (int k = 0; k < K; ++k) {
         const float u1 = pcg_next_float(rng);
         const float u2 = pcg_next_float(rng);
         int nx = int(gid.x) +
-                 int((u1 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
-        int ny = int(py) + int((u2 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
+                 int((u1 * 2.0f - 1.0f) * float(U.restir_radius));
+        int ny = int(py) + int((u2 * 2.0f - 1.0f) * float(U.restir_radius));
         nx = nx < 0 ? 0 : (nx >= int(U.width) ? int(U.width) - 1 : nx);
         ny = ny < 0 ? 0 : (ny >= int(U.height) ? int(U.height) - 1 : ny);
         nxs[k] = nx;
@@ -1627,13 +1631,23 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
 
     // --- env slot ---
     if (can_env) {
+        // Mirror of integrator.h: denominators count every M>0 input;
+        // selection needs W>0.
         ReSTIRSlot pslot[1 + PT_RESTIR_NEIGHBORS];
         int psurf[1 + PT_RESTIR_NEIGHBORS];
         int np = 0;
-        if (own.env_slot.M > 0.0f && own.env_slot.W > 0.0f) {
-            pslot[np] = own.env_slot;
-            psurf[np] = -1;
-            ++np;
+        int dsurf[1 + PT_RESTIR_NEIGHBORS];
+        float dM[1 + PT_RESTIR_NEIGHBORS];
+        int nd = 0;
+        if (own.env_slot.M > 0.0f) {
+            dsurf[nd] = -1;
+            dM[nd] = own.env_slot.M;
+            ++nd;
+            if (own.env_slot.W > 0.0f) {
+                pslot[np] = own.env_slot;
+                psurf[np] = -1;
+                ++np;
+            }
         }
         int pidx[PT_RESTIR_NEIGHBORS];
         for (int k = 0; k < K; ++k) {
@@ -1641,7 +1655,11 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
             if (!ok[k]) continue;
             device const ReSTIRPixel& nb =
                 resv_cur[ulong(nys[k]) * U.width + nxs[k]];
-            if (nb.env_slot.M <= 0.0f || nb.env_slot.W <= 0.0f) continue;
+            if (nb.env_slot.M <= 0.0f) continue;
+            dsurf[nd] = k;
+            dM[nd] = nb.env_slot.M;
+            ++nd;
+            if (nb.env_slot.W <= 0.0f) continue;
             pslot[np] = nb.env_slot;
             psurf[np] = k;
             pidx[k] = np;
@@ -1664,23 +1682,23 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
             float w_i = 0.0f;
             if (that_own > 0.0f) {
                 float denom = 0.0f, self = 0.0f;
-                for (int j = 0; j < np; ++j) {
+                for (int j = 0; j < nd; ++j) {
                     float3 cc;
                     float wmm;
                     float p;
-                    if (psurf[j] < 0) {
+                    if (dsurf[j] < 0) {
                         p = target_env_t(hi.mat, hi.hn, hi.hp, vdir, sdir,
                                          env_texels, env_row_cdf,
                                          env_cond_cdf, U, cc, wmm);
                     } else {
-                        const int kk = psurf[j];
+                        const int kk = dsurf[j];
                         p = target_env_t(nsurf[kk].mat, nsurf[kk].hn,
                                          nsurf[kk].hp, nvdir[kk], sdir,
                                          env_texels, env_row_cdf,
                                          env_cond_cdf, U, cc, wmm);
                     }
-                    denom += pslot[j].M * p;
-                    if (j == i) self = p;
+                    denom += dM[j] * p;
+                    if (dsurf[j] == psurf[i]) self = p;
                 }
                 if (denom > 0.0f && self > 0.0f) {
                     w_i = (pslot[i].M * self / denom) * that_own *
@@ -1710,23 +1728,23 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
             float w_i = 0.0f;
             if (that_own > 0.0f) {
                 float denom = 0.0f, self = 0.0f;
-                for (int j = 0; j < np; ++j) {
+                for (int j = 0; j < nd; ++j) {
                     float3 cc;
                     float wmm;
                     float p;
-                    if (psurf[j] < 0) {
+                    if (dsurf[j] < 0) {
                         p = target_env_t(hi.mat, hi.hn, hi.hp, vdir, sdir,
                                          env_texels, env_row_cdf,
                                          env_cond_cdf, U, cc, wmm);
                     } else {
-                        const int kk = psurf[j];
+                        const int kk = dsurf[j];
                         p = target_env_t(nsurf[kk].mat, nsurf[kk].hn,
                                          nsurf[kk].hp, nvdir[kk], sdir,
                                          env_texels, env_row_cdf,
                                          env_cond_cdf, U, cc, wmm);
                     }
-                    denom += pslot[j].M * p;
-                    if (j == i) self = p;
+                    denom += dM[j] * p;
+                    if (dsurf[j] == psurf[i]) self = p;
                 }
                 if (denom > 0.0f && self > 0.0f) {
                     w_i = (pslot[i].M * self / denom) * that_own *
@@ -1764,12 +1782,20 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
         ReSTIRSlot pslot[1 + PT_RESTIR_NEIGHBORS];
         int psurf[1 + PT_RESTIR_NEIGHBORS];
         int np = 0;
-        if (own.area_slot.M > 0.0f && own.area_slot.W > 0.0f &&
-            own.area_slot.light_id_p1 > 0u &&
-            own.area_slot.light_id_p1 <= U.light_count) {
-            pslot[np] = own.area_slot;
-            psurf[np] = -1;
-            ++np;
+        int dsurf[1 + PT_RESTIR_NEIGHBORS];
+        float dM[1 + PT_RESTIR_NEIGHBORS];
+        int nd = 0;
+        if (own.area_slot.M > 0.0f) {
+            dsurf[nd] = -1;
+            dM[nd] = own.area_slot.M;
+            ++nd;
+            if (own.area_slot.W > 0.0f &&
+                own.area_slot.light_id_p1 > 0u &&
+                own.area_slot.light_id_p1 <= U.light_count) {
+                pslot[np] = own.area_slot;
+                psurf[np] = -1;
+                ++np;
+            }
         }
         int pidx[PT_RESTIR_NEIGHBORS];
         for (int k = 0; k < K; ++k) {
@@ -1777,7 +1803,11 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
             if (!ok[k]) continue;
             device const ReSTIRPixel& nb =
                 resv_cur[ulong(nys[k]) * U.width + nxs[k]];
-            if (nb.area_slot.M <= 0.0f || nb.area_slot.W <= 0.0f ||
+            if (nb.area_slot.M <= 0.0f) continue;
+            dsurf[nd] = k;
+            dM[nd] = nb.area_slot.M;
+            ++nd;
+            if (nb.area_slot.W <= 0.0f ||
                 nb.area_slot.light_id_p1 == 0u ||
                 nb.area_slot.light_id_p1 > U.light_count)
                 continue;
@@ -1805,26 +1835,26 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
             float w_i = 0.0f;
             if (that_own > 0.0f) {
                 float denom = 0.0f, self = 0.0f;
-                for (int j = 0; j < np; ++j) {
+                for (int j = 0; j < nd; ++j) {
                     float3 cc;
                     float wmm, gg, tt;
                     float3 dd;
                     float p;
-                    if (psurf[j] < 0) {
+                    if (dsurf[j] < 0) {
                         p = target_area_t(hi.mat, hi.hn, hi.hp, vdir, L,
                                           pslot[i].ax, pslot[i].ay,
                                           pslot[i].az, materials, MU, cc,
                                           wmm, gg, dd, tt);
                     } else {
-                        const int kk = psurf[j];
+                        const int kk = dsurf[j];
                         p = target_area_t(nsurf[kk].mat, nsurf[kk].hn,
                                           nsurf[kk].hp, nvdir[kk], L,
                                           pslot[i].ax, pslot[i].ay,
                                           pslot[i].az, materials, MU, cc,
                                           wmm, gg, dd, tt);
                     }
-                    denom += pslot[j].M * p;
-                    if (j == i) self = p;
+                    denom += dM[j] * p;
+                    if (dsurf[j] == psurf[i]) self = p;
                 }
                 if (denom > 0.0f && self > 0.0f) {
                     w_i = (pslot[i].M * self / denom) * that_own *
@@ -1859,26 +1889,26 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
             float w_i = 0.0f;
             if (that_own > 0.0f) {
                 float denom = 0.0f, self = 0.0f;
-                for (int j = 0; j < np; ++j) {
+                for (int j = 0; j < nd; ++j) {
                     float3 cc;
                     float wmm, gg, tt;
                     float3 dd;
                     float p;
-                    if (psurf[j] < 0) {
+                    if (dsurf[j] < 0) {
                         p = target_area_t(hi.mat, hi.hn, hi.hp, vdir, L,
                                           pslot[i].ax, pslot[i].ay,
                                           pslot[i].az, materials, MU, cc,
                                           wmm, gg, dd, tt);
                     } else {
-                        const int kk = psurf[j];
+                        const int kk = dsurf[j];
                         p = target_area_t(nsurf[kk].mat, nsurf[kk].hn,
                                           nsurf[kk].hp, nvdir[kk], L,
                                           pslot[i].ax, pslot[i].ay,
                                           pslot[i].az, materials, MU, cc,
                                           wmm, gg, dd, tt);
                     }
-                    denom += pslot[j].M * p;
-                    if (j == i) self = p;
+                    denom += dM[j] * p;
+                    if (dsurf[j] == psurf[i]) self = p;
                 }
                 if (denom > 0.0f && self > 0.0f) {
                     w_i = (pslot[i].M * self / denom) * that_own *
