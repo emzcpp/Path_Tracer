@@ -1560,9 +1560,9 @@ kernel void direct_v0(device float4* accum            [[buffer(0)]],
     gbuf[px].rng_hi = uint(rng.state >> 32);
 }
 
-// Phase D2 — mirror of integrator.h's restir_spatial_shade: spatial merge
-// with the unbiased 1/Z correction, the slot's single shadow ray, shading,
-// and the persistent store feeding next frame's temporal reuse.
+// Phase D2 — mirror of integrator.h's restir_spatial_shade: Talbot
+// balance-heuristic spatial combine (unbiased for any support overlap),
+// the slot's single shadow ray, shading, and pre-spatial history store.
 kernel void spatial_v0(device float4* accum            [[buffer(0)]],
                        constant GPUSphere* spheres     [[buffer(1)]],
                        constant PassUniforms& U        [[buffer(2)]],
@@ -1586,8 +1586,6 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
     const HitInfo hi = hitinfo_from_gbuf(g);
     PRNG rng = pcg_restore(g.rng_lo, g.rng_hi, px);
     const float3 vdir = -normalize(c3(g.rd));
-    const int M = int(U.restir_m);
-    const float McapF = 20.0f * float(M);
     const bool can_env = U.env_nee != 0u && U.env_w != 0u &&
                          hi.mat.transmission <= 0.5f;
     const bool can_area = U.env_nee != 0u && U.light_count > 0u &&
@@ -1601,7 +1599,8 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
     for (int k = 0; k < K; ++k) {
         const float u1 = pcg_next_float(rng);
         const float u2 = pcg_next_float(rng);
-        int nx = int(gid.x) + int((u1 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
+        int nx = int(gid.x) +
+                 int((u1 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
         int ny = int(py) + int((u2 * 2.0f - 1.0f) * float(PT_RESTIR_RADIUS));
         nx = nx < 0 ? 0 : (nx >= int(U.width) ? int(U.width) - 1 : nx);
         ny = ny < 0 ? 0 : (ny >= int(U.height) ? int(U.height) - 1 : ny);
@@ -1612,75 +1611,139 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
         const GBufferPx gn = gbuf[ulong(ny) * U.width + nx];
         if (gn.t < 0.0f || gn.transmission > 0.5f) continue;
         if (fabs(gn.t - hi.t) >= 0.1f * hi.t) continue;
-        const float3 nn = c3(gn.normal);
-        if (dot(nn, hi.hn) <= 0.9f) continue;
+        if (dot(c3(gn.normal), hi.hn) <= 0.9f) continue;
         ok[k] = true;
+    }
+
+    // Participant surfaces cached as HitInfo (own = index -1).
+    HitInfo nsurf[PT_RESTIR_NEIGHBORS];
+    float3 nvdir[PT_RESTIR_NEIGHBORS];
+    for (int k = 0; k < K; ++k) {
+        if (!ok[k]) continue;
+        const GBufferPx gn = gbuf[ulong(nys[k]) * U.width + nxs[k]];
+        nsurf[k] = hitinfo_from_gbuf(gn);
+        nvdir[k] = -normalize(c3(gn.rd));
     }
 
     // --- env slot ---
     if (can_env) {
-        float3 win_dir = float3(own.env_slot.ax, own.env_slot.ay,
-                                own.env_slot.az);
-        float3 win_c = float3(0.0f);
-        float win_mis = 0.0f;
-        float win_that = 0.0f;
+        ReSTIRSlot pslot[1 + PT_RESTIR_NEIGHBORS];
+        int psurf[1 + PT_RESTIR_NEIGHBORS];
+        int np = 0;
         if (own.env_slot.M > 0.0f && own.env_slot.W > 0.0f) {
-            win_that = target_env_t(hi.mat, hi.hn, hi.hp, vdir, win_dir,
-                                    env_texels, env_row_cdf, env_cond_cdf,
-                                    U, win_c, win_mis);
+            pslot[np] = own.env_slot;
+            psurf[np] = -1;
+            ++np;
         }
-        float wsum = win_that * own.env_slot.W * own.env_slot.M;
-        float Mtot = own.env_slot.M;
-        if (win_that <= 0.0f) wsum = 0.0f;
+        int pidx[PT_RESTIR_NEIGHBORS];
         for (int k = 0; k < K; ++k) {
-            const float ur = pcg_next_float(rng);
+            pidx[k] = -1;
             if (!ok[k]) continue;
             device const ReSTIRPixel& nb =
                 resv_cur[ulong(nys[k]) * U.width + nxs[k]];
             if (nb.env_slot.M <= 0.0f || nb.env_slot.W <= 0.0f) continue;
-            const float3 sdir =
-                float3(nb.env_slot.ax, nb.env_slot.ay, nb.env_slot.az);
-            float3 contrib;
-            float w_mis;
-            const float that =
-                target_env_t(hi.mat, hi.hn, hi.hp, vdir, sdir, env_texels,
-                             env_row_cdf, env_cond_cdf, U, contrib, w_mis);
-            const float wh = that * nb.env_slot.W * nb.env_slot.M;
-            wsum += wh;
-            Mtot += nb.env_slot.M;
-            if (wh > 0.0f && ur < wh / wsum) {
-                win_dir = sdir;
-                win_c = contrib;
-                win_mis = w_mis;
-                win_that = that;
-            }
+            pslot[np] = nb.env_slot;
+            psurf[np] = k;
+            pidx[k] = np;
+            ++np;
         }
-        float Wshade = 0.0f, Wstore = 0.0f;
-        if (wsum > 0.0f && win_that > 0.0f) {
-            float Z = own.env_slot.M;
-            for (int k = 0; k < K; ++k) {
-                if (!ok[k]) continue;
-                device const ReSTIRPixel& nb =
-                    resv_cur[ulong(nys[k]) * U.width + nxs[k]];
-                if (nb.env_slot.M <= 0.0f) continue;
-                const GBufferPx gn = gbuf[ulong(nys[k]) * U.width + nxs[k]];
-                const HitInfo nh = hitinfo_from_gbuf(gn);
-                const float3 nvdir = -normalize(c3(gn.rd));
-                float3 cc;
-                float wm;
-                if (target_env_t(nh.mat, nh.hn, nh.hp, nvdir, win_dir,
-                                 env_texels, env_row_cdf, env_cond_cdf, U,
-                                 cc, wm) > 0.0f) {
-                    Z += nb.env_slot.M;
+        float3 win_dir = float3(0.0f, 0.0f, 1.0f);
+        float3 win_c = float3(0.0f);
+        float win_mis = 0.0f, win_that = 0.0f, wsum = 0.0f;
+        // Own seeds without a draw; neighbors take one lottery draw per
+        // SLOT k (drawn regardless of participation) — CPU order.
+        for (int i = 0; i < np && psurf[i] < 0; ++i) {
+            const float ur = 0.0f;
+            const float3 sdir =
+                float3(pslot[i].ax, pslot[i].ay, pslot[i].az);
+            float3 c;
+            float wm;
+            const float that_own =
+                target_env_t(hi.mat, hi.hn, hi.hp, vdir, sdir, env_texels,
+                             env_row_cdf, env_cond_cdf, U, c, wm);
+            float w_i = 0.0f;
+            if (that_own > 0.0f) {
+                float denom = 0.0f, self = 0.0f;
+                for (int j = 0; j < np; ++j) {
+                    float3 cc;
+                    float wmm;
+                    float p;
+                    if (psurf[j] < 0) {
+                        p = target_env_t(hi.mat, hi.hn, hi.hp, vdir, sdir,
+                                         env_texels, env_row_cdf,
+                                         env_cond_cdf, U, cc, wmm);
+                    } else {
+                        const int kk = psurf[j];
+                        p = target_env_t(nsurf[kk].mat, nsurf[kk].hn,
+                                         nsurf[kk].hp, nvdir[kk], sdir,
+                                         env_texels, env_row_cdf,
+                                         env_cond_cdf, U, cc, wmm);
+                    }
+                    denom += pslot[j].M * p;
+                    if (j == i) self = p;
+                }
+                if (denom > 0.0f && self > 0.0f) {
+                    w_i = (pslot[i].M * self / denom) * that_own *
+                          pslot[i].W;
                 }
             }
-            if (Z > 0.0f) Wshade = wsum / (Z * win_that);
-            if (Mtot > 0.0f) Wstore = wsum / (Mtot * win_that);
+            (void)ur;
+            wsum += w_i;
+            if (w_i > 0.0f) {
+                win_dir = sdir;
+                win_c = c;
+                win_mis = wm;
+                win_that = that_own;
+            }
         }
-        const float Wnew = Wshade;
-        (void)Wstore;
-        // Persist the PRE-spatial reservoir — mirror of integrator.h.
-        resv[px].env_slot = own.env_slot;
+        for (int k = 0; k < K; ++k) {
+            const float ur = pcg_next_float(rng);
+            const int i = pidx[k];
+            if (i < 0) continue;
+            const float3 sdir =
+                float3(pslot[i].ax, pslot[i].ay, pslot[i].az);
+            float3 c;
+            float wm;
+            const float that_own =
+                target_env_t(hi.mat, hi.hn, hi.hp, vdir, sdir, env_texels,
+                             env_row_cdf, env_cond_cdf, U, c, wm);
+            float w_i = 0.0f;
+            if (that_own > 0.0f) {
+                float denom = 0.0f, self = 0.0f;
+                for (int j = 0; j < np; ++j) {
+                    float3 cc;
+                    float wmm;
+                    float p;
+                    if (psurf[j] < 0) {
+                        p = target_env_t(hi.mat, hi.hn, hi.hp, vdir, sdir,
+                                         env_texels, env_row_cdf,
+                                         env_cond_cdf, U, cc, wmm);
+                    } else {
+                        const int kk = psurf[j];
+                        p = target_env_t(nsurf[kk].mat, nsurf[kk].hn,
+                                         nsurf[kk].hp, nvdir[kk], sdir,
+                                         env_texels, env_row_cdf,
+                                         env_cond_cdf, U, cc, wmm);
+                    }
+                    denom += pslot[j].M * p;
+                    if (j == i) self = p;
+                }
+                if (denom > 0.0f && self > 0.0f) {
+                    w_i = (pslot[i].M * self / denom) * that_own *
+                          pslot[i].W;
+                }
+            }
+            wsum += w_i;
+            if (w_i > 0.0f && ur < w_i / wsum) {
+                win_dir = sdir;
+                win_c = c;
+                win_mis = wm;
+                win_that = that_own;
+            }
+        }
+        const float Wnew =
+            (wsum > 0.0f && win_that > 0.0f) ? wsum / win_that : 0.0f;
+        resv[px].env_slot = own.env_slot;   // pre-spatial history
         if (Wnew > 0.0f) {
             if (!occluded_scene(hi.hp, win_dir, INFINITY, spheres,
                                 U.sphere_count, nodes, tris, MU)) {
@@ -1698,25 +1761,19 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
 
     // --- area slot ---
     if (can_area) {
-        float win_ax = own.area_slot.ax, win_ay = own.area_slot.ay,
-              win_az = own.area_slot.az;
-        uint win_id_p1 = own.area_slot.light_id_p1;
-        float3 win_c = float3(0.0f);
-        float win_mis = 0.0f, win_G = 0.0f, win_t = 0.0f;
-        float3 win_dir = float3(0.0f, 0.0f, 1.0f);
-        float win_that = 0.0f;
+        ReSTIRSlot pslot[1 + PT_RESTIR_NEIGHBORS];
+        int psurf[1 + PT_RESTIR_NEIGHBORS];
+        int np = 0;
         if (own.area_slot.M > 0.0f && own.area_slot.W > 0.0f &&
-            win_id_p1 > 0u && win_id_p1 <= U.light_count) {
-            win_that = target_area_t(hi.mat, hi.hn, hi.hp, vdir,
-                                     lights[int(win_id_p1) - 1], win_ax,
-                                     win_ay, win_az, materials, MU, win_c,
-                                     win_mis, win_G, win_dir, win_t);
+            own.area_slot.light_id_p1 > 0u &&
+            own.area_slot.light_id_p1 <= U.light_count) {
+            pslot[np] = own.area_slot;
+            psurf[np] = -1;
+            ++np;
         }
-        float wsum = win_that * own.area_slot.W * own.area_slot.M;
-        float Mtot = own.area_slot.M;
-        if (win_that <= 0.0f) wsum = 0.0f;
+        int pidx[PT_RESTIR_NEIGHBORS];
         for (int k = 0; k < K; ++k) {
-            const float ur = pcg_next_float(rng);
+            pidx[k] = -1;
             if (!ok[k]) continue;
             device const ReSTIRPixel& nb =
                 resv_cur[ulong(nys[k]) * U.width + nxs[k]];
@@ -1724,58 +1781,125 @@ kernel void spatial_v0(device float4* accum            [[buffer(0)]],
                 nb.area_slot.light_id_p1 == 0u ||
                 nb.area_slot.light_id_p1 > U.light_count)
                 continue;
-            device const GPULight& L =
-                lights[int(nb.area_slot.light_id_p1) - 1];
-            float3 contrib;
-            float w_mis, G, t_o;
-            float3 d_o;
-            const float thatA = target_area_t(
-                hi.mat, hi.hn, hi.hp, vdir, L, nb.area_slot.ax,
-                nb.area_slot.ay, nb.area_slot.az, materials, MU, contrib,
-                w_mis, G, d_o, t_o);
-            const float wh = thatA * nb.area_slot.W * nb.area_slot.M;
-            wsum += wh;
-            Mtot += nb.area_slot.M;
-            if (wh > 0.0f && ur < wh / wsum) {
-                win_ax = nb.area_slot.ax;
-                win_ay = nb.area_slot.ay;
-                win_az = nb.area_slot.az;
-                win_id_p1 = nb.area_slot.light_id_p1;
-                win_c = contrib;
-                win_mis = w_mis;
-                win_G = G;
-                win_dir = d_o;
-                win_t = t_o;
-                win_that = thatA;
-            }
+            pslot[np] = nb.area_slot;
+            psurf[np] = k;
+            pidx[k] = np;
+            ++np;
         }
-        float Wshade = 0.0f, Wstore = 0.0f;
-        if (wsum > 0.0f && win_that > 0.0f && win_id_p1 > 0u) {
-            device const GPULight& Lw = lights[int(win_id_p1) - 1];
-            float Z = own.area_slot.M;
-            for (int k = 0; k < K; ++k) {
-                if (!ok[k]) continue;
-                device const ReSTIRPixel& nb =
-                    resv_cur[ulong(nys[k]) * U.width + nxs[k]];
-                if (nb.area_slot.M <= 0.0f) continue;
-                const GBufferPx gn = gbuf[ulong(nys[k]) * U.width + nxs[k]];
-                const HitInfo nh = hitinfo_from_gbuf(gn);
-                const float3 nvdir = -normalize(c3(gn.rd));
-                float3 cc;
-                float wm, gg, tt;
-                float3 dd;
-                if (target_area_t(nh.mat, nh.hn, nh.hp, nvdir, Lw, win_ax,
-                                  win_ay, win_az, materials, MU, cc, wm, gg,
-                                  dd, tt) > 0.0f) {
-                    Z += nb.area_slot.M;
+        float3 win_c = float3(0.0f);
+        float win_mis = 0.0f, win_G = 0.0f, win_t = 0.0f, win_that = 0.0f;
+        float3 win_dir = float3(0.0f, 0.0f, 1.0f);
+        float wsum = 0.0f;
+        bool have_win = false;
+        for (int i = 0; i < np && psurf[i] < 0; ++i) {
+            const float ur = 0.0f;
+            device const GPULight& L =
+                lights[int(pslot[i].light_id_p1) - 1];
+            float3 c;
+            float wm, G, t;
+            float3 d;
+            const float that_own =
+                target_area_t(hi.mat, hi.hn, hi.hp, vdir, L, pslot[i].ax,
+                              pslot[i].ay, pslot[i].az, materials, MU, c,
+                              wm, G, d, t);
+            float w_i = 0.0f;
+            if (that_own > 0.0f) {
+                float denom = 0.0f, self = 0.0f;
+                for (int j = 0; j < np; ++j) {
+                    float3 cc;
+                    float wmm, gg, tt;
+                    float3 dd;
+                    float p;
+                    if (psurf[j] < 0) {
+                        p = target_area_t(hi.mat, hi.hn, hi.hp, vdir, L,
+                                          pslot[i].ax, pslot[i].ay,
+                                          pslot[i].az, materials, MU, cc,
+                                          wmm, gg, dd, tt);
+                    } else {
+                        const int kk = psurf[j];
+                        p = target_area_t(nsurf[kk].mat, nsurf[kk].hn,
+                                          nsurf[kk].hp, nvdir[kk], L,
+                                          pslot[i].ax, pslot[i].ay,
+                                          pslot[i].az, materials, MU, cc,
+                                          wmm, gg, dd, tt);
+                    }
+                    denom += pslot[j].M * p;
+                    if (j == i) self = p;
+                }
+                if (denom > 0.0f && self > 0.0f) {
+                    w_i = (pslot[i].M * self / denom) * that_own *
+                          pslot[i].W;
                 }
             }
-            if (Z > 0.0f) Wshade = wsum / (Z * win_that);
-            if (Mtot > 0.0f) Wstore = wsum / (Mtot * win_that);
+            (void)ur;
+            wsum += w_i;
+            if (w_i > 0.0f) {
+                win_c = c;
+                win_mis = wm;
+                win_G = G;
+                win_dir = d;
+                win_t = t;
+                win_that = that_own;
+                have_win = true;
+            }
         }
-        const float Wnew = Wshade;
-        (void)Wstore;
-        resv[px].area_slot = own.area_slot;   // pre-spatial
+        for (int k = 0; k < K; ++k) {
+            const float ur = pcg_next_float(rng);
+            const int i = pidx[k];
+            if (i < 0) continue;
+            device const GPULight& L =
+                lights[int(pslot[i].light_id_p1) - 1];
+            float3 c;
+            float wm, G, t;
+            float3 d;
+            const float that_own =
+                target_area_t(hi.mat, hi.hn, hi.hp, vdir, L, pslot[i].ax,
+                              pslot[i].ay, pslot[i].az, materials, MU, c,
+                              wm, G, d, t);
+            float w_i = 0.0f;
+            if (that_own > 0.0f) {
+                float denom = 0.0f, self = 0.0f;
+                for (int j = 0; j < np; ++j) {
+                    float3 cc;
+                    float wmm, gg, tt;
+                    float3 dd;
+                    float p;
+                    if (psurf[j] < 0) {
+                        p = target_area_t(hi.mat, hi.hn, hi.hp, vdir, L,
+                                          pslot[i].ax, pslot[i].ay,
+                                          pslot[i].az, materials, MU, cc,
+                                          wmm, gg, dd, tt);
+                    } else {
+                        const int kk = psurf[j];
+                        p = target_area_t(nsurf[kk].mat, nsurf[kk].hn,
+                                          nsurf[kk].hp, nvdir[kk], L,
+                                          pslot[i].ax, pslot[i].ay,
+                                          pslot[i].az, materials, MU, cc,
+                                          wmm, gg, dd, tt);
+                    }
+                    denom += pslot[j].M * p;
+                    if (j == i) self = p;
+                }
+                if (denom > 0.0f && self > 0.0f) {
+                    w_i = (pslot[i].M * self / denom) * that_own *
+                          pslot[i].W;
+                }
+            }
+            wsum += w_i;
+            if (w_i > 0.0f && ur < w_i / wsum) {
+                win_c = c;
+                win_mis = wm;
+                win_G = G;
+                win_dir = d;
+                win_t = t;
+                win_that = that_own;
+                have_win = true;
+            }
+        }
+        const float Wnew = (wsum > 0.0f && win_that > 0.0f && have_win)
+                               ? wsum / win_that
+                               : 0.0f;
+        resv[px].area_slot = own.area_slot;   // pre-spatial history
         if (Wnew > 0.0f) {
             if (!occluded_scene(hi.hp, win_dir, win_t * (1.0f - 1e-3f),
                                 spheres, U.sphere_count, nodes, tris, MU)) {

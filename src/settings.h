@@ -63,14 +63,11 @@ struct RenderSettings {
     // reservoirs reset with the accumulation through the central reset,
     // which is the ghosting guarantee). M-capped at 20x.
     int restir_temporal = 1;
-    // Stage 3: spatial reservoir reuse (K random neighbors per frame,
-    // 1/Z variant with per-neighbor target re-evaluation). DEFAULT OFF:
-    // the bias bisect on many-light scenes measured +1.3% from the
-    // spatial combine alone (support-test asymmetry between the
-    // two-sided target and the one-sided sphere-cone sampler is the
-    // prime suspect) — below this project's unbiasedness gate it does
-    // not ship. Code stays for the follow-up derivation session.
-    int restir_spatial = 0;
+    // Stage 3: spatial reservoir reuse (K random neighbors per frame)
+    // combined with Talbot balance-heuristic MIS weights — unbiased for
+    // any sampler-support overlap (the earlier 1/Z counting variant
+    // measured +1.3% bias from support asymmetry and was replaced).
+    int restir_spatial = 1;
 
     // Execution
     int thread_count = 0;         // 0 = use all hardware threads
