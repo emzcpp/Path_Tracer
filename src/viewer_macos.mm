@@ -345,6 +345,7 @@ void refresh_lights(ViewerCore& core) {
     } else {
         core.gpu->set_lights(build_light_list(core.desc));
     }
+    core.gpu->set_portals(core.desc.portals);
 }
 
 void apply_mesh_transform(ViewerCore& core) {
@@ -836,7 +837,7 @@ void render_thread_main(ViewerCore& core) {
     ProgressiveRenderer renderer(core.scene, cpu_settings, hw - 1,
                                  env_lookup(core.desc,
                                             core.settings.env_nee != 0),
-                                 ll);
+                                 ll, core.desc.portals);
 
     const auto settle =
         std::chrono::duration<float, std::milli>(core.settings.settle_ms);
@@ -2580,6 +2581,7 @@ int run_viewer(const RenderSettings& settings, bool use_gpu,
                                           desc.env_yaw_deg / 360.0f);
             }
             if (core->gpu) core->gpu->set_lights(build_light_list(desc));
+            if (core->gpu) core->gpu->set_portals(desc.portals);
             if (!core->gpu) {
                 std::fprintf(stderr,
                              "GPU init failed (%s) — using CPU backend\n",

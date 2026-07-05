@@ -47,10 +47,10 @@ struct SceneDesc {
 
 // Build one portal rectangle from a frame (center + world half-edges u,v),
 // with the rigid transform to a partner portal precomputed:
-//   R = R_B * R_A^T,   t = cB - R*cA
-// "connected openings" (aligned wormhole): a ray keeps its heading in the
-// partner's frame, so parallel same-facing portals read as a window into
-// the partner's location (through A you see what is behind B). R_A^T maps
+//   R = R_B * Flip180(up) * R_A^T,   t = cB - R*cA
+// The standard portal convention: a ray entering the FRONT of A exits the
+// FRONT of B (Flip180 about the up axis turns it around). This is what
+// makes FACING portals recurse (exit-front loops A->B->A). R_A^T maps
 // world -> A-local; R_B maps A-local -> world in B's frame.
 inline GPUPortal make_portal(const point3& c, const vec3& u, const vec3& v,
                              const point3& pc, const vec3& pu, const vec3& pv) {
@@ -69,10 +69,11 @@ inline GPUPortal make_portal(const point3& c, const vec3& u, const vec3& v,
     const auto Rt = [&](const vec3& p) {   // R_A^T * p  (world -> A local)
         return vec3(dot(rA, p), dot(upA, p), dot(nA, p));
     };
-    const auto RB = [&](const vec3& l) {   // R_B * l  (A local -> B world)
-        return rB * l.x + upB * l.y + nB * l.z;
+    const auto FB = [&](const vec3& l) {   // Flip180(up) then R_B
+        const vec3 f(-l.x, l.y, -l.z);
+        return rB * f.x + upB * f.y + nB * f.z;
     };
-    const auto R = [&](const vec3& p) { return RB(Rt(p)); };
+    const auto R = [&](const vec3& p) { return FB(Rt(p)); };
     GPUPortal P{};
     P.center = {c.x, c.y, c.z};
     P.u = {u.x, u.y, u.z};

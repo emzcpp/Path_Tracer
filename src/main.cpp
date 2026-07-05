@@ -99,6 +99,7 @@ int run_parity(const RenderSettings& settings, int spp,
     gpu->set_env(desc.env.get());
     gpu->set_env_params(desc.env_intensity, desc.env_yaw_deg / 360.0f);
     if (settings.env_nee != 0) gpu->set_lights(build_light_list(desc));
+    gpu->set_portals(desc.portals);
     auto t0 = Clock::now();
     gpu->render_passes_blocking(to_gpu_camera(camera), spp);
     const double gpu_s = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -116,7 +117,8 @@ int run_parity(const RenderSettings& settings, int spp,
                           desc.mesh.get()};
     ProgressiveRenderer cpu(scene, settings,
                             std::max(1u, std::thread::hardware_concurrency()),
-                            env_lookup(desc, settings.env_nee != 0), ll);
+                            env_lookup(desc, settings.env_nee != 0), ll,
+                            desc.portals);
     t0 = Clock::now();
     for (int s = 0; s < spp; ++s) cpu.render_pass(camera);
     const double cpu_s = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -258,6 +260,7 @@ int main(int argc, char** argv) {
     bool prism_demo = false;     // v1.2: a glass sphere for dispersion
     bool prism_mesh = false;     // v1.2: a triangular GLASS PRISM mesh
     bool godrays = false;        // v1.3: fog + occluders = light shafts
+    bool portals = false;        // v1.3: recursive portal corridor
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--offline") == 0) {
@@ -292,6 +295,9 @@ int main(int argc, char** argv) {
             settings.fog = 1;
             settings.fog_density = 0.09f;
             settings.fog_g = 0.55f;
+        } else if (std::strcmp(argv[i], "--portals") == 0) {
+            portals = true;
+            settings.max_depth = 24;   // recursion depth of the tunnel
         } else if (std::strcmp(argv[i], "--prism") == 0) {
             prism_demo = true;
             settings.spectral = 1;
@@ -367,6 +373,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "no model found (looked for Test_Models/Damaged Helmet"
                      ".glb) — sphere scene; use --model <path>\n");
+    }
+    if (portals) {
+        mesh = mesh_gen::room(point3(0.0f, 1.5f, -2.0f), 2.2f, 1.6f, 4.2f);
+        std::printf("portals: recursive corridor (room + facing pair)\n");
     }
     if (prism_mesh) {
         mesh = mesh_gen::glass_prism(point3(0.0f, 0.8f, 0.0f), 1.3f, 0.75f,
@@ -488,6 +498,30 @@ int main(int argc, char** argv) {
         std::printf("godrays: fog sigma=%.3f g=%.2f, %d occluder bars\n",
                     settings.fog_density, settings.fog_g, nb);
     }
+    if (portals) {
+        desc.spheres.clear();
+        desc.spheres.push_back({point3(1.1f, 0.5f, -3.0f), 0.4f,
+                                Material::lambertian(color(0.85f, 0.3f, 0.2f)),
+                                "Marker A"});
+        desc.spheres.push_back({point3(-1.2f, 0.6f, -5.0f), 0.4f,
+                                Material::lambertian(color(0.2f, 0.5f, 0.9f)),
+                                "Marker B"});
+        desc.spheres.push_back({point3(0.0f, 2.7f, -2.0f), 0.35f,
+                                Material::emissive(color(9.0f, 8.6f, 7.5f)),
+                                "Lamp"});
+        make_portal_pair(desc.portals,
+                         point3(0, 1.3f, -6.1f), vec3(2.0f, 0, 0),
+                         vec3(0, 1.4f, 0),
+                         point3(0, 1.3f, 2.05f), vec3(-2.0f, 0, 0),
+                         vec3(0, 1.4f, 0));
+        desc.env.reset();
+        desc.env_intensity = 0.0f;
+        settings.cam_pos = point3(0.0f, 1.2f, 1.6f);
+        settings.cam_look_at = point3(-0.6f, 1.1f, -4.0f);
+        std::printf("portals: %zu portals, recursion bounded by max_depth "
+                    "%d\n",
+                    desc.portals.size(), settings.max_depth);
+    }
     if (brute) {
         settings.env_nee = 0;
         std::printf("lighting: brute force (ground-truth mode)\n");
@@ -556,6 +590,7 @@ int main(int argc, char** argv) {
             gpu->set_env(desc.env.get());
             gpu->set_env_params(desc.env_intensity, desc.env_yaw_deg / 360.0f);
             if (settings.env_nee != 0) gpu->set_lights(build_light_list(desc));
+            gpu->set_portals(desc.portals);
             gpu->render_passes_blocking(to_gpu_camera(camera), spp);
             gpu_bad = scan(gpu->accum_data(), n * 4);
             gpu_ran = true;
@@ -598,7 +633,7 @@ int main(int argc, char** argv) {
     ProgressiveRenderer renderer(scene, settings,
                                  std::max(1u, std::thread::hardware_concurrency()),
                                  env_lookup(desc, settings.env_nee != 0),
-                                 oll);
+                                 oll, desc.portals);
 
     std::printf("rendering %dx%d @ %d spp, max depth %d\n", settings.width,
                 settings.height, settings.samples_per_pixel, settings.max_depth);
