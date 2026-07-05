@@ -155,6 +155,9 @@ public:
     // view params (debug AOV, wipe split). Never touches accumulation.
     void set_denoise(const RenderSettings& s);
     void set_denoise_view(int aov, float wipe);
+    // v1.2 spectral: sync the mode + dispersion into the renderer's own
+    // settings copy. Changes tracing, so the caller marks the scene dirty.
+    void set_spectral(int on, float dispersion_b);
 
     // Bridged id<MTLDevice>, for CAMetalLayer.device.
     void* metal_device() const;

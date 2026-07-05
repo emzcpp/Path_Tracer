@@ -1720,6 +1720,10 @@ void render_thread_main(ViewerCore& core) {
         ImGui::Text("estimator: %s",
                     core_->settings.env_nee ? "NEE+MIS" : "brute force");
     }
+    if (core_->settings.spectral != 0) {
+        ImGui::Text("spectral: hero-wavelength 400-700nm, dispersion %.3f",
+                    core_->settings.dispersion_b);
+    }
 
     // Session G telemetry: per-CB GPU time vs budget, main-thread tick
     // time, and the shape of the last submitted slice.
@@ -2153,6 +2157,34 @@ void render_thread_main(ViewerCore& core) {
         }
         if (changed) {
             gpu.set_restir(s);
+            dirty = true;
+        }
+    }
+    {
+        // v1.2 spectral dispersion. Changes tracing (one wavelength per
+        // path, wavelength-dependent glass IOR), so it RESETS accumulation
+        // — not display-only like the denoiser. Uses the monolithic
+        // NEE+MIS / brute estimator; pairs best with ReSTIR off.
+        bool sp_on = s.spectral != 0;
+        bool changed = false;
+        if (ImGui::Checkbox("spectral dispersion", &sp_on)) {
+            s.spectral = sp_on ? 1 : 0;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Each path carries ONE wavelength (400-700nm); the glass\n"
+                "IOR is wavelength-dependent (Cauchy), so glass disperses\n"
+                "white light into a spectrum. Neutral scenes still\n"
+                "reconstruct to the same RGB image. NEE+MIS path.");
+        }
+        if (sp_on) {
+            changed |= ImGui::SliderFloat("dispersion", &s.dispersion_b,
+                                          0.0f, 0.15f, "%.3f");
+            ImGui::TextDisabled("hero-wavelength; 0 = no dispersion");
+        }
+        if (changed) {
+            gpu.set_spectral(s.spectral, s.dispersion_b);
             dirty = true;
         }
     }

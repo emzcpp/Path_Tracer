@@ -59,6 +59,24 @@ Most hobby path tracers are one backend, eyeballed for correctness. This one is 
 - Spatial reuse: neighbor reservoir sharing under the Talbot balance heuristic (provably unbiased for arbitrary support overlap).
 - All three dimensions unbiased against brute force; toggle with `G`.
 
+### Spectral dispersion (v1.2)
+- A `--spectral` mode (also `--prism`, or the Render-tab toggle) where each
+  path carries ONE wavelength (400-700nm) instead of an RGB triple; RGB is
+  reconstructed at the sensor through the Wyman-Sloan analytic CIE fit ->
+  XYZ -> linear sRGB, with a baked round-trip correction so neutral scenes
+  reconstruct to the same image (white stays white).
+- Glass IOR is wavelength-dependent (Cauchy `n(λ)=A+B/λ²`), so a glass
+  sphere disperses white light into a rainbow caustic + colored edge
+  fringing — real prism dispersion, tunable from subtle to strong. `B=0`
+  reduces exactly to the RGB glass.
+- A display-only knob by design's opposite: it changes *tracing*, so it
+  resets accumulation (unlike the denoiser). Default OFF -> `--parity`,
+  `--brute`, and performance are byte-identical to the RGB pipeline; ON ->
+  CPU and GPU still agree same-seed (hand-matched λ sampling + CMF). Uses
+  the NEE+MIS estimator; pairs with ReSTIR off.
+
+![Glass sphere dispersion, spectral, B=0.10](docs/prism_dispersion.png)
+
 ### Real-time denoiser (v1.1, display-only)
 - Edge-aware À-trous / SVGF-style wavelet filter, guided by the G-buffer
   (shading normal, depth, and albedo edge-stops) with albedo demodulation

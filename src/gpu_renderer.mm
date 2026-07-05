@@ -1074,6 +1074,11 @@ void GpuRenderer::set_env_nee(bool on) {
     impl_->settings.env_nee = on ? 1 : 0;
 }
 
+void GpuRenderer::set_spectral(int on, float dispersion_b) {
+    impl_->settings.spectral = on;
+    impl_->settings.dispersion_b = dispersion_b;
+}
+
 void GpuRenderer::set_denoise(const RenderSettings& s) {
     impl_->settings.denoise = s.denoise;
     impl_->settings.denoise_iters = s.denoise_iters;
