@@ -16,6 +16,7 @@
 
 #include "gltf_loader.h"
 #include "image.h"
+#include "mesh_gen.h"
 #include "renderer.h"
 #include "scene_setup.h"
 #include "settings.h"
@@ -255,6 +256,7 @@ int main(int argc, char** argv) {
     bool only_model = false;     // mesh + env only (no sphere field)
     bool lights_demo = false;    // add a grid of emissive fixtures (ReSTIR)
     bool prism_demo = false;     // v1.2: a glass sphere for dispersion
+    bool prism_mesh = false;     // v1.2: a triangular GLASS PRISM mesh
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--offline") == 0) {
@@ -283,6 +285,10 @@ int main(int argc, char** argv) {
             prism_demo = true;
             settings.spectral = 1;
             settings.dispersion_b = 0.08f;
+        } else if (std::strcmp(argv[i], "--prism-mesh") == 0) {
+            prism_mesh = true;
+            settings.spectral = 1;
+            settings.dispersion_b = 0.12f;
         } else if (std::strcmp(argv[i], "--lights-demo") == 0) {
             lights_demo = true;
         } else if (std::strcmp(argv[i], "--model-height") == 0 && i + 1 < argc) {
@@ -351,6 +357,13 @@ int main(int argc, char** argv) {
                      "no model found (looked for Test_Models/Damaged Helmet"
                      ".glb) — sphere scene; use --model <path>\n");
     }
+    if (prism_mesh) {
+        mesh = mesh_gen::glass_prism(point3(0.0f, 0.8f, 0.0f), 1.3f, 0.75f,
+                                     1.5f);
+        std::printf("prism-mesh: generated triangular glass prism (%zu "
+                    "tris)\n",
+                    mesh->tris.size());
+    }
     SceneDesc desc =
         grid ? build_grid_desc() : build_scene_desc(std::move(mesh));
     if (desc.mesh && !resolved_model.empty()) {
@@ -411,6 +424,28 @@ int main(int argc, char** argv) {
             {point3(0.0f, 1.0f, 0.0f), 1.0f, glass, "Glass prism-sphere"});
         std::printf("prism demo: glass sphere, spectral on, dispersion "
                     "B=%.3f\n",
+                    settings.dispersion_b);
+    }
+    if (prism_mesh) {
+        // Dark stage + one bright compact source so the prism's dispersed
+        // spectrum pops (the generated prism is already desc.mesh). Camera
+        // faces the prism head-on.
+        desc.spheres.clear();
+        desc.spheres.push_back(
+            {point3(0.0f, -1000.0f, 0.0f), 1000.0f,
+             Material::lambertian(color(0.25f, 0.25f, 0.27f)), "Floor"});
+        desc.spheres.push_back(
+            {point3(0.0f, 0.0f, -1002.2f), 1000.0f,
+             Material::lambertian(color(0.05f, 0.05f, 0.06f)), "Backdrop"});
+        desc.spheres.push_back({point3(-3.0f, 3.2f, -1.2f), 0.55f,
+                                Material::emissive(color(60, 60, 60)),
+                                "Beam"});
+        desc.env.reset();               // near-dark dome
+        desc.env_intensity = 0.02f;
+        settings.cam_pos = point3(0.0f, 0.85f, 3.2f);
+        settings.cam_look_at = point3(0.0f, 0.75f, 0.0f);
+        settings.max_depth = 12;
+        std::printf("prism-mesh: spectral on, dispersion B=%.3f\n",
                     settings.dispersion_b);
     }
     if (brute) {

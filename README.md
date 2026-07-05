@@ -75,6 +75,12 @@ Most hobby path tracers are one backend, eyeballed for correctness. This one is 
   CPU and GPU still agree same-seed (hand-matched λ sampling + CMF). Uses
   the NEE+MIS estimator; pairs with ReSTIR off.
 
+Mesh materials can be glass too (KHR_materials_transmission / ior on
+import, or the generated `--prism-mesh` prism), so the dispersion showcase
+is a real triangular prism splitting light into a spectrum:
+
+![Triangular glass prism dispersion, spectral](docs/prism_mesh.png)
+
 ![Glass sphere dispersion, spectral, B=0.10](docs/prism_dispersion.png)
 
 ### Real-time denoiser (v1.1, display-only)
