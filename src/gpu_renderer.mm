@@ -520,6 +520,8 @@ struct GpuRenderer::Impl {
             e.emis_h = pt_uint(m.emissive.h);
             e.norm_w = pt_uint(m.normal.w);
             e.norm_h = pt_uint(m.normal.h);
+            e.transmission = m.transmission;
+            e.ior = m.ior;
             table.push_back(e);
         }
         mat_table =

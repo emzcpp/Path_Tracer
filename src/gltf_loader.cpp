@@ -310,6 +310,15 @@ MeshMaterial bake_material(const cgltf_material* mat,
         }
         out.mean_emission = float(sum / double(n));
     }
+
+    // v1.2 mesh glass: KHR_materials_transmission + KHR_materials_ior. cgltf
+    // parses both; absent -> opaque defaults (0 / 1.5), so every existing
+    // asset is unchanged. The delta-glass BSDF treats transmission as a
+    // binary switch (>0.5), matching the sphere path.
+    if (mat->has_transmission)
+        out.transmission = mat->transmission.transmission_factor;
+    if (mat->has_ior) out.ior = mat->ior.ior;
+
     return out;
 }
 

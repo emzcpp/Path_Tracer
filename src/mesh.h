@@ -173,8 +173,8 @@ inline Material eval_mesh_material(const MeshData& m, std::uint32_t mat_id,
     out.emission = emis * m.emissive_scale;
     out.metallic = mr.z;    // glTF: B = metallic
     out.roughness = mr.y;   // glTF: G = roughness (perceptual)
-    out.ior = 1.5f;
-    out.transmission = 0.0f;
+    out.ior = set.ior;
+    out.transmission = set.transmission;
     return out;
 }
 
@@ -231,6 +231,12 @@ public:
         rec.normal = front ? ns : -ns;
         rec.front_face = front;
         rec.mat = eval_mesh_material(*data_, data_->tri_mat[best.tri], u, v);
+        // Glass refracts through the GEOMETRIC normal (never the
+        // interpolated/normal-mapped shading normal): a bent shading normal
+        // would send the refracted ray off-axis and leak/blacken the glass.
+        if (rec.mat.transmission > 0.5f) {
+            rec.normal = front ? normalize(ng) : -normalize(ng);
+        }
         // Session J: triangle lights enumerate first, so the stored
         // ordinal+1 IS the global light id + 1.
         rec.light_id = data_->tri_light.empty()

@@ -45,6 +45,13 @@ struct MeshMaterial {
     // power-proportional selection weight; the estimator itself evaluates
     // the ACTUAL textured Le at each sampled point.
     float mean_emission = 0.0f;
+    // v1.2 mesh glass: the delta-dielectric fields the sphere path already
+    // had. transmission > 0.5 -> the mesh triangle routes through the SAME
+    // glass BSDF (Schlick reflect/refract + TIR, spectral n(lambda)).
+    // Defaults keep every existing mesh opaque (byte-identical to before).
+    // Read from glTF KHR_materials_transmission / KHR_materials_ior.
+    float transmission = 0.0f;
+    float ior = 1.5f;
 };
 
 struct MeshData {

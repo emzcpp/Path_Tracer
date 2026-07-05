@@ -145,6 +145,9 @@ struct GPUMaterialArgs {
 #endif
     pt_uint base_w, base_h, mr_w, mr_h;
     pt_uint emis_w, emis_h, norm_w, norm_h;
+    // v1.2 mesh glass: per-material delta-dielectric scalars (0 / 1.5 keep
+    // the material opaque, as every existing mesh is).
+    float transmission, ior;
 };
 
 // Session J: one scene emitter for area-light NEE. Shared POD, built on
@@ -223,8 +226,8 @@ static_assert(sizeof(GPULight) == 96, "GPULight must be six 16B rows");
 static_assert(sizeof(GBufferPx) == 96, "GBufferPx must be six 16B rows");
 static_assert(sizeof(ReSTIRSlot) == 32, "ReSTIRSlot layout drifted");
 static_assert(sizeof(ReSTIRPixel) == 96, "ReSTIRPixel layout drifted");
-static_assert(sizeof(GPUMaterialArgs) == 64,
-              "GPUMaterialArgs must be four 8B pointers + eight uints");
+static_assert(sizeof(GPUMaterialArgs) == 72,
+              "GPUMaterialArgs: 4 pointers + 8 uints + 2 floats (glass)");
 #endif
 
 #endif // PT_KERNEL_TYPES_H

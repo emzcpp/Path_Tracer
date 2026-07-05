@@ -369,8 +369,8 @@ inline EvalMat eval_mesh_material(device const GPUMaterialArgs* mats,
     m.emission = emis * MU.emissive_scale;
     m.metallic = mr.z;    // glTF: B = metallic
     m.roughness = mr.y;   // glTF: G = roughness (perceptual)
-    m.ior = 1.5f;
-    m.transmission = 0.0f;
+    m.ior = M.ior;
+    m.transmission = M.transmission;
     return m;
 }
 
@@ -875,6 +875,10 @@ inline bool scene_hit_eval(float3 ro, float3 rd, constant GPUSphere* spheres,
         }
         out.hn = out.front ? ns : -ns;
         out.mat = eval_mesh_material(materials, mid, MU, u, v);
+        // Glass refracts through the GEOMETRIC normal — mirror of mesh.h.
+        if (out.mat.transmission > 0.5f) {
+            out.hn = out.front ? normalize(ng) : -normalize(ng);
+        }
         out.light_id = int(tri_light[th.tri]) - 1;
     } else {
         out.hp = rec.p;
