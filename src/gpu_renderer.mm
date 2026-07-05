@@ -327,6 +327,8 @@ struct GpuRenderer::Impl {
             pt_uint(settings.restir_radius > 1 ? settings.restir_radius : 1);
         u.restir_mcap =
             pt_uint(settings.restir_mcap > 1 ? settings.restir_mcap : 1);
+        u.spectral = pt_uint(settings.spectral != 0 ? 1 : 0);
+        u.dispersion_b = settings.dispersion_b;
         return u;
     }
 

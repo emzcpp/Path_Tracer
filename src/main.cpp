@@ -276,6 +276,8 @@ int main(int argc, char** argv) {
             brute = true;
         } else if (std::strcmp(argv[i], "--restir") == 0) {
             settings.restir = 1;
+        } else if (std::strcmp(argv[i], "--spectral") == 0) {
+            settings.spectral = 1;
         } else if (std::strcmp(argv[i], "--lights-demo") == 0) {
             lights_demo = true;
         } else if (std::strcmp(argv[i], "--model-height") == 0 && i + 1 < argc) {

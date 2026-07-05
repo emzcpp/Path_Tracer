@@ -15,6 +15,7 @@
 #include "texture.h"
 #include "ray.h"
 #include "rng.h"
+#include "spectral.h"
 
 // The dome light: sky white at the horizon blending to blue overhead.
 // Paths that escape the scene pick up this radiance. Emissive surfaces in
@@ -293,7 +294,10 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
                           const EnvLookup& env, const LightsLookup& lights,
                           float clamp_indirect, const color& throughput,
                           color& radiance, bool& can_nee_out,
-                          bool& can_nee_light_out) {
+                          bool& can_nee_light_out,
+                          const SpecCtx& sc = SpecCtx{false, 0.0f,
+                                                      color(1.0f, 1.0f,
+                                                            1.0f)}) {
         // ---- Session H: next-event estimation toward the environment.
         // Deliberately sample the env distribution (the sun), evaluate the
         // BSDF for that direction, and add the contribution if the shadow
@@ -323,9 +327,10 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
                         const float w =
                             (pdf_env * pdf_env) /
                             (pdf_env * pdf_env + pdf_b * pdf_b + 1e-20f);
-                        const color c = throughput * f * nl *
-                                        miss_radiance(env, shadow) *
-                                        (w / pdf_env);
+                        const color c =
+                            throughput *
+                            spec_dep2(sc, f, miss_radiance(env, shadow)) *
+                            (nl * w / pdf_env);
                         radiance += clamp_contribution(c, clamp_indirect);
                     }
                 }
@@ -379,8 +384,8 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
                         const float pl = pdf_sa * L.sel_pdf;
                         const float w =
                             (pl * pl) / (pl * pl + pdf_b * pdf_b + 1e-20f);
-                        const color c = throughput * f * nl * Le *
-                                        (w / pl);
+                        const color c = throughput * spec_dep2(sc, f, Le) *
+                                        (nl * w / pl);
                         radiance += clamp_contribution(c, clamp_indirect);
                     }
                 }
@@ -1025,9 +1030,12 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                    // hit and skips vertex-0 direct (the direct phase
                    // computed it with the same rng draws).
                    const HitRecord* pre = nullptr,
-                   bool skip_v0_direct = false) {
+                   bool skip_v0_direct = false, bool spectral = false) {
     color radiance(0.0f);      // light collected so far
     color throughput(1.0f);    // fraction of it that survives back to the eye
+    // v1.2 hero-wavelength: sample one lambda per path (one rng draw, here,
+    // so both backends align) — or the identity context when spectral off.
+    const SpecCtx sc = spec_begin(spectral, rng);
     bool prev_nee = false;     // env NEE ran at the previous path vertex
     bool prev_nee_light = false;   // area-light NEE ran there too
     float prev_pdf = 0.0f;     // BSDF pdf of the ray we're now following
@@ -1056,7 +1064,8 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                 w = (prev_pdf * prev_pdf) /
                     (prev_pdf * prev_pdf + pe * pe + 1e-20f);
             }
-            const color c = throughput * miss_radiance(env, ray) * w;
+            const color c =
+                throughput * spec_dep(sc, miss_radiance(env, ray)) * w;
             radiance +=
                 (depth == 0 ? c : clamp_contribution(c, clamp_indirect));
             return radiance;
@@ -1080,7 +1089,7 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                 w = (prev_pdf * prev_pdf) /
                     (prev_pdf * prev_pdf + pl * pl + 1e-20f);
             }
-            const color c = throughput * rec.mat.emission * w;
+            const color c = throughput * spec_dep(sc, rec.mat.emission) * w;
             radiance +=
                 depth == 0 ? c : clamp_contribution(c, clamp_indirect);
         }
@@ -1095,7 +1104,7 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
         } else {
             bool v_nee = false, v_nee_light = false;
             sample_direct(rec, ray, world, rng, env, lights, clamp_indirect,
-                          throughput, radiance, v_nee, v_nee_light);
+                          throughput, radiance, v_nee, v_nee_light, sc);
             prev_nee = v_nee;
             prev_nee_light = v_nee_light;
         }
@@ -1108,7 +1117,7 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                      scatter_pdf, scatter_delta)) {
             return radiance;                         // light hit, or absorbed
         }
-        throughput *= attenuation;
+        throughput *= spec_atten(sc, attenuation);
         ray = scattered;
         prev_pdf = scatter_delta ? 0.0f : scatter_pdf;
         if (scatter_delta) prev_nee = false;   // delta chains keep full env

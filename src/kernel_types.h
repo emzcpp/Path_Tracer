@@ -69,6 +69,11 @@ struct PassUniforms {
     pt_uint restir_k;        // spatial neighbors (<= PT_RESTIR_NEIGHBORS)
     pt_uint restir_radius;   // spatial radius, pixels
     pt_uint restir_mcap;     // temporal M-cap multiplier (x M)
+    // v1.2 spectral rendering (hero-wavelength). spectral == 0 -> RGB path,
+    // byte-identical to pre-feature. dispersion_b feeds the Cauchy IOR.
+    pt_uint spectral;
+    float dispersion_b;
+    pt_uint pad_s0, pad_s1;
 };
 
 // v1.1 denoiser (display-only post-process; OUTSIDE the parity surface —
@@ -208,7 +213,7 @@ struct GBufferPx {
 static_assert(sizeof(pt_float3) == 12, "pt_float3 must be 12 bytes");
 static_assert(sizeof(GPUSphere) == 64, "GPUSphere must be one cacheline");
 static_assert(sizeof(GPUCamera) == 48, "GPUCamera layout drifted");
-static_assert(sizeof(PassUniforms) == 128, "PassUniforms layout drifted");
+static_assert(sizeof(PassUniforms) == 144, "PassUniforms layout drifted");
 static_assert(sizeof(ResolveUniforms) == 24, "ResolveUniforms layout drifted");
 static_assert(sizeof(DenoiseUniforms) == 64, "DenoiseUniforms layout drifted");
 static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");

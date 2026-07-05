@@ -887,6 +887,78 @@ inline bool scene_hit_eval(float3 ro, float3 rd, constant GPUSphere* spheres,
 // estimator shared by the monolithic kernel and the partitioned direct
 // phase. Appends into `radiance` in the original order; same rng draws
 // under the same conditions.
+// ---- v1.2 spectral core — mirror of spectral.h (--parity is the drift
+// detector). See that header for the derivation; constants are identical.
+constant float SPEC_LMIN = 400.0f;
+constant float SPEC_BAND = 300.0f;
+
+inline float spec_sample_wavelength(float u) {
+    return SPEC_LMIN + u * SPEC_BAND;
+}
+inline float wyman_g(float x, float mu, float s1, float s2) {
+    const float t = (x - mu) * (x < mu ? 1.0f / s1 : 1.0f / s2);
+    return exp(-0.5f * t * t);
+}
+inline float3 cie_xyz_fit(float l) {
+    const float x = 1.056f * wyman_g(l, 599.8f, 37.9f, 31.0f) +
+                    0.362f * wyman_g(l, 442.0f, 16.0f, 26.7f) -
+                    0.065f * wyman_g(l, 501.1f, 20.4f, 26.2f);
+    const float y = 0.821f * wyman_g(l, 568.8f, 46.9f, 40.5f) +
+                    0.286f * wyman_g(l, 530.9f, 16.3f, 31.1f);
+    const float z = 1.217f * wyman_g(l, 437.0f, 11.8f, 36.0f) +
+                    0.681f * wyman_g(l, 459.0f, 26.0f, 13.8f);
+    return float3(x, y, z);
+}
+inline float3 spec_response(float l) {
+    const float3 c = cie_xyz_fit(l);
+    const float R = 3.2406f * c.x - 1.5372f * c.y - 0.4986f * c.z;
+    const float G = -0.9689f * c.x + 1.8758f * c.y + 0.0415f * c.z;
+    const float B = 0.0557f * c.x - 0.2040f * c.y + 1.0570f * c.z;
+    return float3(R * 2.33749215f, G * 2.95510157f, B * 3.10746416f);
+}
+inline float spec_reflectance(float3 rgb0, float l) {
+    // Round-trip correction (C^-1) — mirror of spectral.h.
+    const float3 rgb =
+        float3(0.838717f * rgb0.x + 0.148845f * rgb0.y + 0.012780f * rgb0.z,
+               -0.117719f * rgb0.x + 1.103062f * rgb0.y + 0.014987f * rgb0.z,
+               -0.023000f * rgb0.x + 0.011697f * rgb0.y + 1.011686f * rgb0.z);
+    const float3 c = cie_xyz_fit(l);
+    const float R = fmax(0.0f, 3.2406f * c.x - 1.5372f * c.y - 0.4986f * c.z);
+    const float G = fmax(0.0f, -0.9689f * c.x + 1.8758f * c.y + 0.0415f * c.z);
+    const float B = fmax(0.0f, 0.0557f * c.x - 0.2040f * c.y + 1.0570f * c.z);
+    const float sum = R + G + B;
+    if (sum <= 1e-8f) return 0.0f;
+    return (rgb.x * R + rgb.y * G + rgb.z * B) / sum;
+}
+
+struct SpecCtx {
+    bool on;
+    float lam;
+    float3 resp;
+};
+inline SpecCtx spec_begin(bool on, thread PRNG& rng) {
+    SpecCtx s;
+    s.on = on;
+    s.lam = 0.0f;
+    s.resp = float3(1.0f);
+    if (on) {
+        s.lam = spec_sample_wavelength(pcg_next_float(rng));
+        s.resp = spec_response(s.lam);
+    }
+    return s;
+}
+inline float3 spec_dep(thread const SpecCtx& s, float3 src) {
+    return s.on ? s.resp * spec_reflectance(src, s.lam) : src;
+}
+inline float3 spec_dep2(thread const SpecCtx& s, float3 a, float3 b) {
+    if (!s.on) return a * b;
+    return s.resp * (spec_reflectance(a, s.lam) * spec_reflectance(b, s.lam));
+}
+inline float3 spec_atten(thread const SpecCtx& s, float3 a) {
+    if (!s.on) return a;
+    return float3(spec_reflectance(a, s.lam));
+}
+
 inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                           float3 rd, thread PRNG& rng, float3 throughput,
                           thread float3& radiance,
@@ -901,7 +973,8 @@ inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                           constant MeshUniforms& MU,
                           constant PassUniforms& U,
                           thread bool& can_nee_out,
-                          thread bool& can_nee_light_out) {
+                          thread bool& can_nee_light_out,
+                          thread const SpecCtx& sc) {
         // ---- Session H: next-event estimation toward the environment.
         // Deliberately sample the env distribution (the sun), evaluate the
         // BSDF for that direction, and add the contribution if the shadow
@@ -930,11 +1003,12 @@ inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                             (pdf_env * pdf_env) /
                             (pdf_env * pdf_env + pdf_b * pdf_b + 1e-20f);
                         const float3 c =
-                            throughput * f * nl *
-                            miss_radiance(env_texels, U.env_w, U.env_h,
-                                          U.env_intensity, U.env_yaw_norm,
-                                          ldir) *
-                            (w / pdf_env);
+                            throughput *
+                            spec_dep2(sc, f,
+                                      miss_radiance(env_texels, U.env_w,
+                                                    U.env_h, U.env_intensity,
+                                                    U.env_yaw_norm, ldir)) *
+                            (nl * w / pdf_env);
                         radiance += clamp_contribution(c, U.clamp_indirect);
                     }
                 }
@@ -988,8 +1062,8 @@ inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                         const float pl = pdf_sa * L.sel_pdf;
                         const float w =
                             (pl * pl) / (pl * pl + pdf_b * pdf_b + 1e-20f);
-                        const float3 c = throughput * f * nl * Le *
-                                         (w / pl);
+                        const float3 c = throughput * spec_dep2(sc, f, Le) *
+                                         (nl * w / pl);
                         radiance += clamp_contribution(c, U.clamp_indirect);
                     }
                 }
@@ -1015,9 +1089,12 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     // direct lighting (the direct phase computed it with
                     // the same rng draws).
                     bool has_pre, thread const HitInfo& pre,
-                    bool skip_v0_direct) {
+                    bool skip_v0_direct, bool spectral) {
     float3 radiance = float3(0.0f);
     float3 throughput = float3(1.0f);
+    // v1.2 hero-wavelength: one lambda per path (one rng draw, here, so
+    // both backends align) — identity context when spectral is off.
+    const SpecCtx sc = spec_begin(spectral, rng);
     bool prev_nee = false;   // env NEE ran at the previous path vertex
     bool prev_nee_light = false;   // area-light NEE ran there too
     float prev_pdf = 0.0f;   // BSDF pdf of the ray we're now following
@@ -1048,11 +1125,12 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                 w = (prev_pdf * prev_pdf) /
                     (prev_pdf * prev_pdf + pe * pe + 1e-20f);
             }
-            const float3 c = throughput *
-                             miss_radiance(env_texels, U.env_w, U.env_h,
+            const float3 c =
+                throughput *
+                spec_dep(sc, miss_radiance(env_texels, U.env_w, U.env_h,
                                            U.env_intensity, U.env_yaw_norm,
-                                           rd) *
-                             w;
+                                           rd)) *
+                w;
             radiance +=
                 (depth == 0u ? c : clamp_contribution(c, U.clamp_indirect));
             return radiance;
@@ -1078,7 +1156,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                 w = (prev_pdf * prev_pdf) /
                     (prev_pdf * prev_pdf + pl * pl + 1e-20f);
             }
-            const float3 c = throughput * mat.emission * w;
+            const float3 c = throughput * spec_dep(sc, mat.emission) * w;
             radiance += depth == 0u
                             ? c
                             : clamp_contribution(c, U.clamp_indirect);
@@ -1096,7 +1174,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             sample_direct(hp, hn, mat, rd, rng, throughput, radiance,
                           spheres, n, nodes, tris, materials, env_texels,
                           env_row_cdf, env_cond_cdf, lights, MU, U, v_nee,
-                          v_nee_light);
+                          v_nee_light, sc);
             prev_nee = v_nee;
             prev_nee_light = v_nee_light;
         }
@@ -1108,7 +1186,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                      scatter_pdf, scatter_delta)) {
             return radiance;
         }
-        throughput *= attenuation;
+        throughput *= spec_atten(sc, attenuation);
         ro = hp;
         rd = new_dir;
         prev_pdf = scatter_delta ? 0.0f : scatter_pdf;
@@ -1172,7 +1250,8 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
         total += trace(ro, rd, spheres, U.sphere_count, nodes, tris,
                        materials, tri_mat, env_texels, env_row_cdf,
                        env_cond_cdf, lights, tri_light, MU, U, rng,
-                       U.max_depth, false, no_pre, false);
+                       U.max_depth, false, no_pre, false,
+                       U.spectral != 0u);
     }
     accum[px] += float4(total, 0.0f);
 }
@@ -2066,7 +2145,7 @@ kernel void indirect_v0(device float4* accum           [[buffer(0)]],
     const float3 c =
         trace(c3(g.pos), rd, spheres, U.sphere_count, nodes, tris, materials,
               tri_mat, env_texels, env_row_cdf, env_cond_cdf, lights,
-              tri_light, MU, U, rng, U.max_depth, true, pre, true);
+              tri_light, MU, U, rng, U.max_depth, true, pre, true, false);
     accum[px] += float4(c, 0.0f);
 }
 

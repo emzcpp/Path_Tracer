@@ -85,6 +85,12 @@ struct RenderSettings {
     int denoise = 0;
     int denoise_iters = 3;       // a-trous iterations (steps 1,2,4,..)
     int denoise_fade_spp = 96;
+    // v1.2 spectral rendering: each path carries ONE wavelength; RGB is
+    // reconstructed at the sensor. Changes tracing, so it resets
+    // accumulation (NOT display-only). dispersion_b feeds the Cauchy IOR
+    // n(lambda)=A+B/lambda^2 in Stage 2 (0 = no dispersion, matches Stage 1).
+    int spectral = 0;
+    float dispersion_b = 0.0f;
 
     // Execution
     int thread_count = 0;         // 0 = use all hardware threads
