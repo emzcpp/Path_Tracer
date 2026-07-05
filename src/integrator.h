@@ -1144,6 +1144,35 @@ inline void restir_spatial_shade(
     persist.prev_t = rec.t;
 }
 
+// v1.3 portal ray-rectangle intersection (front face only) + the rigid
+// transform to the partner. Mirrored in pathtrace.metal.
+inline bool hit_portal(const GPUPortal& P, const Ray& r, float t_min,
+                       float t_max, float& t_out) {
+    const vec3 n(P.normal.x, P.normal.y, P.normal.z);
+    const float denom = dot(n, r.dir);
+    if (denom >= -1e-9f) return false;   // parallel or hitting the back
+    const vec3 c(P.center.x, P.center.y, P.center.z);
+    const float t = dot(n, c - r.origin) / denom;
+    if (t < t_min || t > t_max) return false;
+    const vec3 d = (r.origin + t * r.dir) - c;
+    const vec3 u(P.u.x, P.u.y, P.u.z), vv(P.v.x, P.v.y, P.v.z);
+    const float a = dot(d, u) / dot(u, u);
+    const float b = dot(d, vv) / dot(vv, vv);
+    if (a < -1.0f || a > 1.0f || b < -1.0f || b > 1.0f) return false;
+    t_out = t;
+    return true;
+}
+inline point3 portal_xf_point(const GPUPortal& P, const point3& p) {
+    const vec3 r0(P.r0.x, P.r0.y, P.r0.z), r1(P.r1.x, P.r1.y, P.r1.z),
+        r2(P.r2.x, P.r2.y, P.r2.z);
+    return point3(dot(r0, p) + P.tx, dot(r1, p) + P.ty, dot(r2, p) + P.tz);
+}
+inline vec3 portal_xf_dir(const GPUPortal& P, const vec3& d) {
+    const vec3 r0(P.r0.x, P.r0.y, P.r0.z), r1(P.r1.x, P.r1.y, P.r1.z),
+        r2(P.r2.x, P.r2.y, P.r2.z);
+    return vec3(dot(r0, d), dot(r1, d), dot(r2, d));
+}
+
 inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                    const EnvLookup& env, const LightsLookup& lights,
                    float clamp_indirect,
@@ -1154,7 +1183,8 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                    bool skip_v0_direct = false, bool spectral = false,
                    float dispersion_b = 0.0f, float fog_sigma = 0.0f,
                    float fog_g = 0.0f,
-                   color fog_albedo = color(1.0f, 1.0f, 1.0f)) {
+                   color fog_albedo = color(1.0f, 1.0f, 1.0f),
+                   const GPUPortal* portals = nullptr, int portal_count = 0) {
     color radiance(0.0f);      // light collected so far
     color throughput(1.0f);    // fraction of it that survives back to the eye
     // v1.2 hero-wavelength: sample one lambda per path (one rng draw, here,
@@ -1185,9 +1215,21 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
         // cancels the reach-probability). Both backends take the SAME
         // branch for a given (pixel,pass) since t_c and t_surf are
         // deterministic, so parity holds.
+        // v1.3 portals: fold the closest portal into the "surface"
+        // distance (so fog handles a medium scatter BEFORE the portal). No
+        // rng draw here — a pure geometric query.
+        float t_surf =
+            hit_any ? rec.t : std::numeric_limits<float>::infinity();
+        int phit = -1;
+        for (int pi = 0; pi < portal_count; ++pi) {
+            float tp;
+            if (hit_portal(portals[pi], ray, 1e-3f, t_surf, tp)) {
+                phit = pi;
+                t_surf = tp;
+            }
+        }
+
         if (fog_sigma > 0.0f) {
-            const float t_surf =
-                hit_any ? rec.t : std::numeric_limits<float>::infinity();
             const float uc = rng.next_float();
             const float t_c =
                 -std::log(std::fmax(1e-30f, 1.0f - uc)) / fog_sigma;
@@ -1218,6 +1260,18 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                 continue;   // scattered in the medium — no surface this step
             }
             // reached the surface: throughput unchanged (baked-in cancel)
+        }
+
+        // v1.3 portal teleport: the closest hit is a portal — rigidly
+        // redirect the ray to the partner and continue the SAME path. No
+        // shading, NEE, cosine, attenuation, or rng draw. Consumes one
+        // depth step, so recursion is bounded by max_depth.
+        if (phit >= 0) {
+            const point3 hp = ray.origin + t_surf * ray.dir;
+            const point3 hp2 = portal_xf_point(portals[phit], hp);
+            const vec3 d2 = normalize(portal_xf_dir(portals[phit], ray.dir));
+            ray = Ray(hp2 + 1e-3f * d2, d2);   // offset off the seam
+            continue;
         }
 
         if (!hit_any) {

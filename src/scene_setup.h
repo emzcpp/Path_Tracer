@@ -39,7 +39,66 @@ struct SceneDesc {
     std::string env_source_path;
     float env_intensity = 1.0f;
     float env_yaw_deg = 0.0f;
+
+    // v1.3 recursive portals (empty = none, so no-portal scenes are
+    // byte-identical). Built in pairs by make_portal_pair.
+    std::vector<GPUPortal> portals;
 };
+
+// Build one portal rectangle from a frame (center + world half-edges u,v),
+// with the rigid transform to a partner portal precomputed:
+//   R = R_B * R_A^T,   t = cB - R*cA
+// "connected openings" (aligned wormhole): a ray keeps its heading in the
+// partner's frame, so parallel same-facing portals read as a window into
+// the partner's location (through A you see what is behind B). R_A^T maps
+// world -> A-local; R_B maps A-local -> world in B's frame.
+inline GPUPortal make_portal(const point3& c, const vec3& u, const vec3& v,
+                             const point3& pc, const vec3& pu, const vec3& pv) {
+    const auto basis = [](const vec3& uu, const vec3& vv, vec3& r, vec3& up,
+                          vec3& n) {
+        r = normalize(uu);
+        up = normalize(vv);
+        n = normalize(cross(uu, vv));
+    };
+    vec3 rA, upA, nA, rB, upB, nB;
+    basis(u, v, rA, upA, nA);
+    basis(pu, pv, rB, upB, nB);
+    // R_A columns = (rA, upA, nA); R_A^T rows = those. Flip180 about up:
+    // diag(-1, 1, -1) in local space. Combined rotation R = R_B * F * R_A^T.
+    // Row i of R = R_B * F * (col i of R_A). Compute R via basis images.
+    const auto Rt = [&](const vec3& p) {   // R_A^T * p  (world -> A local)
+        return vec3(dot(rA, p), dot(upA, p), dot(nA, p));
+    };
+    const auto RB = [&](const vec3& l) {   // R_B * l  (A local -> B world)
+        return rB * l.x + upB * l.y + nB * l.z;
+    };
+    const auto R = [&](const vec3& p) { return RB(Rt(p)); };
+    GPUPortal P{};
+    P.center = {c.x, c.y, c.z};
+    P.u = {u.x, u.y, u.z};
+    P.v = {v.x, v.y, v.z};
+    P.normal = {nA.x, nA.y, nA.z};
+    const vec3 t = pc - R(vec3(c.x, c.y, c.z));
+    // Store R's ROWS: r0 = R applied to basis vectors' x-components. Easiest:
+    // R's rows are (R(e_x).comp? ) — instead store rows as R(e_i) transposed.
+    const vec3 rx = R(vec3(1, 0, 0)), ry = R(vec3(0, 1, 0)), rz = R(vec3(0, 0, 1));
+    // rx/ry/rz are the COLUMNS of R; its rows are (rx.x,ry.x,rz.x), etc.
+    P.r0 = {rx.x, ry.x, rz.x};
+    P.tx = t.x;
+    P.r1 = {rx.y, ry.y, rz.y};
+    P.ty = t.y;
+    P.r2 = {rx.z, ry.z, rz.z};
+    P.tz = t.z;
+    return P;
+}
+
+// A↔B pair: two rectangles, each transporting to the other.
+inline void make_portal_pair(std::vector<GPUPortal>& out, const point3& ca,
+                             const vec3& ua, const vec3& va, const point3& cb,
+                             const vec3& ub, const vec3& vb) {
+    out.push_back(make_portal(ca, ua, va, cb, ub, vb));   // A -> B
+    out.push_back(make_portal(cb, ub, vb, ca, ua, va));   // B -> A
+}
 
 inline EnvLookup env_lookup(const SceneDesc& desc, bool nee = true) {
     EnvLookup e;

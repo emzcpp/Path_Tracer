@@ -1201,6 +1201,31 @@ inline void sample_medium(float3 p, float3 d, thread PRNG& rng,
     can_nee_light_out = can_nee_light;
 }
 
+// v1.3 portal helpers — mirror of integrator.h.
+inline bool hit_portal(device const GPUPortal& P, float3 ro, float3 rd,
+                       float t_min, float t_max, thread float& t_out) {
+    const float3 nrm = c3(P.normal);
+    const float denom = dot(nrm, rd);
+    if (denom >= -1e-9f) return false;
+    const float3 c = c3(P.center);
+    const float t = dot(nrm, c - ro) / denom;
+    if (t < t_min || t > t_max) return false;
+    const float3 d = (ro + t * rd) - c;
+    const float3 u = c3(P.u), vv = c3(P.v);
+    const float a = dot(d, u) / dot(u, u);
+    const float b = dot(d, vv) / dot(vv, vv);
+    if (a < -1.0f || a > 1.0f || b < -1.0f || b > 1.0f) return false;
+    t_out = t;
+    return true;
+}
+inline float3 portal_xf_point(device const GPUPortal& P, float3 p) {
+    return float3(dot(c3(P.r0), p) + P.tx, dot(c3(P.r1), p) + P.ty,
+                  dot(c3(P.r2), p) + P.tz);
+}
+inline float3 portal_xf_dir(device const GPUPortal& P, float3 d) {
+    return float3(dot(c3(P.r0), d), dot(c3(P.r1), d), dot(c3(P.r2), d));
+}
+
 inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     uint n, device const BVHNode* nodes,
                     device const GPUTriangle* tris,
@@ -1219,7 +1244,8 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     // the same rng draws).
                     bool has_pre, thread const HitInfo& pre,
                     bool skip_v0_direct, bool spectral, float fog_sigma,
-                    float fog_g, float3 fog_albedo) {
+                    float fog_g, float3 fog_albedo,
+                    device const GPUPortal* portals, uint portal_count) {
     float3 radiance = float3(0.0f);
     float3 throughput = float3(1.0f);
     // v1.2 hero-wavelength: one lambda per path (one rng draw, here, so
@@ -1246,8 +1272,19 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
         // integrator.h. Collision before the surface -> scatter in the
         // medium (throughput *= albedo, in-scatter NEE, HG continuation);
         // else reach the surface, throughput unchanged.
+        // v1.3 portals: fold the closest portal into the surface distance
+        // (mirror of integrator.h). No rng draw.
+        float t_surf = hit_any ? hi.t : INFINITY;
+        int phit = -1;
+        for (uint pi = 0u; pi < portal_count; ++pi) {
+            float tp;
+            if (hit_portal(portals[pi], ro, rd, 1e-3f, t_surf, tp)) {
+                phit = int(pi);
+                t_surf = tp;
+            }
+        }
+
         if (fog_sigma > 0.0f) {
-            const float t_surf = hit_any ? hi.t : INFINITY;
             const float uc = pcg_next_float(rng);
             const float t_c = -log(fmax(1e-30f, 1.0f - uc)) / fog_sigma;
             if (t_c < t_surf) {
@@ -1279,6 +1316,18 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                 continue;
             }
         }
+
+        // v1.3 portal teleport — mirror of integrator.h. Loss-less rigid
+        // redirect; consumes one depth step (recursion bounded by max_depth).
+        if (phit >= 0) {
+            const float3 hp = ro + t_surf * rd;
+            const float3 hp2 = portal_xf_point(portals[phit], hp);
+            const float3 d2 = normalize(portal_xf_dir(portals[phit], rd));
+            ro = hp2 + 1e-3f * d2;
+            rd = d2;
+            continue;
+        }
+
         if (!hit_any) {
             // MIS (power heuristic): vertices that ran env NEE weight
             // their continuation's env hit by the BSDF-sampling share;
@@ -1395,6 +1444,7 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                        device const float* env_cond_cdf [[buffer(12)]],
                        device const GPULight* lights   [[buffer(13)]],
                        device const uint* tri_light    [[buffer(14)]],
+                       device const GPUPortal* portals [[buffer(15)]],
                        uint2 gid [[thread_position_in_grid]]) {
     // The dispatch may cover a row slice [row_offset, row_offset+rows);
     // everything below keys off the FRAME pixel, so slicing is invisible
@@ -1423,7 +1473,7 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                        U.max_depth, false, no_pre, false,
                        U.spectral != 0u,
                        U.fog != 0u ? U.fog_sigma : 0.0f, U.fog_g,
-                       c3(U.fog_col));
+                       c3(U.fog_col), portals, MU.portal_count);
     }
     accum[px] += float4(total, 0.0f);
 }
@@ -2298,6 +2348,7 @@ kernel void indirect_v0(device float4* accum           [[buffer(0)]],
                         device const float* env_row_cdf [[buffer(11)]],
                         device const float* env_cond_cdf [[buffer(12)]],
                         device const GPULight* lights  [[buffer(13)]],
+                        device const GPUPortal* portals [[buffer(15)]],
                         uint2 gid [[thread_position_in_grid]]) {
     const uint py = gid.y + U.row_offset;
     if (py >= U.height) return;
@@ -2318,7 +2369,8 @@ kernel void indirect_v0(device float4* accum           [[buffer(0)]],
         trace(c3(g.pos), rd, spheres, U.sphere_count, nodes, tris, materials,
               tri_mat, env_texels, env_row_cdf, env_cond_cdf, lights,
               tri_light, MU, U, rng, U.max_depth, true, pre, true, false,
-              0.0f, 0.0f, float3(1.0f));   // ReSTIR indirect: fog deferred
+              0.0f, 0.0f, float3(1.0f), portals,
+              0u);   // ReSTIR indirect: fog + portals deferred
     accum[px] += float4(c, 0.0f);
 }
 

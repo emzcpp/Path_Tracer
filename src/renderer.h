@@ -31,7 +31,8 @@ public:
     // itself, so the pool holds total_threads - 1 workers.
     ProgressiveRenderer(const Scene& scene, const RenderSettings& settings,
                         unsigned total_threads, const EnvLookup& env = {},
-                        const LightsLookup& lights = {});
+                        const LightsLookup& lights = {},
+                        const std::vector<GPUPortal>& portals = {});
     ~ProgressiveRenderer();
 
     ProgressiveRenderer(const ProgressiveRenderer&) = delete;
@@ -71,6 +72,7 @@ private:
     RenderSettings settings_;
     EnvLookup env_;
     LightsLookup lights_;
+    std::vector<GPUPortal> portals_;   // v1.3 (empty = none)
     std::vector<GBufferPx> gbuf_;      // current frame's primary hits
     std::vector<GBufferPx> gbuf_prev_; // last frame's (temporal balance)
     std::vector<ReSTIRPixel> resv_;     // persistent (temporal history)

@@ -151,6 +151,9 @@ struct GpuRenderer::Impl {
     // Session J: area-light list.
     id<MTLBuffer> lights;
     pt_uint light_count = 0;
+    // v1.3 recursive portals (always bound — a 1-element dummy when none —
+    // so buffer 15 is valid; MU.portal_count gates use).
+    id<MTLBuffer> portals;
     // Session F: HDRI environment (env_w == 0 -> gradient fallback).
     id<MTLBuffer> env_texels;
     id<MTLBuffer> env_row_cdf;
@@ -284,6 +287,7 @@ struct GpuRenderer::Impl {
             [e setBuffer:env_row_cdf offset:0 atIndex:11];
             [e setBuffer:env_cond_cdf offset:0 atIndex:12];
             [e setBuffer:lights offset:0 atIndex:13];
+            [e setBuffer:portals offset:0 atIndex:15];
             break;
         }
         for (id<MTLBuffer> t : mat_textures) {
@@ -406,6 +410,7 @@ struct GpuRenderer::Impl {
         [enc setBuffer:env_cond_cdf offset:0 atIndex:12];
         [enc setBuffer:lights offset:0 atIndex:13];
         [enc setBuffer:tri_light offset:0 atIndex:14];
+        [enc setBuffer:portals offset:0 atIndex:15];
         [enc dispatchThreads:MTLSizeMake(w, slice ? row_count : h, 1)
             threadsPerThreadgroup:tg_accum];
         [enc endEncoding];
@@ -772,6 +777,11 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
 
     im.upload_mesh(mesh);
     im.lights = im.upload(nullptr, 0);       // none until set_lights
+    {   // v1.3 portals: a 1-element dummy so buffer 15 is always valid.
+        GPUPortal dummy{};
+        im.portals = im.upload(&dummy, sizeof dummy);
+    }
+    im.mesh_u.portal_count = 0;
     im.env_texels = im.upload(nullptr, 0);   // gradient until set_env
     im.env_row_cdf = im.upload(nullptr, 0);
     im.env_cond_cdf = im.upload(nullptr, 0);
@@ -785,6 +795,14 @@ void GpuRenderer::set_lights(const std::vector<GPULight>& lights) {
         lights.empty() ? nullptr : lights.data(),
         lights.size() * sizeof(GPULight));
     impl_->light_count = pt_uint(lights.size());
+}
+
+void GpuRenderer::set_portals(const std::vector<GPUPortal>& portals) {
+    if (!portals.empty()) {
+        impl_->portals =
+            impl_->upload(portals.data(), portals.size() * sizeof(GPUPortal));
+    }
+    impl_->mesh_u.portal_count = pt_uint(portals.size());
 }
 
 void GpuRenderer::set_env(const EnvMap* env) {

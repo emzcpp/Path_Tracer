@@ -144,6 +144,9 @@ public:
     // Session J: swap the area-light list (emissive spheres/triangles).
     // Same buffer-swap discipline; count rides in PassUniforms.
     void set_lights(const std::vector<GPULight>& lights);
+    // v1.3 recursive portals: swap the portal list (empty = none). Same
+    // buffer-swap discipline as set_lights; count rides in MeshUniforms.
+    void set_portals(const std::vector<GPUPortal>& portals);
 
     void set_env(const EnvMap* env);
     void set_env_params(float intensity, float yaw_norm);

@@ -132,7 +132,8 @@ struct GPUTriangle {
 struct MeshUniforms {
     pt_uint has_mesh, tri_count, node_count, mat_count;
     float   emissive_scale;
-    pt_uint pad0, pad1, pad2;
+    pt_uint portal_count;   // v1.3: number of GPUPortal entries (0 = none)
+    pt_uint pad1, pad2;
 };
 
 // Session I: one material's texture set, as an entry in the bindless
@@ -155,6 +156,24 @@ struct GPUMaterialArgs {
     // v1.2 mesh glass: per-material delta-dielectric scalars (0 / 1.5 keep
     // the material opaque, as every existing mesh is).
     float transmission, ior;
+};
+
+// v1.3 recursive portal (non-euclidean geometry). A rectangle that, when a
+// ray hits it, TELEPORTS the ray to its partner instead of shading —
+// p' = R*p + t, d' = R*d (a rigid, loss-less redirect; no BSDF/NEE/cosine/
+// attenuation and no rng draw). The host precomputes R|t as
+// R_B * Flip180 * R_A^T with t = cB - R*cA, so entering the front of A
+// exits the front of B. Rows r0/r1/r2 are R's rows; tx/ty/tz the
+// translation. Portals are intersected only when portal_count > 0, so
+// no-portal scenes are byte-identical.
+struct GPUPortal {
+    pt_float3 center; float pad0;
+    pt_float3 u;      float pad1;   // half-edge (world), rectangle extent
+    pt_float3 v;      float pad2;   // half-edge (world)
+    pt_float3 normal; float pad3;   // = normalize(cross(u, v))
+    pt_float3 r0;     float tx;      // transform to the partner: R row 0 | t.x
+    pt_float3 r1;     float ty;
+    pt_float3 r2;     float tz;
 };
 
 // Session J: one scene emitter for area-light NEE. Shared POD, built on
@@ -230,6 +249,7 @@ static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");
 static_assert(sizeof(GPUTriangle) == 144, "GPUTriangle must be nine 16B rows");
 static_assert(sizeof(MeshUniforms) == 32, "MeshUniforms layout drifted");
 static_assert(sizeof(GPULight) == 96, "GPULight must be six 16B rows");
+static_assert(sizeof(GPUPortal) == 112, "GPUPortal must be seven 16B rows");
 static_assert(sizeof(GBufferPx) == 96, "GBufferPx must be six 16B rows");
 static_assert(sizeof(ReSTIRSlot) == 32, "ReSTIRSlot layout drifted");
 static_assert(sizeof(ReSTIRPixel) == 96, "ReSTIRPixel layout drifted");

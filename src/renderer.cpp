@@ -13,8 +13,13 @@ ProgressiveRenderer::ProgressiveRenderer(const Scene& scene,
                                          const RenderSettings& settings,
                                          unsigned total_threads,
                                          const EnvLookup& env,
-                                         const LightsLookup& lights)
-    : scene_(scene), settings_(settings), env_(env), lights_(lights) {
+                                         const LightsLookup& lights,
+                                         const std::vector<GPUPortal>& portals)
+    : scene_(scene),
+      settings_(settings),
+      env_(env),
+      lights_(lights),
+      portals_(portals) {
     reset(settings.width, settings.height);
     const unsigned n_workers = total_threads > 1 ? total_threads - 1 : 0;
     workers_.reserve(n_workers);
@@ -119,7 +124,9 @@ void ProgressiveRenderer::render_row(int y) {
                               settings_.dispersion_b,
                               settings_.fog != 0 ? settings_.fog_density
                                                  : 0.0f,
-                              settings_.fog_g, settings_.fog_color);
+                              settings_.fog_g, settings_.fog_color,
+                              portals_.empty() ? nullptr : portals_.data(),
+                              int(portals_.size()));
 
         const color c = accum_row[x] * inv_n;
         out[x * 4 + 0] = encode_channel(c.x);
