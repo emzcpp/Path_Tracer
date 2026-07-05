@@ -1158,6 +1158,9 @@ void render_thread_main(ViewerCore& core) {
     // v1.1 denoiser: per-frame view params (display-only; never dirty).
     int denoise_aov_;
     float denoise_wipe_;
+    // UI-only: tracks the selection so the panel can auto-focus the
+    // Selection tab on pick / return to Scene on deselect. No render state.
+    Selection tabPrevSel_;
 
     // Phase 5: scene file UI state.
     char scenePath_[256];
@@ -1668,7 +1671,7 @@ void render_thread_main(ViewerCore& core) {
     GpuRenderer& gpu = *core_->gpu;
 
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(340, 620), ImGuiCond_FirstUseEver);
     ImGui::Begin("Render");
 
     const bool final_mode = core_->final_mode;
@@ -1743,6 +1746,23 @@ void render_thread_main(ViewerCore& core) {
     ImGui::SameLine();
     ImGui::TextDisabled("cmd+Z / cmd+shift+Z");
 
+    // Contextual (per-object) vs global (render) controls now live in
+    // separate tabs. Selecting an object auto-focuses Selection;
+    // deselecting returns to Scene. LAYOUT ONLY: every control keeps its
+    // exact wiring, range, and accumulator-reset behavior, and input
+    // arbitration is unchanged (all still children of the one window).
+    ImGui::Separator();
+    ImGuiTabItemFlags sceneTabFlag = 0, selTabFlag = 0;
+    if (core_->selection.kind != tabPrevSel_.kind ||
+        core_->selection.index != tabPrevSel_.index) {
+        if (core_->selection.kind == Selection::Kind::None)
+            sceneTabFlag = ImGuiTabItemFlags_SetSelected;
+        else
+            selTabFlag = ImGuiTabItemFlags_SetSelected;
+        tabPrevSel_ = core_->selection;
+    }
+    if (ImGui::BeginTabBar("##panel_tabs")) {
+    if (ImGui::BeginTabItem("Scene", nullptr, sceneTabFlag)) {
     // ---- Outliner ----
     ImGui::SeparatorText("Outliner");
     if (ImGui::BeginChild("##outliner", ImVec2(0, 130),
@@ -1816,6 +1836,45 @@ void render_thread_main(ViewerCore& core) {
         }
     }
 
+    ImGui::SeparatorText("Scene");
+    ImGui::SetNextItemWidth(-60.0f);
+    ImGui::InputText("file", scenePath_, sizeof scenePath_);
+    if (ImGui::Button("Save")) {
+        std::string err;
+        if (save_scene(scenePath_, snapshot_from_core(*core_),
+                       core_->desc.mesh_source_path,
+                       core_->desc.env_source_path, err)) {
+            std::error_code ec;
+            sceneStatus_ = "saved " +
+                std::filesystem::absolute(scenePath_, ec).string();
+        } else {
+            sceneStatus_ = err;
+        }
+        std::printf("%s\n", sceneStatus_.c_str());
+        std::fflush(stdout);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load")) {
+        std::string err, resolved;
+        SceneSnapshot snap;
+        undo_begin(*core_);
+        if (load_scene(scenePath_, snap, err, &resolved) &&
+            apply_snapshot(*core_, std::move(snap), err)) {
+            undo_commit(*core_, "load scene");
+            sceneStatus_ = "loaded " + resolved;
+        } else {
+            sceneStatus_ = err;
+        }
+        std::printf("%s\n", sceneStatus_.c_str());
+        std::fflush(stdout);
+    }
+    if (!sceneStatus_.empty()) {
+        ImGui::TextWrapped("%s", sceneStatus_.c_str());
+    }
+
+    ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Selection", nullptr, selTabFlag)) {
     // ---- Selection ----
     ImGui::SeparatorText("Selection");
     const Selection& sel = core_->selection;
@@ -1981,6 +2040,9 @@ void render_thread_main(ViewerCore& core) {
         }
     }
 
+    ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Render")) {
     // ---- Camera ----
     ImGui::SeparatorText("Camera");
     ImGui::SliderFloat("speed", &core_->fly.move_speed, 0.05f, 50.0f, "%.2f",
@@ -2094,6 +2156,14 @@ void render_thread_main(ViewerCore& core) {
             dirty = true;
         }
     }
+    if (dirty) {
+        core_->final_saved = false;   // settings changed: re-arm the export
+        core_->mark_scene_dirty();
+    }
+    ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Display")) {
+    ImGui::TextDisabled("Display-only \xE2\x80\x94 these never restart the render.");
     {
         // v1.1 display-only denoiser. None of these controls mark the
         // scene dirty: they cannot affect accumulation by construction.
@@ -2143,11 +2213,9 @@ void render_thread_main(ViewerCore& core) {
             "that never converges away. Off = ground truth. Not saved in\n"
             "scenes; the FINAL log states the clamp used.");
     }
-    if (dirty) {
-        core_->final_saved = false;   // settings changed: re-arm the export
-        core_->mark_scene_dirty();
+    ImGui::EndTabItem();
     }
-
+    if (ImGui::BeginTabItem("Environment")) {
     // ---- Environment (Session F) ----
     ImGui::SeparatorText("Environment");
     ImGui::SetNextItemWidth(-60.0f);
@@ -2205,40 +2273,9 @@ void render_thread_main(ViewerCore& core) {
     }
     if (!envStatus_.empty()) ImGui::TextWrapped("%s", envStatus_.c_str());
 
-    ImGui::SeparatorText("Scene");
-    ImGui::SetNextItemWidth(-60.0f);
-    ImGui::InputText("file", scenePath_, sizeof scenePath_);
-    if (ImGui::Button("Save")) {
-        std::string err;
-        if (save_scene(scenePath_, snapshot_from_core(*core_),
-                       core_->desc.mesh_source_path,
-                       core_->desc.env_source_path, err)) {
-            std::error_code ec;
-            sceneStatus_ = "saved " +
-                std::filesystem::absolute(scenePath_, ec).string();
-        } else {
-            sceneStatus_ = err;
-        }
-        std::printf("%s\n", sceneStatus_.c_str());
-        std::fflush(stdout);
+    ImGui::EndTabItem();
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Load")) {
-        std::string err, resolved;
-        SceneSnapshot snap;
-        undo_begin(*core_);
-        if (load_scene(scenePath_, snap, err, &resolved) &&
-            apply_snapshot(*core_, std::move(snap), err)) {
-            undo_commit(*core_, "load scene");
-            sceneStatus_ = "loaded " + resolved;
-        } else {
-            sceneStatus_ = err;
-        }
-        std::printf("%s\n", sceneStatus_.c_str());
-        std::fflush(stdout);
-    }
-    if (!sceneStatus_.empty()) {
-        ImGui::TextWrapped("%s", sceneStatus_.c_str());
+    ImGui::EndTabBar();
     }
 
     ImGui::Separator();
