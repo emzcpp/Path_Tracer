@@ -59,14 +59,13 @@ struct RenderSettings {
     int restir = 0;
     // RIS candidates per light slot (env / area) at the primary vertex.
     int restir_m = 8;
-    // Stage 2: temporal reservoir reuse. DEFAULT OFF pending the
-    // prev-surface balance correction: the Mtot-style temporal combine
-    // biases +5.7% on scenes with emitters very close to surfaces (the
-    // target mismatch under sub-pixel jitter is large at close range;
-    // benign scenes measure ~0.0%). The fix needs last frame's G-buffer
-    // so history can carry proper balance-heuristic weights — scoped for
-    // a follow-up session. Toggle lives in the panel for A/B.
-    int restir_temporal = 0;
+    // Stage 2: temporal reservoir reuse — ON. The temporal merge is the
+    // same Talbot balance-heuristic combine as spatial, with history's
+    // target evaluated on LAST frame's surface (G-buffer ping-pong):
+    // the old Mtot-style combine biased +5.7% on normal-mapped scenes
+    // with empty-reservoir regions; the balance combine measures +0.1%
+    // alongside RIS +0.06% and spatial +0.09% on the same gate.
+    int restir_temporal = 1;
     // Stage 3: spatial reservoir reuse (K random neighbors per frame)
     // combined with Talbot balance-heuristic MIS weights — unbiased for
     // any sampler-support overlap (the earlier 1/Z counting variant

@@ -471,27 +471,52 @@ inline float target_area(const HitRecord& rec, const vec3& vdir,
 }
 
 // Phase D1: fresh candidates + temporal merge -> the per-frame reservoir
-// (resv_cur). No shadow rays here; shading happens after spatial reuse.
+// (resv_cur). The temporal merge is the SAME Talbot balance-heuristic
+// combine that made spatial reuse unbiased: history is "a neighbor in
+// time" whose target is evaluated on LAST frame's surface (gprev), so a
+// jitter-shifted target (normal maps!) can never skew the weights. With
+// no valid history the combine degenerates exactly to the plain
+// candidate reservoir. No shadow rays here; shading happens after
+// spatial reuse. Mirrored in pathtrace.metal.
 inline void restir_build(const HitRecord& rec, const Ray& ray, RNG& rng,
                          const EnvLookup& env, const LightsLookup& lights,
                          int M, bool temporal, int mcap,
-                         const ReSTIRPixel& hist, ReSTIRPixel& cur) {
+                         const ReSTIRPixel& hist, const GBufferPx& gprev,
+                         ReSTIRPixel& cur) {
     const bool can_env = env.nee && env.row_cdf != nullptr &&
                          rec.mat.transmission <= 0.5f;
     const bool can_area = env.nee && lights.count > 0 &&
                           rec.mat.transmission <= 0.5f;
     const vec3 vdir = -normalize(ray.dir);
     const float McapF = float(mcap) * float(M);
+    // History validity: similarity vs LAST frame's surface + a usable
+    // prev-surface record for the balance weights.
     const bool hist_ok =
-        temporal && hist.prev_t > 0.0f && rec.t > 0.0f &&
-        std::fabs(hist.prev_t - rec.t) < 0.1f * rec.t &&
-        (hist.prev_normal.x * rec.normal.x +
-         hist.prev_normal.y * rec.normal.y +
-         hist.prev_normal.z * rec.normal.z) > 0.9f;
+        temporal && gprev.t > 0.0f && rec.t > 0.0f &&
+        std::fabs(gprev.t - rec.t) < 0.1f * rec.t &&
+        (gprev.normal.x * rec.normal.x + gprev.normal.y * rec.normal.y +
+         gprev.normal.z * rec.normal.z) > 0.9f;
+    HitRecord prec;
+    vec3 pvdir(0.0f, 0.0f, 1.0f);
+    if (hist_ok) {
+        prec.p = point3(gprev.pos.x, gprev.pos.y, gprev.pos.z);
+        prec.normal = vec3(gprev.normal.x, gprev.normal.y, gprev.normal.z);
+        prec.front_face = (gprev.flags & 1u) != 0u;
+        prec.t = gprev.t;
+        prec.mat.base_color =
+            color(gprev.base_color.x, gprev.base_color.y, gprev.base_color.z);
+        prec.mat.emission =
+            color(gprev.emission.x, gprev.emission.y, gprev.emission.z);
+        prec.mat.metallic = gprev.metallic;
+        prec.mat.roughness = gprev.roughness;
+        prec.mat.ior = gprev.ior;
+        prec.mat.transmission = gprev.transmission;
+        pvdir = -normalize(vec3(gprev.rd.x, gprev.rd.y, gprev.rd.z));
+    }
 
     // --- env slot ---
     if (can_env) {
-        float wsum = 0.0f, win_that = 0.0f;
+        float wsum_c = 0.0f, win_that = 0.0f;
         vec3 win_dir(0.0f, 0.0f, 1.0f);
         for (int i = 0; i < M; ++i) {
             const float u1 = rng.next_float();
@@ -506,37 +531,68 @@ inline void restir_build(const HitRecord& rec, const Ray& ray, RNG& rng,
                 that = target_env(rec, vdir, ldir, env, contrib, w_mis);
                 if (that > 0.0f) w_i = that / pl;
             }
-            wsum += w_i;
-            if (w_i > 0.0f && ur < w_i / wsum) {
+            wsum_c += w_i;
+            if (w_i > 0.0f && ur < w_i / wsum_c) {
                 win_dir = ldir;
                 win_that = that;
             }
         }
-        float Mtot = float(M);
+        const float Wc = (wsum_c > 0.0f && win_that > 0.0f)
+                             ? wsum_c / (float(M) * win_that)
+                             : 0.0f;
         const float ur_h = rng.next_float();
-        if (hist_ok && hist.env_slot.M > 0.0f && hist.env_slot.W > 0.0f) {
-            const vec3 hdir(hist.env_slot.ax, hist.env_slot.ay,
-                            hist.env_slot.az);
-            color contrib;
-            float w_mis;
-            const float that =
-                target_env(rec, vdir, hdir, env, contrib, w_mis);
+        float out_that = win_that;
+        vec3 out_dir = win_dir;
+        float out_wsum = 0.0f, out_M = float(M);
+        const bool have_hist = hist_ok && hist.env_slot.M > 0.0f;
+        if (!have_hist) {
+            // Degenerate balance: one input, m = 1.
+            out_wsum = win_that * Wc;   // == wsum_c / M
+        } else {
             const float Mh = std::fmin(hist.env_slot.M, McapF);
-            const float wh = that * hist.env_slot.W * Mh;
-            wsum += wh;
-            Mtot += Mh;
-            if (wh > 0.0f && ur_h < wh / wsum) {
-                win_dir = hdir;
-                win_that = that;
+            out_M += Mh;
+            color cc;
+            float wm;
+            // candidate input
+            float w_c = 0.0f;
+            if (Wc > 0.0f && win_that > 0.0f) {
+                const float p_prev_c =
+                    target_env(prec, pvdir, win_dir, env, cc, wm);
+                const float denom =
+                    float(M) * win_that + Mh * p_prev_c;
+                if (denom > 0.0f) {
+                    w_c = (float(M) * win_that / denom) * win_that * Wc;
+                }
+            }
+            // history input
+            float w_h = 0.0f, that_h_cur = 0.0f;
+            vec3 hdir(hist.env_slot.ax, hist.env_slot.ay, hist.env_slot.az);
+            if (hist.env_slot.W > 0.0f) {
+                that_h_cur = target_env(rec, vdir, hdir, env, cc, wm);
+                if (that_h_cur > 0.0f) {
+                    const float p_prev_h =
+                        target_env(prec, pvdir, hdir, env, cc, wm);
+                    const float denom =
+                        float(M) * that_h_cur + Mh * p_prev_h;
+                    if (denom > 0.0f && p_prev_h > 0.0f) {
+                        w_h = (Mh * p_prev_h / denom) * that_h_cur *
+                              hist.env_slot.W;
+                    }
+                }
+            }
+            out_wsum = w_c + w_h;
+            if (w_h > 0.0f && ur_h < w_h / out_wsum) {
+                out_dir = hdir;
+                out_that = that_h_cur;
             }
         }
-        cur.env_slot.ax = win_dir.x;
-        cur.env_slot.ay = win_dir.y;
-        cur.env_slot.az = win_dir.z;
-        cur.env_slot.W = (wsum > 0.0f && win_that > 0.0f)
-                             ? wsum / (Mtot * win_that)
+        cur.env_slot.ax = out_dir.x;
+        cur.env_slot.ay = out_dir.y;
+        cur.env_slot.az = out_dir.z;
+        cur.env_slot.W = (out_wsum > 0.0f && out_that > 0.0f)
+                             ? out_wsum / out_that
                              : 0.0f;
-        cur.env_slot.M = std::fmin(Mtot, McapF);
+        cur.env_slot.M = std::fmin(out_M, McapF);
         cur.env_slot.light_id_p1 = 0u;
     } else {
         cur.env_slot = ReSTIRSlot{};
@@ -544,7 +600,7 @@ inline void restir_build(const HitRecord& rec, const Ray& ray, RNG& rng,
 
     // --- area slot ---
     if (can_area) {
-        float wsum = 0.0f, win_thatA = 0.0f;
+        float wsum_c = 0.0f, win_thatA = 0.0f;
         float win_ax = 0.0f, win_ay = 0.0f, win_az = 0.0f;
         pt_uint win_id_p1 = 0u;
         for (int i = 0; i < M; ++i) {
@@ -581,8 +637,8 @@ inline void restir_build(const HitRecord& rec, const Ray& ray, RNG& rng,
                 const float pl = pdf_sa * L.sel_pdf;
                 if (thatA > 0.0f && G > 0.0f) w_i = thatA / (pl * G);
             }
-            wsum += w_i;
-            if (w_i > 0.0f && ur < w_i / wsum) {
+            wsum_c += w_i;
+            if (w_i > 0.0f && ur < w_i / wsum_c) {
                 win_thatA = thatA;
                 win_ax = sax;
                 win_ay = say;
@@ -590,40 +646,74 @@ inline void restir_build(const HitRecord& rec, const Ray& ray, RNG& rng,
                 win_id_p1 = pt_uint(li + 1);
             }
         }
-        float Mtot = float(M);
+        const float Wc = (wsum_c > 0.0f && win_thatA > 0.0f)
+                             ? wsum_c / (float(M) * win_thatA)
+                             : 0.0f;
         const float ur_h = rng.next_float();
-        if (hist_ok && hist.area_slot.M > 0.0f && hist.area_slot.W > 0.0f &&
-            hist.area_slot.light_id_p1 > 0u &&
-            int(hist.area_slot.light_id_p1) <= lights.count) {
-            const GPULight& L =
-                lights.lights[int(hist.area_slot.light_id_p1) - 1];
-            color contrib;
-            float w_mis, G, t_o;
-            vec3 d_o;
-            const float thatA =
-                target_area(rec, vdir, L, hist.area_slot.ax,
-                            hist.area_slot.ay, hist.area_slot.az, lights,
-                            contrib, w_mis, G, d_o, t_o);
+        float out_that = win_thatA;
+        float out_ax = win_ax, out_ay = win_ay, out_az = win_az;
+        pt_uint out_id = win_id_p1;
+        float out_wsum = 0.0f, out_M = float(M);
+        const bool have_hist = hist_ok && hist.area_slot.M > 0.0f;
+        if (!have_hist) {
+            out_wsum = win_thatA * Wc;
+        } else {
             const float Mh = std::fmin(hist.area_slot.M, McapF);
-            const float wh = thatA * hist.area_slot.W * Mh;
-            wsum += wh;
-            Mtot += Mh;
-            if (wh > 0.0f && ur_h < wh / wsum) {
-                win_thatA = thatA;
-                win_ax = hist.area_slot.ax;
-                win_ay = hist.area_slot.ay;
-                win_az = hist.area_slot.az;
-                win_id_p1 = hist.area_slot.light_id_p1;
+            out_M += Mh;
+            color cc;
+            float wm, gg, tt;
+            vec3 dd;
+            float w_c = 0.0f;
+            if (Wc > 0.0f && win_thatA > 0.0f && win_id_p1 > 0u) {
+                const GPULight& Lc = lights.lights[int(win_id_p1) - 1];
+                const float p_prev_c =
+                    target_area(prec, pvdir, Lc, win_ax, win_ay, win_az,
+                                lights, cc, wm, gg, dd, tt);
+                const float denom =
+                    float(M) * win_thatA + Mh * p_prev_c;
+                if (denom > 0.0f) {
+                    w_c = (float(M) * win_thatA / denom) * win_thatA * Wc;
+                }
+            }
+            float w_h = 0.0f, that_h_cur = 0.0f;
+            if (hist.area_slot.W > 0.0f && hist.area_slot.light_id_p1 > 0u &&
+                int(hist.area_slot.light_id_p1) <= lights.count) {
+                const GPULight& Lh =
+                    lights.lights[int(hist.area_slot.light_id_p1) - 1];
+                that_h_cur = target_area(rec, vdir, Lh, hist.area_slot.ax,
+                                         hist.area_slot.ay,
+                                         hist.area_slot.az, lights, cc, wm,
+                                         gg, dd, tt);
+                if (that_h_cur > 0.0f) {
+                    const float p_prev_h = target_area(
+                        prec, pvdir, Lh, hist.area_slot.ax,
+                        hist.area_slot.ay, hist.area_slot.az, lights, cc,
+                        wm, gg, dd, tt);
+                    const float denom =
+                        float(M) * that_h_cur + Mh * p_prev_h;
+                    if (denom > 0.0f && p_prev_h > 0.0f) {
+                        w_h = (Mh * p_prev_h / denom) * that_h_cur *
+                              hist.area_slot.W;
+                    }
+                }
+            }
+            out_wsum = w_c + w_h;
+            if (w_h > 0.0f && ur_h < w_h / out_wsum) {
+                out_that = that_h_cur;
+                out_ax = hist.area_slot.ax;
+                out_ay = hist.area_slot.ay;
+                out_az = hist.area_slot.az;
+                out_id = hist.area_slot.light_id_p1;
             }
         }
-        cur.area_slot.ax = win_ax;
-        cur.area_slot.ay = win_ay;
-        cur.area_slot.az = win_az;
-        cur.area_slot.W = (wsum > 0.0f && win_thatA > 0.0f)
-                              ? wsum / (Mtot * win_thatA)
+        cur.area_slot.ax = out_ax;
+        cur.area_slot.ay = out_ay;
+        cur.area_slot.az = out_az;
+        cur.area_slot.W = (out_wsum > 0.0f && out_that > 0.0f)
+                              ? out_wsum / out_that
                               : 0.0f;
-        cur.area_slot.M = std::fmin(Mtot, McapF);
-        cur.area_slot.light_id_p1 = win_id_p1;
+        cur.area_slot.M = std::fmin(out_M, McapF);
+        cur.area_slot.light_id_p1 = out_id;
     } else {
         cur.area_slot = ReSTIRSlot{};
     }

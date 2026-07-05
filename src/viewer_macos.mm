@@ -1401,7 +1401,7 @@ void render_thread_main(ViewerCore& core) {
     // ~304 B/px; above the budget, clamp the resolution scale instead of
     // silently allocating gigabytes.
     if (core_->settings.restir != 0) {
-        const double per_px = double(sizeof(GBufferPx)) +
+        const double per_px = 2.0 * double(sizeof(GBufferPx)) +
                               2.0 * sizeof(ReSTIRPixel) + 4.0 * sizeof(float);
         const double budget_px =
             double(core_->settings.restir_mem_budget_mb) * 1024.0 * 1024.0 /
@@ -1682,7 +1682,7 @@ void render_thread_main(ViewerCore& core) {
         const double px = double(gpu.width()) * gpu.height();
         const double mb =
             px *
-            (sizeof(GBufferPx) + 2.0 * sizeof(ReSTIRPixel) +
+            (2.0 * sizeof(GBufferPx) + 2.0 * sizeof(ReSTIRPixel) +
              4.0 * sizeof(float)) /
             (1024.0 * 1024.0);
         ImGui::Text("estimator: ReSTIR (M=%d%s%s) · buffers %.0f MB",

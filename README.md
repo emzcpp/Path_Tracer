@@ -114,9 +114,12 @@ the list rebuilds automatically on any light edit or gizmo re-bake.
 ReSTIR DI (`--restir`, `G` key, panel controls): reservoir-based direct
 lighting — M candidates per light slot (RIS), spatial neighbor reuse with
 Talbot balance-heuristic MIS (unbiased; +0.09% vs brute on a 36-light
-scene, 1.5x cleaner than NEE+MIS at equal spp). Temporal reuse exists but
-defaults OFF pending a prev-surface balance correction (biases on
-emitters very close to surfaces). Reservoir+G-buffer memory (~304 B/px)
+scene, 1.5x cleaner than NEE+MIS at equal spp). Temporal reuse is ON:
+history merges through the same balance-heuristic combine (its target
+evaluated on last frame's surface via a G-buffer ping-pong), measuring
++0.1% alongside RIS and spatial on the hostile many-light gate. On
+accumulated renders temporal is noise-neutral (its value is per-frame
+quality); all reuse resets bit-identically through the central reset. Reservoir+G-buffer memory (~304 B/px)
 is shown in the stats panel and guarded by restir_mem_budget_mb (scale is
 clamped, never silently allocated). ReSTIR frames schedule whole-frame
 (spatial reuse reads across rows); brute force and NEE+MIS remain the

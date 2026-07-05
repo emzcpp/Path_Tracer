@@ -134,6 +134,9 @@ void ProgressiveRenderer::render_pass_partitioned() {
     if (gbuf_.size() != std::size_t(w_) * h_) {
         gbuf_.assign(std::size_t(w_) * h_, GBufferPx{});
     }
+    if (gbuf_prev_.size() != std::size_t(w_) * h_) {
+        gbuf_prev_.assign(std::size_t(w_) * h_, GBufferPx{});
+    }
     if (resv_.size() != std::size_t(w_) * h_) {
         resv_.assign(std::size_t(w_) * h_, ReSTIRPixel{});
     }
@@ -222,7 +225,8 @@ void ProgressiveRenderer::render_pass_partitioned() {
             const Ray pray(rec.p, vec3(g.rd.x, g.rd.y, g.rd.z));
             restir_build(rec, pray, rng, env_, lights_, settings_.restir_m,
                          settings_.restir_temporal != 0,
-                         settings_.restir_mcap, resv_[px], resv_cur_[px]);
+                         settings_.restir_mcap, resv_[px], gbuf_prev_[px],
+                         resv_cur_[px]);
             g.rng_lo = pt_uint(rng.state & 0xffffffffULL);
             g.rng_hi = pt_uint(rng.state >> 32);
         }
@@ -297,6 +301,10 @@ void ProgressiveRenderer::render_pass_partitioned() {
             out[x * 4 + 3] = 255;
         }
     });
+
+    // Ping-pong: this frame's surfaces become next frame's temporal
+    // balance-weight reference.
+    std::swap(gbuf_, gbuf_prev_);
 }
 
 bool ProgressiveRenderer::save_png(const std::string& path) const {

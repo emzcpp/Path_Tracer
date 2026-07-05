@@ -121,7 +121,10 @@ struct GpuRenderer::Impl {
     id<MTLComputePipelineState> direct_pso;
     id<MTLComputePipelineState> spatial_pso;
     id<MTLComputePipelineState> indirect_pso;
-    id<MTLBuffer> gbuf;   // GBufferPx per pixel, allocated at full res
+    id<MTLBuffer> gbuf;    // GBufferPx per pixel (frame parity 0)
+    id<MTLBuffer> gbuf2;   // frame parity 1 — temporal balance weights
+                           // need LAST frame's surfaces, so g_primary
+                           // ping-pongs and build reads both
     id<MTLBuffer> resv;      // persistent reservoirs (temporal history)
     id<MTLBuffer> resv_cur;  // this frame, post-temporal (spatial input)
     id<MTLBuffer> accum;     // full-res float4, StorageModeShared
@@ -206,12 +209,16 @@ struct GpuRenderer::Impl {
     // paths so the binding lists exist exactly once.
     void encode_restir_phase(id<MTLCommandBuffer> cb, int phase,
                              const PassUniforms& pu, int rows) {
+        // Frame parity selects which G-buffer is CURRENT; the other holds
+        // last frame's surfaces for the temporal balance weights.
+        id<MTLBuffer> gcur = (pu.pass_base & 1u) ? gbuf2 : gbuf;
+        id<MTLBuffer> gprev = (pu.pass_base & 1u) ? gbuf : gbuf2;
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
         const MTLSize grid = MTLSizeMake(w, rows, 1);
         switch (phase) {
         case 0:
             [e setComputePipelineState:g_primary_pso];
-            [e setBuffer:gbuf offset:0 atIndex:0];
+            [e setBuffer:gcur offset:0 atIndex:0];
             [e setBuffer:spheres offset:0 atIndex:1];
             [e setBytes:&pu length:sizeof pu atIndex:2];
             [e setBuffer:bvh_nodes offset:0 atIndex:3];
@@ -229,7 +236,7 @@ struct GpuRenderer::Impl {
             [e setBuffer:bvh_nodes offset:0 atIndex:3];
             [e setBuffer:tris offset:0 atIndex:4];
             [e setBuffer:mat_table offset:0 atIndex:5];
-            [e setBuffer:gbuf offset:0 atIndex:6];
+            [e setBuffer:gcur offset:0 atIndex:6];
             [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
             [e setBuffer:env_texels offset:0 atIndex:10];
             [e setBuffer:env_row_cdf offset:0 atIndex:11];
@@ -237,6 +244,7 @@ struct GpuRenderer::Impl {
             [e setBuffer:lights offset:0 atIndex:13];
             [e setBuffer:resv offset:0 atIndex:14];
             [e setBuffer:resv_cur offset:0 atIndex:15];
+            [e setBuffer:gprev offset:0 atIndex:16];
             break;
         case 2:
             [e setComputePipelineState:spatial_pso];
@@ -246,7 +254,7 @@ struct GpuRenderer::Impl {
             [e setBuffer:bvh_nodes offset:0 atIndex:3];
             [e setBuffer:tris offset:0 atIndex:4];
             [e setBuffer:mat_table offset:0 atIndex:5];
-            [e setBuffer:gbuf offset:0 atIndex:6];
+            [e setBuffer:gcur offset:0 atIndex:6];
             [e setBuffer:resv_cur offset:0 atIndex:7];
             [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
             [e setBuffer:resv offset:0 atIndex:9];
@@ -263,7 +271,7 @@ struct GpuRenderer::Impl {
             [e setBuffer:bvh_nodes offset:0 atIndex:3];
             [e setBuffer:tris offset:0 atIndex:4];
             [e setBuffer:mat_table offset:0 atIndex:5];
-            [e setBuffer:gbuf offset:0 atIndex:6];
+            [e setBuffer:gcur offset:0 atIndex:6];
             [e setBuffer:tri_mat offset:0 atIndex:7];
             [e setBytes:&mesh_u length:sizeof mesh_u atIndex:8];
             [e setBuffer:tri_light offset:0 atIndex:9];
@@ -623,6 +631,10 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
         newBufferWithLength:size_t(settings.width) * settings.height *
                             sizeof(GBufferPx)
                     options:MTLResourceStorageModeShared];
+    im.gbuf2 = [device
+        newBufferWithLength:size_t(settings.width) * settings.height *
+                            sizeof(GBufferPx)
+                    options:MTLResourceStorageModeShared];
     im.resv = [device
         newBufferWithLength:size_t(settings.width) * settings.height *
                             sizeof(ReSTIRPixel)
@@ -698,6 +710,11 @@ void GpuRenderer::reset(int w, int h) {
     const size_t gneeded = size_t(w) * h * sizeof(GBufferPx);
     if (gneeded > impl_->gbuf.length) {
         impl_->gbuf =
+            [impl_->device newBufferWithLength:gneeded
+                                       options:MTLResourceStorageModeShared];
+    }
+    if (gneeded > impl_->gbuf2.length) {
+        impl_->gbuf2 =
             [impl_->device newBufferWithLength:gneeded
                                        options:MTLResourceStorageModeShared];
     }

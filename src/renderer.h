@@ -71,7 +71,8 @@ private:
     RenderSettings settings_;
     EnvLookup env_;
     LightsLookup lights_;
-    std::vector<GBufferPx> gbuf_;   // Session K: per-pixel primary hits
+    std::vector<GBufferPx> gbuf_;      // current frame's primary hits
+    std::vector<GBufferPx> gbuf_prev_; // last frame's (temporal balance)
     std::vector<ReSTIRPixel> resv_;     // persistent (temporal history)
     std::vector<ReSTIRPixel> resv_cur_; // this frame, post-temporal
 
