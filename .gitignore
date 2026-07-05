@@ -1,21 +1,48 @@
-# Build output (includes generated shader-embed headers and binaries)
+# Build output
 build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
 *.o
+*.a
+compile_commands.json
+
+# Binaries
+pathtracer
 *.dSYM/
 
-# Render/export outputs
-out.png
-out.ppm
-render_*.png
-parity_*.png
-ref_*.png
+# The generated shader embed (build/generated/pathtrace_msl.h) is covered
+# by build/ above.
+
+# Render outputs / exports
+*.png
+*.ppm
+*.hdr
+parity_cpu.png
+parity_gpu.png
+parity_diff.png
+# If you keep specific showcase renders under version control, force-add them:
+#   git add -f docs/sponza_hero.png
+!docs/*.png
+# Committed assets (HDRIs, model textures) are never ignored:
+!assets/**
+!Test_Models/**
 
 # UI state
 imgui.ini
 
-# macOS / editor cruft
+# macOS
 .DS_Store
+.AppleDouble
+._*
+
+# Editor / IDE
 .vscode/
 .idea/
+*.swp
+*~
 
-# NOT ignored on purpose: external/ (vendored deps), assets/, Test_Models/
+# NOTE: vendored dependency headers (stb, nlohmann/json, cgltf, imgui, ImGuizmo)
+# and assets/ are PART OF THE REPO and must NOT be ignored.

@@ -1,174 +1,174 @@
 # PathTracer
 
-Path tracer with full global illumination — a principled GGX
-metallic-roughness BSDF (glTF-style: baseColor/metallic/roughness, VNDF
-importance sampling, Smith height-correlated masking) plus delta glass and
-emissive lights — and a live interactive viewer running on **Metal
-compute**, with the CPU implementation kept as a
-bit-for-bit-seeded reference. C++20, no dependencies beyond the vendored
-`stb_image_write.h` (the Metal kernel is embedded in the binary and
-compiled at runtime, so not even Xcode is required — just Command Line
-Tools).
+A physically-based, progressive, unidirectional Monte Carlo **path tracer for macOS / Apple Silicon**, written from scratch in C++20 with **two hand-matched backends** — a CPU reference and a Metal compute kernel — kept *provably* in agreement by a same-seed parity harness. Around the renderer sits a full native editor: live viewer, object picking, gizmos, material and light editing, undo/redo, scene persistence, and adaptive GPU scheduling.
 
-## Build & run
+Its headline capability is **ReSTIR DI** (Bitterli et al. 2020): a 36-light scene resolves clean at 512 spp — a scene class that used to stay speckled at 10,000.
 
-```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+> **The real product is the correctness methodology.** Every feature was landed against a brute-force ground truth and gated by a same-seed parity harness that diffs the two backends below the Monte Carlo noise floor. Every bias bug this architecture produced was killed *by measurement, not by assumption*.
+
+---
+
+## Showcase
+
+![Sponza, 36 lights, ReSTIR DI, 512 spp](docs/sponza_hero.png)
+![DamagedHelmet under HDRI, FINAL](docs/helmet_hero.png)
+
+| Scene | Lights | Samples | Result |
+|---|---|---|---|
+| Sponza (multi-material) | 36 emissive fixtures | 512 spp | zero fireflies |
+| DamagedHelmet | HDRI environment | FINAL (converged) | full PBR, normal-mapped |
+
+---
+
+## What makes it unusual
+
+Most hobby path tracers are one backend, eyeballed for correctness. This one is built the other way around — correctness first, everything else in service of it:
+
+- **Two backends, provably identical.** The entire integrator (RNG, intersection, BSDF, lighting, ReSTIR) is written twice — once in C++ (`integrator.h`), once in Metal Shading Language (`pathtrace.metal`) — and kept in lockstep. Cross products, lerps, bilinear filtering and trig are hand-matched rather than delegated to builtins/hardware samplers, because a single float ULP that flips a branch is enough to break bit-exactness.
+- **A same-seed parity harness (`--parity`).** Both backends render the same scene with the same per-`(pixel, pass)` seeds; the results are diffed, with two independent CPU runs providing the Monte Carlo noise floor as a built-in control. Gates are *relative* to that floor. Typical agreement: **~96–99% of pixels bit-exact, mean error hundreds of times below the noise floor.**
+- **Brute force as a permanent referee.** A `--brute` toggle renders unbiased ground truth. Every variance-reduction technique — NEE, MIS, importance sampling, all three ReSTIR reuse dimensions — is gated on converging to the *same image* as brute force in the mean. This harness caught real bias bugs (+96%, +10%, +5.7%, +1.3% …), each localized by bisection and fixed with principled math rather than a fudge factor.
+- **Determinism as a foundation.** PCG32 seeded per `(pixel, pass)` via splitmix64 → images are bit-identical at any thread count, any GPU work-slicing, any schedule. This is what makes the whole verification culture possible.
+
+**One renderer, three estimators — brute force, NEE+MIS, and full ReSTIR — all provably converging to the same image.**
+
+---
+
+## Features
+
+### Rendering core
+- Unidirectional path tracer, iterative bounce loop, max depth 16, Russian roulette after bounce 3 (zero-guarded).
+- Progressive accumulation: viewer, PNG export and offline render are all `accum / N` — one math everywhere.
+- Metal compute backend, runtime-compiled from embedded source (Command Line Tools only, **no Xcode, no package manager**).
+- Adaptive GPU-time budgeting: heavy frames slice into row ranges across ticks (proven byte-identical) so 4K renders never starve the compositor.
+
+### Materials — GGX metallic-roughness BSDF
+- glTF-standard parameters (baseColor, metallic, roughness, emission, ior, transmission).
+- Cook-Torrance specular: GGX D (cancellation-free form), height-correlated Smith G2, Schlick Fresnel; Fresnel-coupled diffuse.
+- VNDF importance sampling (Heitz 2018); delta-dielectric glass.
+- Validated by a roughness×metallic grid (`--grid`) and a 20k-sample statistical sampler probe.
+
+### Lighting — unified NEE + MIS over every light type
+- HDRI environment (equirectangular `.hdr`), importance-sampled via a luminance×sinθ CDF.
+- Emissive spheres (cone/solid-angle sampling) and emissive mesh triangles (area sampling with the r²/cosθ Jacobian).
+- Power-heuristic MIS combining BSDF sampling and light sampling across all light types.
+- **Sun, sky, lamp, glowing mesh — every light is importance-sampled and MIS-combined**, with brute force one flag away.
+
+### ReSTIR DI (RIS + temporal + spatial)
+- RIS: audition 8 candidates per light slot, spend one shadow ray on the winner.
+- Temporal reuse: per-pixel persistent reservoirs, M-capped, similarity-gated, visibility re-traced every frame, reset through the central dirty hook.
+- Spatial reuse: neighbor reservoir sharing under the Talbot balance heuristic (provably unbiased for arbitrary support overlap).
+- All three dimensions unbiased against brute force; toggle with `G`.
+
+### Geometry & assets
+- BVH (midpoint split, median fallback, depth-capped so the traversal stack is a guarantee), built once on host, identical arrays on both backends.
+- glTF/GLB via cgltf: full node hierarchy, multi-material meshes via **Metal bindless argument buffers**, JPEG/PNG textures (embedded or file-relative), tangent-space normal mapping.
+- Correct sRGB↔linear handling (baseColor/emissive decoded; metallicRoughness/normal left linear; HDRI left linear).
+
+### Native editor
+- Bare-AppKit viewer (no GLFW/SDL), CAMetalLayer, resizable to 4K, Retina-crisp Dear ImGui UI.
+- Fly camera (WASD/QE + drag-look + sprint), fast-nav raster preview (solid/wireframe) for heavy scenes.
+- Picking, ImGuizmo translate/rotate/scale, material & light editors, outliner, undo/redo (Cmd+Z), JSON scene save/load (geometry by reference, bit-exact round-trips).
+
+---
+
+## Build
+
+Requires macOS on Apple Silicon and the Xcode **Command Line Tools** (no full Xcode, no package manager — all dependencies are vendored).
+
+```bash
+git clone https://github.com/emzcpp/Path_Tracer.git
+cd Path_Tracer
+cmake -B build
 cmake --build build
-cd build && ./pathtracer            # interactive viewer, GPU backend
-./pathtracer --cpu                  # interactive viewer, CPU reference backend
-./pathtracer --offline              # CPU render to out.ppm/out.png @ 256 spp
-./pathtracer 1024                   # offline render @ 1024 spp
-./pathtracer --parity               # verify GPU kernel against CPU reference
-./pathtracer --gpu-check            # compile kernels, print device info
-./pathtracer --mesh-info            # model loader / BVH diagnostics
-open out.png
 ```
 
-All render settings — resolution, samples per pixel, max bounce depth,
-camera, preview quality, GPU batch sizes — live in `src/settings.h`.
+## Run
 
-## Model import (glTF binary)
+```bash
+# Interactive viewer with an HDRI environment
+./build/pathtracer --env assets/kloofendal_puresky_2k.hdr
 
-The scene auto-loads `assets/DamagedHelmet.glb` (or the legacy
-`Test_Models/` path) when present; `--model <path>` loads any glTF/GLB,
-`--no-model` forces the sphere-only scene. Parsing is via the vendored
-single-header `cgltf` (node-hierarchy transforms composed to world space,
-all triangle primitives, TANGENT accessors or UV-derived tangents), with
-JPEG/PNG decode via `stb_image.h`. Materials map straight onto the GGX
-metallic-roughness BSDF, including tangent-space normal mapping; baseColor
-and emissive textures are sRGB-decoded to linear at load, while
-metallicRoughness and normal maps stay linear.
+# Full ReSTIR (RIS + spatial + temporal); G toggles the estimator live
+./build/pathtracer --restir --env assets/kloofendal_puresky_2k.hdr
+```
 
-Meshes are multi-material (Session I): every glTF material's texture set is loaded (shared images decoded once), each triangle carries a material index (permuted with the BVH, including through gizmo re-bakes), and the Metal kernel reaches all texture sets through a bindless argument-buffer table of Metal-3 gpuAddress pointers — same raw ushort buffers, same hand-matched bilinear filtering, no hardware samplers, residency via useResource. Building-scale assets work via --model-height / --model-yaw / --only-model (e.g. Sponza: 262k triangles, 25 materials, ~576 MB of decoded ushort4 textures on unified memory). Known limitation: alphaMode MASK cutouts (Sponza foliage) render opaque.
+### CLI reference
 
-What the import pipeline does: bakes the node transform + placement into
-world-space triangles at load, decodes textures to linear ushort4 (sRGB via
-pure pow-2.2, matching the display encode), builds a midpoint-split BVH
-(depth-capped so the traversal stack is a guarantee), and maps glTF
-metallic/roughness onto the existing material model (metallic > 0.5 →
-metal with fuzz = roughness²; emissive texture rides on the scattering
-surface). Both backends consume the identical host-built arrays: BVH
-traversal, Möller–Trumbore, and the bilinear texture sampler are written
-twice (C++ and MSL) with textually identical logic — `--parity` is the
-drift detector, and the helmet scene passes with the same-seed error ~19×
-below the Monte Carlo noise floor.
-
-## GPU/CPU parity
-
-Both backends render the same deterministic scene with the same
-per-(pixel, pass) PCG32 seeds, so `--parity` can diff them meaningfully:
-same-seed GPU-vs-CPU error sits ~60× below the Monte Carlo noise floor
-(mean ~0.05 display LSB, >96% of pixels exactly equal at 64 spp). Rare
-larger diffs are expected: a float ULP that flips a discrete branch
-(discriminant, Fresnel-vs-rng, roulette) replaces that whole path — the
-gate is on the bulk statistics, never the max. `parity_diff.png` makes any
-systematic bug visible at a glance.
-
-## Viewer controls
-
-| Input | Action |
+| Flag | Purpose |
 |---|---|
-| `W A S D` | move forward / left / back / right |
-| `Q` / `E` | move down / up |
-| left-drag | look around |
-| `Shift` | 4× speed boost |
-| scroll | adjust move speed |
-| `P` | save the current image as a timestamped PNG |
-| `R` | FINAL mode: lock camera, converge to target spp, auto-export PNG |
-| `F` | frame the selected object |
-| `U` | show/hide the tool panel (ImGui) |
-| click | select object under cursor (sky deselects) |
-| `Tab` / `Shift+Tab` | cycle selection through the outliner |
-| `1` / `2` / `3` | gizmo mode: move / rotate / scale the selection |
-| `Backspace` | delete the selected object |
-| `V` | fast-nav: cycle Off / Solid / Wireframe raster preview |
-| `?` / `F1` | keyboard-shortcut overlay |
-| `Esc` / `Cmd-Q` | close overlay / quit |
+| `./pathtracer` | Interactive viewer (Metal backend) |
+| `--cpu` | Run the viewer on the CPU reference backend |
+| `--restir` | Enable ReSTIR DI |
+| `--brute` | Brute-force ground truth (the referee) |
+| `--env <path>` | Load an equirectangular `.hdr` environment |
+| `--model <path>` / `--no-model` | Choose / suppress the loaded glTF |
+| `--offline [spp]` | Headless render to PNG |
+| `--parity [spp]` | **The correctness gate** — diff CPU vs GPU |
+| `--grid` | BSDF validation scene (roughness × metallic) |
+| `--nan-check` | Scan both accumulators for non-finite values |
+| `--gpu-check` / `--mesh-info` | Device / loader & BVH diagnostics |
 
-The tool panel exposes live render settings (reconverging through the
-central reset hook), the selection readout, and scene Save/Load (JSON;
-geometry stored by reference — sphere parameters and a relative mesh path,
-never vertex data).
+### In-viewer controls
+- **Camera:** `WASD` + `Q/E`, drag to look, `Shift` sprint, scroll to change speed, `F` frames selection.
+- **Modes:** `R` FINAL (locks camera, converges, exports PNG). `V` cycles fast-nav (off / solid / wireframe). `G` toggles the ReSTIR estimator. `U` hides the panel. `?`/`F1` shortcut overlay.
+- **Editing:** click to select, `1/2/3` gizmo mode, `Cmd+Z` / `Cmd+Shift+Z` undo/redo. Panel exposes material, light, camera, render settings, and ReSTIR parameters (M / temporal / spatial / M-cap / radius).
 
-The environment is an equirectangular HDRI (`--env <path.hdr>` or the
-panel's Environment section: load/clear, intensity, yaw — all persisted in
-scene files as a relative path). Radiance data stays linear (never
-sRGB-decoded), missed rays sample it with the same hand-written bilinear
-as material textures (u wraps, v clamps), and with no HDRI loaded the
-original gradient dome remains. Environment lighting uses NEE + MIS
-(Session H): a luminance x sin(theta) distribution over the HDRI drives
-shadow rays at every non-delta bounce, combined with BSDF sampling by the
-power heuristic — the sun's energy arrives every sample instead of by
-lottery, unbiased (verified to converge to brute force within MC noise on
-the image mean and per-band energy). `--brute` (or the panel checkbox)
-switches back to brute-force ground truth. Scene lights get the same
-treatment (Session J): emissive spheres AND emissive mesh triangles are
-next-event-estimated — one power-selected light sample per bounce (cone
-sampling for spheres, uniform-area with the r^2/cos Jacobian for
-triangles, textured Le at the sampled point) — and unified with env NEE
-and BSDF sampling under one power-heuristic MIS. Only triangles whose
-emissive texture actually glows join the light list (4-point UV probe);
-the list rebuilds automatically on any light edit or gizmo re-bake.
+---
 
-ReSTIR DI (`--restir`, `G` key, panel controls): reservoir-based direct
-lighting — M candidates per light slot (RIS), spatial neighbor reuse with
-Talbot balance-heuristic MIS (unbiased; +0.09% vs brute on a 36-light
-scene, 1.5x cleaner than NEE+MIS at equal spp). Temporal reuse is ON:
-history merges through the same balance-heuristic combine (its target
-evaluated on last frame's surface via a G-buffer ping-pong), measuring
-+0.1% alongside RIS and spatial on the hostile many-light gate. On
-accumulated renders temporal is noise-neutral (its value is per-frame
-quality); all reuse resets bit-identically through the central reset. Reservoir+G-buffer memory (~304 B/px)
-is shown in the stats panel and guarded by restir_mem_budget_mb (scale is
-clamped, never silently allocated). ReSTIR frames schedule whole-frame
-(spatial reuse reads across rows); brute force and NEE+MIS remain the
-referees. Residual sparse speckle from
-sun-through-glass caustic paths is inherent (delta chains can't be
-shadow-rayed) — the preview clamp still covers those. Fireflies from bright HDRI suns are
-legitimate brute-force variance; the indirect clamp that calms them is
-PREVIEW-ONLY (toggle + threshold in the panel, default 10) — FINAL,
-`--offline`, and `--parity` always render unclamped ground truth, since
-clamping is biased. `--nan-check [spp]` renders both backends and counts
-non-finite accumulator values (must be zero). Environment importance sampling / NEE is
-deliberately not implemented yet — bright suns converge slowly for now.
+## Verification
 
-Fast-nav (V) rasterizes the scene (flat-lit solid or wireframe) at full
-framerate while the camera moves — same camera matrices as the tracer, so
-it registers exactly — and hands back to path tracing on settle. The
-selected object always shows a wireframe overlay, in both modes.
+The project's correctness culture, in the commands you can run yourself:
 
-Trace work is scheduled against a per-command-buffer GPU-time budget
-(panel slider, default 10 ms; FINAL uses 24 ms): cheap frames batch several
-passes, heavy frames (4K/4x) are sliced into row ranges across ticks, so no
-dispatch monopolizes the GPU and the UI stays responsive at any detail.
-Slicing never changes the image — seeds are per (pixel, pass). PNG exports
-run on a background queue; the main thread never waits on the GPU.
+```bash
+./build/pathtracer --parity 64      # CPU vs GPU, gated below the noise floor
+./build/pathtracer --brute          # unbiased ground truth for any scene
+./build/pathtracer --grid           # BSDF energy validation
+./build/pathtracer --nan-check      # 0 non-finite across both backends
+```
 
-While the camera moves the renderer drops to a half-resolution preview;
-once you stop for ~150 ms it switches back to full resolution and
-progressively accumulates samples — the title bar shows the live sample
-count and pass rate, and rendering parks once it reaches 4096 spp.
+The full methodology — seed discipline, the noise-floor control, gate
+definitions, and the bias-bug case studies — is documented in
+[docs/PARITY.md](docs/PARITY.md).
 
-## Layout
+Every kernel-touching change is followed by `--parity`. Every variance-reduction technique is gated on matching `--brute` in the mean. Refactors are gated on byte-identical output (checksums). This is why the renderer can carry three different estimators and two different backends and still claim they all produce the *same image*.
 
-| File | Role |
-|---|---|
-| `src/settings.h` | every render knob |
-| `src/vec3.h`, `ray.h`, `rng.h` | core math + PCG32 RNG (GPU-portable) |
-| `src/camera.h` | look-from/look-at/fov → primary rays |
-| `src/camera_controller.h` | fly camera (pos + yaw/pitch) for the viewer |
-| `src/hittable.h`, `sphere.h`, `scene.h` | geometry + traversal |
-| `src/scene_setup.h` | the demo scene |
-| `src/material.h` | Lambertian/metal/glass/emissive scatter — **future Metal kernel** |
-| `src/integrator.h` | iterative bounce loop — **future Metal kernel** |
-| `src/renderer.h/.cpp` | CPU progressive accumulation + worker pool |
-| `src/gltf_loader.h/.cpp` | GLB/JSON/accessor parsing, texture decode, transform bake |
-| `src/bvh.h/.cpp` | midpoint-split BVH build (host-only, shared by both backends) |
-| `src/mesh.h`, `texture.h` | CPU BVH traversal, Möller–Trumbore, bilinear sampling |
-| `src/kernel_types.h` | structs shared between C++ and MSL |
-| `src/kernels/pathtrace.metal` | the GPU kernel — line-by-line port of the CPU reference |
-| `src/gpu_renderer.h/.mm` | Metal device/pipelines/buffers, batching, readback |
-| `src/image.h/.cpp` | linear framebuffer → gamma-corrected PPM/PNG |
-| `src/viewer.h`, `viewer_macos.mm` | AppKit window, input, GPU present / CPU blit |
-| `src/main.cpp` | mode dispatch: viewer / offline / parity / gpu-check |
+---
+
+## Architecture at a glance
+
+```
+Camera ray ─▶ BVH intersect ─▶ G-buffer (position, normal, material, RNG state)
+                                   │
+                                   ▼
+              ┌────────── direct lighting ──────────┐
+              │  NEE + MIS   or   ReSTIR DI          │
+              │  (RIS → temporal reuse → spatial     │
+              │   reuse, Talbot balance heuristic)   │
+              └──────────────────────────────────────┘
+                                   │
+                                   ▼
+                       indirect bounces (resume path)
+                                   │
+                                   ▼
+                 progressive accumulation  (accum / N)
+                                   │
+                     ┌─────────────┴─────────────┐
+                     ▼                             ▼
+              CPU reference                 Metal compute kernel
+              (integrator.h)                (pathtrace.metal)
+                     └──────── --parity diff ──────┘
+```
+
+The integrator is a phased pipeline (`g_primary` → direct → indirect), which is what makes ReSTIR's per-step, all-pixels-synchronized reuse possible while keeping each phase independently sliceable for GPU-time budgeting.
+
+## Dependencies (all vendored — no package manager)
+
+`stb_image`, `stb_image_write`, `nlohmann/json`, `cgltf`, Dear ImGui (+ osx/metal backends), ImGuizmo. Everything else — BVH, loader glue, samplers, BSDF, integrator, ReSTIR, viewer — is written in-repo.
+
+## Acknowledgements
+
+Built on the shoulders of: Shirley, *Ray Tracing in One Weekend*; Heitz 2018 (VNDF sampling); Bitterli et al. 2020 (ReSTIR); the Khronos glTF Sample Assets (DamagedHelmet, Sponza); Poly Haven (CC0 HDRIs).
+
+## License
+
+MIT — see [LICENSE](LICENSE). Bundled assets (the Khronos glTF Sample Assets and Poly Haven HDRI under `assets/` and `Test_Models/`) retain their original licenses; see their source pages.
