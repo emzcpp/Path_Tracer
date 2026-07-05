@@ -121,6 +121,18 @@ struct ViewerCore {
     // when still (the settle machinery already reconverges on handback).
     int fastnav = 0;
 
+    // v1.3 light painting (creative long-exposure mode, main-thread
+    // only, GPU viewer only). While ON, sphere edits swap buffers WITHOUT
+    // the generation bump, so a moving emissive object deposits a glowing
+    // trail into the un-cleared accumulator. Everything else (mesh, env,
+    // scene load, render settings) resets exactly as before.
+    bool light_painting = false;
+    bool paint_orbit = false;      // hands-free animator for the selection
+    float paint_orbit_speed = 0.8f;   // radians/s
+    float paint_orbit_radius = 1.6f;
+    float paint_orbit_angle = 0.0f;   // animator state
+    point3 paint_orbit_center{0.0f, 1.2f, 0.0f};
+
     // Phase 5.2 viewport/render QoL (main-thread only).
     float interactive_scale = 1.0f;    // interactive-mode resolution scale
     bool paused = false;               // freeze accumulation (UI stays live)
@@ -409,6 +421,13 @@ void apply_sphere_edit(ViewerCore& core) {
         // added / deleted) — the light list is derived data.
         refresh_lights(core);
     }
+    // v1.3 light painting: the ONE deliberate exception to the central
+    // reset. The buffer swaps above already put the sphere's new position
+    // in front of the tracer; skipping the generation bump leaves the
+    // accumulator summing, so successive positions deposit a glowing
+    // trail (a photographic long exposure). Only sphere edits paint —
+    // every other mutation still funnels through mark_scene_dirty.
+    if (core.light_painting) return;
     core.mark_scene_dirty();
 }
 
@@ -1390,6 +1409,25 @@ void render_thread_main(ViewerCore& core) {
     GpuRenderer& gpu = *core_->gpu;
     const auto now = Clock::now();
 
+    // v1.3 light painting: hands-free performer. Orbits the selected
+    // sphere around its capture center; each step flows through
+    // apply_sphere_edit, which (in painting mode) swaps buffers without
+    // resetting — the orbit paints a ring.
+    if (core_->light_painting && core_->paint_orbit &&
+        core_->selection.kind == Selection::Kind::Sphere &&
+        core_->selection.index < int(core_->desc.spheres.size())) {
+        core_->paint_orbit_angle += core_->paint_orbit_speed * dt;
+        SphereData& sd = core_->desc.spheres[core_->selection.index];
+        sd.center = point3(core_->paint_orbit_center.x +
+                               core_->paint_orbit_radius *
+                                   std::cos(core_->paint_orbit_angle),
+                           core_->paint_orbit_center.y,
+                           core_->paint_orbit_center.z +
+                               core_->paint_orbit_radius *
+                                   std::sin(core_->paint_orbit_angle));
+        apply_sphere_edit(*core_);
+    }
+
     // Throttled mesh re-bake, shared by the gizmo and the numeric TRS
     // fields: apply when the interaction settles, or every ~80ms during a
     // continuous drag/scrub.
@@ -2267,6 +2305,87 @@ void render_thread_main(ViewerCore& core) {
             ImGui::Text("%d portals \xC2\xB7 recursion bounded by max "
                         "bounces (%d)",
                         np, s.max_depth);
+        }
+    }
+    if (ImGui::CollapsingHeader("Light painting",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Creative long-exposure mode: NOT physics — no unbiasedness gate.
+        // While on, sphere edits do NOT reset accumulation, so dragging an
+        // emissive sphere paints a glowing trail.
+        bool lp = core_->light_painting;
+        if (ImGui::Checkbox("light painting", &lp)) {
+            core_->light_painting = lp;
+            if (lp && s.restir != 0) {
+                // Temporal reservoirs must not replay a deliberately-
+                // moving light; painting runs on the NEE+MIS path.
+                s.restir = 0;
+                gpu.set_restir(s);
+            }
+            // Entering OR leaving the mode starts from a clean state —
+            // the one deliberate reset bracketing the exception.
+            core_->mark_scene_dirty();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Long exposure: moving an emissive sphere leaves a glowing\n"
+                "trail (sphere edits stop resetting accumulation). Drag a\n"
+                "light or use the orbit performer. ReSTIR turns off while\n"
+                "painting; denoiser off recommended (its guides don't see\n"
+                "trails). P exports the painting.");
+        }
+        if (core_->light_painting) {
+            if (ImGui::Button("clear canvas")) core_->mark_scene_dirty();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(manual reset)");
+            // Trail brightness: edits the SELECTED emissive sphere through
+            // the same no-reset path, so changes mid-stroke become part of
+            // the painting.
+            if (core_->selection.kind == Selection::Kind::Sphere &&
+                core_->selection.index < int(core_->desc.spheres.size())) {
+                SphereData& sd =
+                    core_->desc.spheres[core_->selection.index];
+                float strength = std::fmax(
+                    sd.mat.emission.x,
+                    std::fmax(sd.mat.emission.y, sd.mat.emission.z));
+                if (strength > 0.0f) {
+                    if (ImGui::DragFloat("trail brightness", &strength,
+                                         0.1f, 0.1f, 200.0f)) {
+                        const color dir =
+                            sd.mat.emission *
+                            (1.0f / std::fmax(
+                                        1e-4f,
+                                        std::fmax(sd.mat.emission.x,
+                                                  std::fmax(
+                                                      sd.mat.emission.y,
+                                                      sd.mat.emission
+                                                          .z))));
+                        sd.mat.emission = dir * strength;
+                        apply_sphere_edit(*core_);
+                    }
+                    bool orb = core_->paint_orbit;
+                    if (ImGui::Checkbox("orbit performer", &orb)) {
+                        core_->paint_orbit = orb;
+                        if (orb) {
+                            // capture the orbit about the CURRENT position
+                            core_->paint_orbit_center = sd.center;
+                            core_->paint_orbit_angle = 0.0f;
+                        }
+                    }
+                    if (core_->paint_orbit) {
+                        ImGui::SliderFloat("orbit speed",
+                                           &core_->paint_orbit_speed, 0.1f,
+                                           4.0f, "%.2f rad/s");
+                        ImGui::SliderFloat("orbit radius",
+                                           &core_->paint_orbit_radius, 0.2f,
+                                           4.0f, "%.2f");
+                    }
+                } else {
+                    ImGui::TextDisabled(
+                        "select an EMISSIVE sphere to paint with");
+                }
+            } else {
+                ImGui::TextDisabled("select an emissive sphere to paint");
+            }
         }
     }
         ImGui::TextDisabled(

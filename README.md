@@ -59,6 +59,23 @@ Most hobby path tracers are one backend, eyeballed for correctness. This one is 
 - Spatial reuse: neighbor reservoir sharing under the Talbot balance heuristic (provably unbiased for arbitrary support overlap).
 - All three dimensions unbiased against brute force; toggle with `G`.
 
+### Light painting (creative mode)
+- A long-exposure capture mode (Effects tab): while on, moving an emissive
+  sphere does NOT reset accumulation, so every position it passes through
+  deposits into the same image — a glowing trail, like photographic light
+  painting. Sphere edits paint; everything else (mesh, environment, scene,
+  render settings) resets exactly as before, and a "clear canvas" button is
+  the deliberate manual reset. An orbit performer animates the selected
+  light hands-free; trail brightness is adjustable mid-stroke.
+- Deliberately NOT physics (no unbiasedness gate): each pass is a correct
+  render of a legitimate scene state, and the sum is the time-average of a
+  moving scene — the definition of a long exposure. Runs on the NEE+MIS
+  path (ReSTIR turns off while painting; its temporal reservoirs must not
+  replay a deliberately-moving light). Mode off restores the exact prior
+  behavior — `--parity` is untouched.
+
+![Light painting: an emissive sphere swept along a spiral](docs/lightpainting.png)
+
 ### Recursive portals / non-euclidean geometry (v1.3)
 - A portal is a rectangle that, instead of shading a ray, TELEPORTS it to a
   partner and continues the same path — a loss-less rigid redirect (no BSDF,
