@@ -281,6 +281,11 @@ int main(int argc, char** argv) {
             settings.restir = 1;
         } else if (std::strcmp(argv[i], "--spectral") == 0) {
             settings.spectral = 1;
+        } else if (std::strcmp(argv[i], "--fog") == 0) {
+            settings.fog = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                settings.fog_density = float(std::atof(argv[++i]));
+            }
         } else if (std::strcmp(argv[i], "--prism") == 0) {
             prism_demo = true;
             settings.spectral = 1;

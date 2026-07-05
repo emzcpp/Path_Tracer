@@ -91,6 +91,14 @@ struct RenderSettings {
     // n(lambda)=A+B/lambda^2 in Stage 2 (0 = no dispersion, matches Stage 1).
     int spectral = 0;
     float dispersion_b = 0.0f;
+    // v1.3 participating medium (homogeneous global fog). Changes tracing,
+    // so it resets accumulation. fog == 0 -> vacuum, byte-identical.
+    // Stage 1 uses only density (Beer-Lambert transmittance); g + color
+    // drive the Stage 2 in-scattering phase function / scatter albedo.
+    int fog = 0;
+    float fog_density = 0.10f;   // sigma_t (extinction per world unit)
+    float fog_g = 0.0f;          // Henyey-Greenstein anisotropy [-1,1]
+    color fog_color = color(1.0f, 1.0f, 1.0f);   // scattering albedo (RGB)
 
     // Execution
     int thread_count = 0;         // 0 = use all hardware threads

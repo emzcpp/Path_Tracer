@@ -972,6 +972,11 @@ inline float3 spec_atten(thread const SpecCtx& s, float3 a) {
     return float3(spec_reflectance(a, s.lam));
 }
 
+// v1.3 homogeneous-medium transmittance — mirror of integrator.h::fog_tr.
+inline float fog_tr(float sigma, float dist) {
+    return sigma > 0.0f ? exp(-sigma * dist) : 1.0f;
+}
+
 inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                           float3 rd, thread PRNG& rng, float3 throughput,
                           thread float3& radiance,
@@ -987,7 +992,7 @@ inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                           constant PassUniforms& U,
                           thread bool& can_nee_out,
                           thread bool& can_nee_light_out,
-                          thread const SpecCtx& sc) {
+                          thread const SpecCtx& sc, float fog_sigma) {
         // ---- Session H: next-event estimation toward the environment.
         // Deliberately sample the env distribution (the sun), evaluate the
         // BSDF for that direction, and add the contribution if the shadow
@@ -1015,13 +1020,15 @@ inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                         const float w =
                             (pdf_env * pdf_env) /
                             (pdf_env * pdf_env + pdf_b * pdf_b + 1e-20f);
+                        // Env at infinity: global fog extinguishes it
+                        // (fog_tr with +inf -> 0); vacuum -> 1.
                         const float3 c =
                             throughput *
                             spec_dep2(sc, f,
                                       miss_radiance(env_texels, U.env_w,
                                                     U.env_h, U.env_intensity,
                                                     U.env_yaw_norm, ldir)) *
-                            (nl * w / pdf_env);
+                            (nl * w / pdf_env) * fog_tr(fog_sigma, INFINITY);
                         radiance += clamp_contribution(c, U.clamp_indirect);
                     }
                 }
@@ -1075,8 +1082,11 @@ inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                         const float pl = pdf_sa * L.sel_pdf;
                         const float w =
                             (pl * pl) / (pl * pl + pdf_b * pdf_b + 1e-20f);
+                        // Area light at finite t_light: dim by fog along
+                        // the shadow ray.
                         const float3 c = throughput * spec_dep2(sc, f, Le) *
-                                         (nl * w / pl);
+                                         (nl * w / pl) *
+                                         fog_tr(fog_sigma, t_light);
                         radiance += clamp_contribution(c, U.clamp_indirect);
                     }
                 }
@@ -1102,7 +1112,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     // direct lighting (the direct phase computed it with
                     // the same rng draws).
                     bool has_pre, thread const HitInfo& pre,
-                    bool skip_v0_direct, bool spectral) {
+                    bool skip_v0_direct, bool spectral, float fog_sigma) {
     float3 radiance = float3(0.0f);
     float3 throughput = float3(1.0f);
     // v1.2 hero-wavelength: one lambda per path (one rng draw, here, so
@@ -1124,6 +1134,12 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
         } else {
             hit_any = scene_hit_eval(ro, rd, spheres, n, nodes, tris,
                                      materials, tri_mat, tri_light, MU, hi);
+        }
+        // v1.3 Stage 1: Beer-Lambert transmittance over this segment —
+        // mirror of integrator.h (miss -> +inf -> 0; guard avoids 0*inf).
+        if (fog_sigma > 0.0f) {
+            const float seg_len = hit_any ? hi.t : INFINITY;
+            throughput *= exp(-fog_sigma * seg_len);
         }
         if (!hit_any) {
             // MIS (power heuristic): vertices that ran env NEE weight
@@ -1187,7 +1203,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             sample_direct(hp, hn, mat, rd, rng, throughput, radiance,
                           spheres, n, nodes, tris, materials, env_texels,
                           env_row_cdf, env_cond_cdf, lights, MU, U, v_nee,
-                          v_nee_light, sc);
+                          v_nee_light, sc, fog_sigma);
             prev_nee = v_nee;
             prev_nee_light = v_nee_light;
         }
@@ -1267,7 +1283,8 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                        materials, tri_mat, env_texels, env_row_cdf,
                        env_cond_cdf, lights, tri_light, MU, U, rng,
                        U.max_depth, false, no_pre, false,
-                       U.spectral != 0u);
+                       U.spectral != 0u,
+                       U.fog != 0u ? U.fog_sigma : 0.0f);
     }
     accum[px] += float4(total, 0.0f);
 }
@@ -2161,7 +2178,8 @@ kernel void indirect_v0(device float4* accum           [[buffer(0)]],
     const float3 c =
         trace(c3(g.pos), rd, spheres, U.sphere_count, nodes, tris, materials,
               tri_mat, env_texels, env_row_cdf, env_cond_cdf, lights,
-              tri_light, MU, U, rng, U.max_depth, true, pre, true, false);
+              tri_light, MU, U, rng, U.max_depth, true, pre, true, false,
+              0.0f);   // ReSTIR indirect: fog deferred (monolithic path only)
     accum[px] += float4(c, 0.0f);
 }
 

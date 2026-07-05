@@ -329,6 +329,11 @@ struct GpuRenderer::Impl {
             pt_uint(settings.restir_mcap > 1 ? settings.restir_mcap : 1);
         u.spectral = pt_uint(settings.spectral != 0 ? 1 : 0);
         u.dispersion_b = settings.dispersion_b;
+        u.fog = pt_uint(settings.fog != 0 ? 1 : 0);
+        u.fog_sigma = settings.fog_density;
+        u.fog_g = settings.fog_g;
+        u.fog_col = pt_float3{settings.fog_color.x, settings.fog_color.y,
+                              settings.fog_color.z};
         return u;
     }
 

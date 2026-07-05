@@ -73,7 +73,14 @@ struct PassUniforms {
     // byte-identical to pre-feature. dispersion_b feeds the Cauchy IOR.
     pt_uint spectral;
     float dispersion_b;
-    pt_uint pad_s0, pad_s1;
+    // v1.3 participating medium (homogeneous global fog). fog == 0 -> the
+    // vacuum path, byte-identical. sigma_t = extinction; g = HG anisotropy;
+    // fog_col = scattering albedo (Stage 2 in-scattering).
+    pt_uint fog;
+    float fog_sigma;
+    float fog_g;
+    pt_float3 fog_col;
+    pt_uint pad_s1;
 };
 
 // v1.1 denoiser (display-only post-process; OUTSIDE the parity surface —
@@ -216,7 +223,7 @@ struct GBufferPx {
 static_assert(sizeof(pt_float3) == 12, "pt_float3 must be 12 bytes");
 static_assert(sizeof(GPUSphere) == 64, "GPUSphere must be one cacheline");
 static_assert(sizeof(GPUCamera) == 48, "GPUCamera layout drifted");
-static_assert(sizeof(PassUniforms) == 144, "PassUniforms layout drifted");
+static_assert(sizeof(PassUniforms) == 164, "PassUniforms layout drifted");
 static_assert(sizeof(ResolveUniforms) == 24, "ResolveUniforms layout drifted");
 static_assert(sizeof(DenoiseUniforms) == 64, "DenoiseUniforms layout drifted");
 static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");

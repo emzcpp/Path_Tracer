@@ -289,6 +289,13 @@ inline color clamp_contribution(const color& c, float m) {
 // original order (bit-preserving for the monolithic caller); consumes
 // the same rng draws under the same conditions. The can_nee_* outputs
 // feed the caller's MIS bookkeeping for its continuation ray.
+// v1.3 homogeneous-medium transmittance along a ray of the given length
+// (Beer-Lambert). sigma == 0 -> 1 (vacuum). dist may be +inf (env light in
+// global fog -> 0), so the sigma > 0 guard also avoids 0*inf = NaN.
+inline float fog_tr(float sigma, float dist) {
+    return sigma > 0.0f ? std::exp(-sigma * dist) : 1.0f;
+}
+
 inline void sample_direct(const HitRecord& rec, const Ray& ray,
                           const Hittable& world, RNG& rng,
                           const EnvLookup& env, const LightsLookup& lights,
@@ -297,7 +304,8 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
                           bool& can_nee_light_out,
                           const SpecCtx& sc = SpecCtx{false, 0.0f,
                                                       color(1.0f, 1.0f,
-                                                            1.0f)}) {
+                                                            1.0f)},
+                          float fog_sigma = 0.0f) {
         // ---- Session H: next-event estimation toward the environment.
         // Deliberately sample the env distribution (the sun), evaluate the
         // BSDF for that direction, and add the contribution if the shadow
@@ -327,10 +335,15 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
                         const float w =
                             (pdf_env * pdf_env) /
                             (pdf_env * pdf_env + pdf_b * pdf_b + 1e-20f);
+                        // Env light is at infinity: in global fog the
+                        // shadow ray never escapes, so its transmittance is
+                        // 0 (fog_tr with +inf). In vacuum this is 1.
                         const color c =
                             throughput *
                             spec_dep2(sc, f, miss_radiance(env, shadow)) *
-                            (nl * w / pdf_env);
+                            (nl * w / pdf_env) *
+                            fog_tr(fog_sigma,
+                                   std::numeric_limits<float>::infinity());
                         radiance += clamp_contribution(c, clamp_indirect);
                     }
                 }
@@ -384,8 +397,11 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
                         const float pl = pdf_sa * L.sel_pdf;
                         const float w =
                             (pl * pl) / (pl * pl + pdf_b * pdf_b + 1e-20f);
+                        // Area light at finite distance t_light: dim by the
+                        // fog transmittance along the shadow ray.
                         const color c = throughput * spec_dep2(sc, f, Le) *
-                                        (nl * w / pl);
+                                        (nl * w / pl) *
+                                        fog_tr(fog_sigma, t_light);
                         radiance += clamp_contribution(c, clamp_indirect);
                     }
                 }
@@ -1031,7 +1047,7 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                    // computed it with the same rng draws).
                    const HitRecord* pre = nullptr,
                    bool skip_v0_direct = false, bool spectral = false,
-                   float dispersion_b = 0.0f) {
+                   float dispersion_b = 0.0f, float fog_sigma = 0.0f) {
     color radiance(0.0f);      // light collected so far
     color throughput(1.0f);    // fraction of it that survives back to the eye
     // v1.2 hero-wavelength: sample one lambda per path (one rng draw, here,
@@ -1054,6 +1070,18 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
             hit_any = world.hit(ray, 1e-3f,
                                 std::numeric_limits<float>::infinity(), rec);
         }
+        // v1.3 Stage 1: Beer-Lambert transmittance over this vacuum segment
+        // (eye/bounce ray). Applied to the throughput BEFORE this vertex is
+        // shaded, so emission and NEE here are already fog-dimmed. On a miss
+        // the segment is infinite -> transmittance 0 -> the env is
+        // extinguished (correct for global fog). The guard keeps vacuum
+        // byte-identical and avoids 0*inf = NaN.
+        if (fog_sigma > 0.0f) {
+            const float seg_len =
+                hit_any ? rec.t : std::numeric_limits<float>::infinity();
+            throughput = throughput * std::exp(-fog_sigma * seg_len);
+        }
+
         if (!hit_any) {
             // MIS (power heuristic): vertices that ran env NEE weight
             // their continuation's env hit by the BSDF-sampling share;
@@ -1105,7 +1133,8 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
         } else {
             bool v_nee = false, v_nee_light = false;
             sample_direct(rec, ray, world, rng, env, lights, clamp_indirect,
-                          throughput, radiance, v_nee, v_nee_light, sc);
+                          throughput, radiance, v_nee, v_nee_light, sc,
+                          fog_sigma);
             prev_nee = v_nee;
             prev_nee_light = v_nee_light;
         }

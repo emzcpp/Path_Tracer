@@ -116,7 +116,9 @@ void ProgressiveRenderer::render_row(int y) {
                               settings_.max_depth, env_, lights_,
                               settings_.clamp_indirect, nullptr, false,
                               settings_.spectral != 0,
-                              settings_.dispersion_b);
+                              settings_.dispersion_b,
+                              settings_.fog != 0 ? settings_.fog_density
+                                                 : 0.0f);
 
         const color c = accum_row[x] * inv_n;
         out[x * 4 + 0] = encode_channel(c.x);
