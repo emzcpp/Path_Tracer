@@ -257,6 +257,7 @@ int main(int argc, char** argv) {
     bool lights_demo = false;    // add a grid of emissive fixtures (ReSTIR)
     bool prism_demo = false;     // v1.2: a glass sphere for dispersion
     bool prism_mesh = false;     // v1.2: a triangular GLASS PRISM mesh
+    bool godrays = false;        // v1.3: fog + occluders = light shafts
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--offline") == 0) {
@@ -286,6 +287,11 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 settings.fog_density = float(std::atof(argv[++i]));
             }
+        } else if (std::strcmp(argv[i], "--godrays") == 0) {
+            godrays = true;
+            settings.fog = 1;
+            settings.fog_density = 0.09f;
+            settings.fog_g = 0.55f;
         } else if (std::strcmp(argv[i], "--prism") == 0) {
             prism_demo = true;
             settings.spectral = 1;
@@ -452,6 +458,35 @@ int main(int argc, char** argv) {
         settings.max_depth = 12;
         std::printf("prism-mesh: spectral on, dispersion B=%.3f\n",
                     settings.dispersion_b);
+    }
+    if (godrays) {
+        // v1.3 fog showcase: a bright light behind a slotted occluder wall;
+        // the fog makes the shafts through the gaps visible, with
+        // volumetric shadows behind the wall bars. Viewed across the beam.
+        desc.spheres.clear();
+        desc.spheres.push_back(
+            {point3(0.0f, -1000.0f, 0.0f), 1000.0f,
+             Material::lambertian(color(0.3f, 0.3f, 0.33f)), "Floor"});
+        desc.spheres.push_back({point3(3.5f, 6.5f, -6.0f), 0.8f,
+                                Material::emissive(color(34, 32, 26)),
+                                "Sun"});
+        int nb = 0;
+        for (float z = -3.6f; z <= 3.6f; z += 1.8f) {
+            for (float y = 0.5f; y < 4.4f; y += 0.6f) {
+                desc.spheres.push_back(
+                    {point3(1.2f, y, z), 0.30f,
+                     Material::lambertian(color(0.12f, 0.12f, 0.13f)),
+                     "Bar"});
+                ++nb;
+            }
+        }
+        desc.env.reset();
+        desc.env_intensity = 0.012f;
+        settings.cam_pos = point3(-5.0f, 1.5f, 5.5f);
+        settings.cam_look_at = point3(0.5f, 1.3f, 0.0f);
+        settings.max_depth = 8;
+        std::printf("godrays: fog sigma=%.3f g=%.2f, %d occluder bars\n",
+                    settings.fog_density, settings.fog_g, nb);
     }
     if (brute) {
         settings.env_nee = 0;

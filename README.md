@@ -59,6 +59,20 @@ Most hobby path tracers are one backend, eyeballed for correctness. This one is 
 - Spatial reuse: neighbor reservoir sharing under the Talbot balance heuristic (provably unbiased for arbitrary support overlap).
 - All three dimensions unbiased against brute force; toggle with `G`.
 
+### Volumetric fog / god rays (v1.3)
+- A homogeneous participating medium (`--fog [density]`, `--godrays`, or the
+  Render-tab toggle): light is absorbed and scattered along the ray, not
+  just at surfaces. Two effects — Beer-Lambert transmittance (fog dims) and
+  Henyey-Greenstein in-scattering (fog glows), so a bright light behind
+  occluders casts visible **light shafts with volumetric shadows**.
+- Unbiased: analytic distance sampling for the homogeneous case (no
+  ray-march step bias); in-scattering converges to `--brute` in the mean
+  (measured +0.04% / +0.00%). Controls: density, anisotropy g (g>0 forward
+  = bright god rays), scatter albedo. Default OFF -> `--parity`, `--brute`,
+  and performance byte-identical; sigma=0 is byte-identical to vacuum.
+
+![Volumetric god rays through fog](docs/godrays.png)
+
 ### Spectral dispersion (v1.2)
 - A `--spectral` mode (also `--prism`, or the Render-tab toggle) where each
   path carries ONE wavelength (400-700nm) instead of an RGB triple; RGB is

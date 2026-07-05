@@ -1086,6 +1086,13 @@ void GpuRenderer::set_spectral(int on, float dispersion_b) {
     impl_->settings.dispersion_b = dispersion_b;
 }
 
+void GpuRenderer::set_fog(const RenderSettings& s) {
+    impl_->settings.fog = s.fog;
+    impl_->settings.fog_density = s.fog_density;
+    impl_->settings.fog_g = s.fog_g;
+    impl_->settings.fog_color = s.fog_color;
+}
+
 void GpuRenderer::set_denoise(const RenderSettings& s) {
     impl_->settings.denoise = s.denoise;
     impl_->settings.denoise_iters = s.denoise_iters;

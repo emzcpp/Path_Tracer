@@ -158,6 +158,9 @@ public:
     // v1.2 spectral: sync the mode + dispersion into the renderer's own
     // settings copy. Changes tracing, so the caller marks the scene dirty.
     void set_spectral(int on, float dispersion_b);
+    // v1.3 participating medium: sync fog fields into the renderer's own
+    // settings copy. Changes tracing, so the caller marks the scene dirty.
+    void set_fog(const RenderSettings& s);
 
     // Bridged id<MTLDevice>, for CAMetalLayer.device.
     void* metal_device() const;

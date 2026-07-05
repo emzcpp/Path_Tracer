@@ -1724,6 +1724,10 @@ void render_thread_main(ViewerCore& core) {
         ImGui::Text("spectral: hero-wavelength 400-700nm, dispersion %.3f",
                     core_->settings.dispersion_b);
     }
+    if (core_->settings.fog != 0) {
+        ImGui::Text("fog: sigma=%.3f, g=%.2f (in-scattering)",
+                    core_->settings.fog_density, core_->settings.fog_g);
+    }
 
     // Session G telemetry: per-CB GPU time vs budget, main-thread tick
     // time, and the shape of the last submitted slice.
@@ -2185,6 +2189,40 @@ void render_thread_main(ViewerCore& core) {
         }
         if (changed) {
             gpu.set_spectral(s.spectral, s.dispersion_b);
+            dirty = true;
+        }
+    }
+    {
+        // v1.3 participating medium (fog). Changes tracing (distance
+        // sampling + in-scattering), so it RESETS accumulation. Uses the
+        // monolithic NEE+MIS / brute estimator; pairs with ReSTIR off.
+        bool f_on = s.fog != 0;
+        bool changed = false;
+        if (ImGui::Checkbox("fog / god rays", &f_on)) {
+            s.fog = f_on ? 1 : 0;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Homogeneous participating medium: light is absorbed and\n"
+                "scattered along the ray (Beer-Lambert + Henyey-Greenstein\n"
+                "in-scattering). A bright light + occluders gives visible\n"
+                "light shafts with volumetric shadows. NEE+MIS path.");
+        }
+        if (f_on) {
+            changed |= ImGui::SliderFloat("density", &s.fog_density, 0.0f,
+                                          0.5f, "%.3f");
+            changed |= ImGui::SliderFloat("anisotropy g", &s.fog_g, -0.9f,
+                                          0.9f, "%.2f");
+            float fc[3] = {s.fog_color.x, s.fog_color.y, s.fog_color.z};
+            if (ImGui::ColorEdit3("scatter albedo", fc)) {
+                s.fog_color = color(fc[0], fc[1], fc[2]);
+                changed = true;
+            }
+            ImGui::TextDisabled("g>0 forward (bright shafts); global fog");
+        }
+        if (changed) {
+            gpu.set_fog(s);
             dirty = true;
         }
     }
