@@ -95,6 +95,7 @@ struct RenderSettings {
     // so it resets accumulation. fog == 0 -> vacuum, byte-identical.
     // Stage 1 uses only density (Beer-Lambert transmittance); g + color
     // drive the Stage 2 in-scattering phase function / scatter albedo.
+    int portals = 1;   // v1.3: teleport at portal surfaces (0 = ignore them)
     int fog = 0;
     float fog_density = 0.10f;   // sigma_t (extinction per world unit)
     float fog_g = 0.0f;          // Henyey-Greenstein anisotropy [-1,1]

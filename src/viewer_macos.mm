@@ -2241,6 +2241,34 @@ void render_thread_main(ViewerCore& core) {
             dirty = true;
         }
     }
+    if (ImGui::CollapsingHeader("Portals (non-euclidean)",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Portals teleport a ray to a partner instead of shading it —
+        // recursive tunnels / impossible space. They are a SCENE feature
+        // (built by --portals); this toggles whether they're active.
+        const int np = int(core_->desc.portals.size());
+        if (np == 0) {
+            ImGui::TextDisabled("no portals in this scene (try --portals)");
+        } else {
+            bool p_on = s.portals != 0;
+            if (ImGui::Checkbox("portals active", &p_on)) {
+                s.portals = p_on ? 1 : 0;
+                gpu.set_portals(p_on ? core_->desc.portals
+                                     : std::vector<GPUPortal>{});
+                dirty = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "A portal rectangle teleports a ray to its partner\n"
+                    "(loss-less redirect), so you see through space and\n"
+                    "facing portals recurse. Recursion is bounded by the\n"
+                    "Render tab's max bounces.");
+            }
+            ImGui::Text("%d portals \xC2\xB7 recursion bounded by max "
+                        "bounces (%d)",
+                        np, s.max_depth);
+        }
+    }
         ImGui::TextDisabled(
             "advanced transport modes \xE2\x80\x94 these reset accumulation");
         if (dirty) {

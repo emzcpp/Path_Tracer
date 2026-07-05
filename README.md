@@ -59,6 +59,19 @@ Most hobby path tracers are one backend, eyeballed for correctness. This one is 
 - Spatial reuse: neighbor reservoir sharing under the Talbot balance heuristic (provably unbiased for arbitrary support overlap).
 - All three dimensions unbiased against brute force; toggle with `G`.
 
+### Recursive portals / non-euclidean geometry (v1.3)
+- A portal is a rectangle that, instead of shading a ray, TELEPORTS it to a
+  partner and continues the same path — a loss-less rigid redirect (no BSDF,
+  NEE, cosine, attenuation, or random draw). This yields see-through-space,
+  bigger-inside-than-outside layouts, and — with facing portals — bounded
+  recursive corridors (a Droste tunnel that terminates at max bounces).
+- Handled entirely inside `trace` (closest portal hit vs surface hit, then
+  the transform), so it composes with existing lighting/materials/fog on the
+  far side automatically. `--portals` stages a recursive corridor; the
+  Effects tab has a Portals toggle. No-portal scenes are byte-identical.
+
+![Recursive portal corridor](docs/portals.png)
+
 ### Volumetric fog / god rays (v1.3)
 - A homogeneous participating medium (`--fog [density]`, `--godrays`, or the
   Render-tab toggle): light is absorbed and scattered along the ray, not
