@@ -2164,7 +2164,20 @@ void render_thread_main(ViewerCore& core) {
             dirty = true;
         }
     }
-    {
+    if (dirty) {
+        core_->final_saved = false;   // settings changed: re-arm the export
+        core_->mark_scene_dirty();
+    }
+    ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Effects")) {
+        // Advanced, off-by-default light-transport modes — they change
+        // the PHYSICS being simulated, so they RESET accumulation (the
+        // mark_scene_dirty finalizer below), unlike the display-only
+        // denoiser/clamp in Display. Grouped by function, not recency.
+        bool dirty = false;
+    if (ImGui::CollapsingHeader("Spectral dispersion",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
         // v1.2 spectral dispersion. Changes tracing (one wavelength per
         // path, wavelength-dependent glass IOR), so it RESETS accumulation
         // — not display-only like the denoiser. Uses the monolithic
@@ -2192,7 +2205,8 @@ void render_thread_main(ViewerCore& core) {
             dirty = true;
         }
     }
-    {
+    if (ImGui::CollapsingHeader("Volumetric fog",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
         // v1.3 participating medium (fog). Changes tracing (distance
         // sampling + in-scattering), so it RESETS accumulation. Uses the
         // monolithic NEE+MIS / brute estimator; pairs with ReSTIR off.
@@ -2226,10 +2240,12 @@ void render_thread_main(ViewerCore& core) {
             dirty = true;
         }
     }
-    if (dirty) {
-        core_->final_saved = false;   // settings changed: re-arm the export
-        core_->mark_scene_dirty();
-    }
+        ImGui::TextDisabled(
+            "advanced transport modes \xE2\x80\x94 these reset accumulation");
+        if (dirty) {
+            core_->final_saved = false;
+            core_->mark_scene_dirty();
+        }
     ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Display")) {
