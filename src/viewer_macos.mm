@@ -989,6 +989,16 @@ void render_thread_main(ViewerCore& core) {
         frame_selected(*self.core);
         return;
     }
+    if (event.keyCode == 45) {   // N — toggle display denoiser
+        if (self.core->use_gpu) {
+            self.core->settings.denoise = self.core->settings.denoise ? 0 : 1;
+            if (self.core->gpu) self.core->gpu->set_denoise(self.core->settings);
+            std::printf("denoise: %s (display only)\n",
+                        self.core->settings.denoise ? "on" : "off");
+            std::fflush(stdout);
+        }
+        return;
+    }
     if (event.keyCode == 5) {    // G — toggle ReSTIR DI
         if (self.core->use_gpu) {
             self.core->settings.restir = self.core->settings.restir ? 0 : 1;
@@ -1144,6 +1154,10 @@ void render_thread_main(ViewerCore& core) {
     int gpuLastPasses_;
     float gpuRate_;   // smoothed passes/s for the title
     BOOL imguiInited_;
+
+    // v1.1 denoiser: per-frame view params (display-only; never dirty).
+    int denoise_aov_;
+    float denoise_wipe_;
 
     // Phase 5: scene file UI state.
     char scenePath_[256];
@@ -1677,6 +1691,16 @@ void render_thread_main(ViewerCore& core) {
         ImGui::Text("%d spp · %.0f passes/s · %.1fs", gpu.passes(), gpuRate_,
                     accum_s);
     }
+    if (core_->settings.denoise != 0) {
+        const double mb = double(gpu.width()) * gpu.height() * 32.0 /
+                          (1024.0 * 1024.0);
+        const int fade = core_->settings.denoise_fade_spp;
+        const int p = gpu.passes();
+        ImGui::Text("denoise: %d iters · fades by %d spp (now %.0f%%) · "
+                    "scratch %.0f MB",
+                    core_->settings.denoise_iters, fade,
+                    100.0 * std::fmax(0.0, 1.0 - double(p) / fade), mb);
+    }
     // Estimator + ReSTIR memory telemetry (the design-review commitment).
     if (core_->settings.restir != 0) {
         const double px = double(gpu.width()) * gpu.height();
@@ -2069,6 +2093,35 @@ void render_thread_main(ViewerCore& core) {
             gpu.set_restir(s);
             dirty = true;
         }
+    }
+    {
+        // v1.1 display-only denoiser. None of these controls mark the
+        // scene dirty: they cannot affect accumulation by construction.
+        bool changed = false;
+        bool d_on = s.denoise != 0;
+        if (ImGui::Checkbox("denoise display (N)", &d_on)) {
+            s.denoise = d_on ? 1 : 0;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Edge-aware A-trous filter on a COPY of the resolved\n"
+                "image, guided by the G-buffer (normal/depth/albedo).\n"
+                "Fades out as samples accumulate; FINAL export, --parity\n"
+                "and the accumulator are never touched.");
+        }
+        if (d_on) {
+            changed |= ImGui::SliderInt("iterations", &s.denoise_iters, 1, 5);
+            changed |=
+                ImGui::SliderInt("fade spp", &s.denoise_fade_spp, 16, 512);
+            const char* aovs[] = {"off", "normal", "depth", "albedo",
+                                  "illumination"};
+            ImGui::Combo("debug AOV", &denoise_aov_, aovs, 5);
+            ImGui::SliderFloat("wipe (raw | denoised)", &denoise_wipe_, 0.0f,
+                               1.0f, "%.2f");
+        }
+        if (changed) gpu.set_denoise(s);
+        gpu.set_denoise_view(denoise_aov_, denoise_wipe_);
     }
     ImGui::Checkbox("firefly clamp (preview only)", &core_->preview_clamp_on);
     if (ImGui::IsItemHovered()) {

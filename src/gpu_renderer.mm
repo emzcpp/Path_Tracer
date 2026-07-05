@@ -116,6 +116,11 @@ struct GpuRenderer::Impl {
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> accumulate_pso;
     id<MTLComputePipelineState> resolve_pso;
+    // v1.1 denoiser (display-only; see the MSL section banner).
+    id<MTLComputePipelineState> dn_resolve_pso, dn_atrous_pso, dn_finish_pso;
+    id<MTLBuffer> dn_a, dn_b;   // illum ping-pong, lazily allocated
+    int dn_aov = 0;             // per-frame view params from the panel
+    float dn_wipe = 0.0f;
     // Session K: partitioned pipeline (ReSTIR scaffolding).
     id<MTLComputePipelineState> g_primary_pso;
     id<MTLComputePipelineState> direct_pso;
@@ -292,16 +297,14 @@ struct GpuRenderer::Impl {
     // parity/offline path and cheap interactive frames. Slice (row_count <
     // h): a single pass over [row_start, row_start+row_count), so heavy
     // frames are spread across many short command buffers.
-    void encode_accumulate(id<MTLCommandBuffer> cb, const GPUCamera& cam,
-                           int count, int row_start = 0, int row_count = 0) {
-        const bool slice = row_count > 0 && row_count < h;
+    PassUniforms fill_uniforms(const GPUCamera& cam) const {
         PassUniforms u{};
         u.cam = cam;
         u.width = pt_uint(w);
         u.height = pt_uint(h);
         u.pass_base = pt_uint(passes);
-        u.pass_count = pt_uint(slice ? 1 : count);
-        u.row_offset = pt_uint(slice ? row_start : 0);
+        u.pass_count = 1;
+        u.row_offset = 0;
         u.sphere_count = sphere_count;
         u.max_depth = pt_uint(settings.max_depth);
         u.env_w = env_w;
@@ -324,6 +327,15 @@ struct GpuRenderer::Impl {
             pt_uint(settings.restir_radius > 1 ? settings.restir_radius : 1);
         u.restir_mcap =
             pt_uint(settings.restir_mcap > 1 ? settings.restir_mcap : 1);
+        return u;
+    }
+
+    void encode_accumulate(id<MTLCommandBuffer> cb, const GPUCamera& cam,
+                           int count, int row_start = 0, int row_count = 0) {
+        const bool slice = row_count > 0 && row_count < h;
+        PassUniforms u = fill_uniforms(cam);
+        u.pass_count = pt_uint(slice ? 1 : count);
+        u.row_offset = pt_uint(slice ? row_start : 0);
 
         if (settings.restir != 0) {
             // ReSTIR scheduling: a frame is FOUR whole-frame phases in
@@ -538,6 +550,101 @@ struct GpuRenderer::Impl {
             threadsPerThreadgroup:tg_resolve];
         [enc endEncoding];
     }
+
+    // ---- v1.1 denoiser (display-only) ----
+    // Fade weight from accumulated spp; 0 means the denoiser is skipped
+    // entirely and the verbatim resolve path runs instead.
+    float denoise_alpha() const {
+        if (settings.denoise == 0 || needs_clear || passes <= 0) return 0.0f;
+        const float fade = float(settings.denoise_fade_spp > 1
+                                     ? settings.denoise_fade_spp
+                                     : 1);
+        const float a = 1.0f - float(passes) / fade;
+        return a > 0.0f ? a : 0.0f;
+    }
+
+    // The G-buffer holding the guides for what's on screen: the last
+    // ping-pong buffer with a COMPLETE g_primary coverage.
+    id<MTLBuffer> guide_gbuf() const {
+        if (settings.restir != 0) {
+            const bool cur_ok = restir_phase >= 1;   // g_primary finished
+            const int p = cur_ok ? passes : passes - 1;
+            return (p & 1) ? gbuf2 : gbuf;
+        }
+        return (passes & 1) ? gbuf2 : gbuf;   // written by the guide pass
+    }
+
+    void encode_denoised_resolve(id<MTLCommandBuffer> cb,
+                                 const GPUCamera& cam, id<MTLTexture> target,
+                                 float alpha) {
+        // Monolithic mode has no phased pipeline: run g_primary once per
+        // presented frame as a guide-only pass. It writes ONLY the
+        // G-buffer; nothing in the monolithic estimator reads it, and RNG
+        // streams are per (pixel, pass), so accumulation is untouched.
+        if (settings.restir == 0) {
+            encode_restir_phase(cb, 0, fill_uniforms(cam), h);
+        }
+        const size_t need = size_t(w) * h * sizeof(float) * 4;
+        if (!dn_a || dn_a.length < need) {
+            dn_a = [device newBufferWithLength:need
+                                       options:MTLResourceStorageModePrivate];
+            dn_b = [device newBufferWithLength:need
+                                       options:MTLResourceStorageModePrivate];
+        }
+        DenoiseUniforms u{};
+        u.accum_w = pt_uint(w);
+        u.accum_h = pt_uint(h);
+        u.out_w = pt_uint(target.width);
+        u.out_h = pt_uint(target.height);
+        u.pass_total = pt_uint(passes);
+        u.rows_plus1 = pt_uint(settings.restir != 0
+                                   ? (restir_phase == 3 ? restir_cursor : 0)
+                                   : cursor);
+        u.sigma_n = 32.0f;
+        u.sigma_z = 0.1f;
+        // Luminance sigma tightens as the image converges (1/sqrt(spp)).
+        u.sigma_l = 0.6f / sqrtf(float(passes > 0 ? passes : 1));
+        u.alpha = alpha;
+        u.aov = pt_uint(dn_aov);
+        u.wipe_x = pt_uint(dn_wipe * float(target.width));
+        id<MTLBuffer> guides = guide_gbuf();
+
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        const MTLSize agrid = MTLSizeMake(w, h, 1);
+        u.step = 1;
+        [e setComputePipelineState:dn_resolve_pso];
+        [e setBuffer:accum offset:0 atIndex:0];
+        [e setBytes:&u length:sizeof u atIndex:1];
+        [e setBuffer:guides offset:0 atIndex:2];
+        [e setBuffer:dn_a offset:0 atIndex:3];
+        [e dispatchThreads:agrid threadsPerThreadgroup:tg_resolve];
+
+        const int iters = settings.denoise_iters < 1
+                              ? 1
+                              : (settings.denoise_iters > 5
+                                     ? 5
+                                     : settings.denoise_iters);
+        id<MTLBuffer> src = dn_a, dst = dn_b;
+        for (int i = 0; i < iters; ++i) {
+            u.step = pt_uint(1u << i);
+            [e setComputePipelineState:dn_atrous_pso];
+            [e setBuffer:src offset:0 atIndex:0];
+            [e setBytes:&u length:sizeof u atIndex:1];
+            [e setBuffer:guides offset:0 atIndex:2];
+            [e setBuffer:dst offset:0 atIndex:3];
+            [e dispatchThreads:agrid threadsPerThreadgroup:tg_resolve];
+            std::swap(src, dst);
+        }
+        [e setComputePipelineState:dn_finish_pso];
+        [e setBuffer:accum offset:0 atIndex:0];
+        [e setBytes:&u length:sizeof u atIndex:1];
+        [e setBuffer:guides offset:0 atIndex:2];
+        [e setBuffer:src offset:0 atIndex:3];
+        [e setTexture:target atIndex:0];
+        [e dispatchThreads:MTLSizeMake(target.width, target.height, 1)
+            threadsPerThreadgroup:tg_resolve];
+        [e endEncoding];
+    }
 };
 
 GpuRenderer::GpuRenderer() : impl_(new Impl) {}
@@ -562,6 +669,11 @@ std::unique_ptr<GpuRenderer> GpuRenderer::create(
     im.accumulate_pso = make_pipeline(device, lib, @"accumulate", error);
     im.resolve_pso = make_pipeline(device, lib, @"resolve", error);
     if (!im.accumulate_pso || !im.resolve_pso) return nullptr;
+    im.dn_resolve_pso = make_pipeline(device, lib, @"dn_resolve", error);
+    im.dn_atrous_pso = make_pipeline(device, lib, @"dn_atrous", error);
+    im.dn_finish_pso = make_pipeline(device, lib, @"dn_finish", error);
+    if (!im.dn_resolve_pso || !im.dn_atrous_pso || !im.dn_finish_pso)
+        return nullptr;
 
     // Raster nav-preview pipelines (color = drawable format, depth32).
     const auto make_raster_pso = [&](NSString* vs_name,
@@ -859,7 +971,13 @@ void GpuRenderer::encode_frame(const GPUCamera& cam, const TraceWork& work,
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [metal_layer nextDrawable];
         if (drawable) {
-            impl_->encode_resolve(cb, drawable.texture);
+            const float dn_alpha = impl_->denoise_alpha();
+            if (dn_alpha > 0.0f) {
+                impl_->encode_denoised_resolve(cb, cam, drawable.texture,
+                                               dn_alpha);
+            } else {
+                impl_->encode_resolve(cb, drawable.texture);
+            }
             if (overlay && overlay->overlay_kind != 0) {
                 impl_->ensure_raster_depth(drawable.texture);
                 MTLRenderPassDescriptor* rpd =
@@ -952,6 +1070,17 @@ void GpuRenderer::set_clamp_indirect(float clamp) {
 
 void GpuRenderer::set_env_nee(bool on) {
     impl_->settings.env_nee = on ? 1 : 0;
+}
+
+void GpuRenderer::set_denoise(const RenderSettings& s) {
+    impl_->settings.denoise = s.denoise;
+    impl_->settings.denoise_iters = s.denoise_iters;
+    impl_->settings.denoise_fade_spp = s.denoise_fade_spp;
+}
+
+void GpuRenderer::set_denoise_view(int aov, float wipe) {
+    impl_->dn_aov = aov;
+    impl_->dn_wipe = wipe;
 }
 
 void GpuRenderer::set_restir(const RenderSettings& s) {

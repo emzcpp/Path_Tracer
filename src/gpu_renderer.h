@@ -151,6 +151,10 @@ public:
     // Consolidation: live ReSTIR estimator controls (copies the restir_*
     // fields; takes effect on the next encoded batch).
     void set_restir(const RenderSettings& s);
+    // v1.1 display-only denoiser: copies the denoise_* fields / per-frame
+    // view params (debug AOV, wipe split). Never touches accumulation.
+    void set_denoise(const RenderSettings& s);
+    void set_denoise_view(int aov, float wipe);
 
     // Bridged id<MTLDevice>, for CAMetalLayer.device.
     void* metal_device() const;

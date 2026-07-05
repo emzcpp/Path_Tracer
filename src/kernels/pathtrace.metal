@@ -2089,6 +2089,121 @@ kernel void resolve(device const float4* accum         [[buffer(0)]],
     out.write(float4(saturate(c), 1.0f), gid);
 }
 
+// ---------------------------------------------------------------------
+// v1.1 DISPLAY-ONLY DENOISER — everything below runs strictly between the
+// resolve copy and the drawable. It reads the accumulator and G-buffer,
+// writes only scratch + the drawable, and is never encoded by the parity
+// / offline / FINAL-export paths. It is OUTSIDE the parity surface.
+// ---------------------------------------------------------------------
+
+// accum/N + albedo demodulation -> illum scratch (accum resolution).
+// w channel: 1 = surface (demodulated), 0 = primary miss (passthrough).
+kernel void dn_resolve(device const float4* accum       [[buffer(0)]],
+                       constant DenoiseUniforms& U      [[buffer(1)]],
+                       device const GBufferPx* gbuf     [[buffer(2)]],
+                       device float4* illum             [[buffer(3)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= U.accum_w || gid.y >= U.accum_h) return;
+    const ulong px = ulong(gid.y) * U.accum_w + gid.x;
+    const uint n = U.pass_total + (gid.y < U.rows_plus1 ? 1u : 0u);
+    const float3 c = accum[px].xyz / float(max(n, 1u));
+    const GBufferPx g = gbuf[px];
+    if (g.t < 0.0f) {
+        illum[px] = float4(c, 0.0f);
+        return;
+    }
+    const float3 alb = fmax(c3(g.base_color), float3(1e-3f));
+    illum[px] = float4(c / alb, 1.0f);
+}
+
+// One a-trous iteration: 5x5 B3-spline taps dilated by U.step, weighted
+// by normal / relative-depth / illumination-luminance edge stops.
+kernel void dn_atrous(device const float4* src          [[buffer(0)]],
+                      constant DenoiseUniforms& U       [[buffer(1)]],
+                      device const GBufferPx* gbuf      [[buffer(2)]],
+                      device float4* dst                [[buffer(3)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= U.accum_w || gid.y >= U.accum_h) return;
+    const ulong px = ulong(gid.y) * U.accum_w + gid.x;
+    const float4 center = src[px];
+    if (center.w < 0.5f) {   // sky: never filtered, never a filter input
+        dst[px] = center;
+        return;
+    }
+    const GBufferPx gc = gbuf[px];
+    const float3 cn = c3(gc.normal);
+    const float cl =
+        0.2126f * center.x + 0.7152f * center.y + 0.0722f * center.z;
+    const float hk[5] = {0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f};
+    float3 sum = float3(0.0f);
+    float wsum = 0.0f;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            const int tx = int(gid.x) + dx * int(U.step);
+            const int ty = int(gid.y) + dy * int(U.step);
+            if (tx < 0 || ty < 0 || tx >= int(U.accum_w) ||
+                ty >= int(U.accum_h))
+                continue;
+            const ulong tp = ulong(ty) * U.accum_w + tx;
+            const float4 t = src[tp];
+            if (t.w < 0.5f) continue;
+            const GBufferPx gt = gbuf[tp];
+            const float w_n =
+                pow(fmax(dot(cn, c3(gt.normal)), 0.0f), U.sigma_n);
+            const float w_z = exp(-fabs(gt.t - gc.t) /
+                                  (U.sigma_z * fmax(gc.t, 1e-3f)));
+            const float tl =
+                0.2126f * t.x + 0.7152f * t.y + 0.0722f * t.z;
+            const float w_l = exp(-fabs(tl - cl) / (U.sigma_l + 1e-6f));
+            const float w = hk[dx + 2] * hk[dy + 2] * w_n * w_z * w_l;
+            sum += t.xyz * w;
+            wsum += w;
+        }
+    }
+    dst[px] = wsum > 0.0f ? float4(sum / wsum, 1.0f) : center;
+}
+
+// Remodulate, fade toward the raw accumulation, gamma, wipe, AOVs.
+// The raw side of the wipe recomputes accum/N with the EXACT resolve
+// expression so "denoise off" and "left of the wipe" are the true image.
+kernel void dn_finish(device const float4* accum        [[buffer(0)]],
+                      constant DenoiseUniforms& U       [[buffer(1)]],
+                      device const GBufferPx* gbuf      [[buffer(2)]],
+                      device const float4* illum        [[buffer(3)]],
+                      texture2d<float, access::write> out [[texture(0)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= U.out_w || gid.y >= U.out_h) return;
+    const uint sx = gid.x * U.accum_w / U.out_w;
+    const uint sy = gid.y * U.accum_h / U.out_h;
+    const ulong px = ulong(sy) * U.accum_w + sx;
+    const uint n = U.pass_total + (sy < U.rows_plus1 ? 1u : 0u);
+    const float inv_n = 1.0f / float(max(n, 1u));
+    const float3 raw = accum[px].xyz * inv_n;
+    const GBufferPx g = gbuf[px];
+    float3 c;
+    if (U.aov == 1u) {
+        c = g.t < 0.0f ? float3(0.0f) : c3(g.normal) * 0.5f + 0.5f;
+    } else if (U.aov == 2u) {
+        c = float3(g.t < 0.0f ? 0.0f : g.t / (1.0f + g.t));
+    } else if (U.aov == 3u) {
+        c = g.t < 0.0f ? float3(0.0f) : c3(g.base_color);
+    } else if (U.aov == 4u) {
+        c = illum[px].xyz;
+    } else if (gid.x < U.wipe_x) {
+        c = raw;
+    } else {
+        const float4 il = illum[px];
+        const float3 dn =
+            il.w < 0.5f
+                ? il.xyz
+                : il.xyz * fmax(c3(g.base_color), float3(1e-3f));
+        c = mix(raw, dn, U.alpha);
+    }
+    c = pow(fmax(c, 0.0f), float3(1.0f / 2.2f));
+    out.write(float4(saturate(c), 1.0f), gid);
+}
+
+
 
 // ================= Session E: raster navigation preview =================
 // Preview-only pipeline for fast navigation. Deliberately independent of

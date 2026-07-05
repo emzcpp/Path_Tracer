@@ -77,6 +77,14 @@ struct RenderSettings {
     // Reservoir + G-buffer memory guard: above this budget the viewer
     // clamps resolution scale instead of silently allocating (~304 B/px).
     int restir_mem_budget_mb = 1500;
+    // v1.1: display-only edge-aware denoiser (A-trous, G-buffer guided).
+    // NEVER touches the accumulator/parity/FINAL paths; interactive Metal
+    // viewer only. Fades out as spp approaches denoise_fade_spp so the
+    // converged image is the true accumulated one (the pass is skipped
+    // entirely at alpha == 0).
+    int denoise = 0;
+    int denoise_iters = 3;       // a-trous iterations (steps 1,2,4,..)
+    int denoise_fade_spp = 96;
 
     // Execution
     int thread_count = 0;         // 0 = use all hardware threads

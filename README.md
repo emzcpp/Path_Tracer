@@ -59,6 +59,21 @@ Most hobby path tracers are one backend, eyeballed for correctness. This one is 
 - Spatial reuse: neighbor reservoir sharing under the Talbot balance heuristic (provably unbiased for arbitrary support overlap).
 - All three dimensions unbiased against brute force; toggle with `G`.
 
+### Real-time denoiser (v1.1, display-only)
+- Edge-aware À-trous / SVGF-style wavelet filter, guided by the G-buffer
+  (shading normal, depth, and albedo edge-stops) with albedo demodulation
+  so textures and normal-map detail stay crisp while only noisy lighting is
+  smoothed.
+- **Biased by construction, so isolated by construction:** it runs only as
+  a display post-process on a *copy* of the resolved image and never writes
+  back into the accumulator. `--parity`, `--brute`, and FINAL/offline export
+  remain bit-exact and unbiased — verified identical to pre-feature.
+- Adaptive strength: filters hard just after the camera settles, then fades
+  to zero as samples accumulate (the pass is skipped entirely at full
+  convergence, so the final still image is the true unbiased one). Toggle
+  with `N`; iterations, fade-spp, debug AOVs, and a raw-vs-denoised wipe in
+  the panel. ~2.7 ms at 960×540 (3 iterations); ~16 MB scratch.
+
 ### Geometry & assets
 - BVH (midpoint split, median fallback, depth-capped so the traversal stack is a guarantee), built once on host, identical arrays on both backends.
 - glTF/GLB via cgltf: full node hierarchy, multi-material meshes via **Metal bindless argument buffers**, JPEG/PNG textures (embedded or file-relative), tangent-space normal mapping.
@@ -110,7 +125,7 @@ cmake --build build
 
 ### In-viewer controls
 - **Camera:** `WASD` + `Q/E`, drag to look, `Shift` sprint, scroll to change speed, `F` frames selection.
-- **Modes:** `R` FINAL (locks camera, converges, exports PNG). `V` cycles fast-nav (off / solid / wireframe). `G` toggles the ReSTIR estimator. `U` hides the panel. `?`/`F1` shortcut overlay.
+- **Modes:** `R` FINAL (locks camera, converges, exports PNG). `V` cycles fast-nav (off / solid / wireframe). `G` toggles the ReSTIR estimator. `N` toggles the display denoiser. `U` hides the panel. `?`/`F1` shortcut overlay.
 - **Editing:** click to select, `1/2/3` gizmo mode, `Cmd+Z` / `Cmd+Shift+Z` undo/redo. Panel exposes material, light, camera, render settings, and ReSTIR parameters (M / temporal / spatial / M-cap / radius).
 
 ---

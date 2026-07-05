@@ -71,6 +71,19 @@ struct PassUniforms {
     pt_uint restir_mcap;     // temporal M-cap multiplier (x M)
 };
 
+// v1.1 denoiser (display-only post-process; OUTSIDE the parity surface —
+// nothing here reads back into accumulation).
+struct DenoiseUniforms {
+    pt_uint accum_w, accum_h, out_w, out_h;   // same mapping as resolve
+    pt_uint pass_total, rows_plus1;           // accum normalization
+    pt_uint step;      // a-trous dilation for this iteration
+    pt_uint aov;       // 0 off | 1 normal | 2 depth | 3 albedo | 4 illum
+    float sigma_n, sigma_z, sigma_l;          // edge-stopping params
+    float alpha;       // fade: 0 = raw accumulation, 1 = fully denoised
+    pt_uint wipe_x;    // drawable-x split; pixels left of it show RAW
+    pt_uint pad0, pad1, pad2;
+};
+
 struct ResolveUniforms {
     pt_uint accum_w, accum_h;   // accumulation dims (may be preview-sized)
     pt_uint out_w, out_h;       // drawable dims (always full res)
@@ -197,6 +210,7 @@ static_assert(sizeof(GPUSphere) == 64, "GPUSphere must be one cacheline");
 static_assert(sizeof(GPUCamera) == 48, "GPUCamera layout drifted");
 static_assert(sizeof(PassUniforms) == 128, "PassUniforms layout drifted");
 static_assert(sizeof(ResolveUniforms) == 24, "ResolveUniforms layout drifted");
+static_assert(sizeof(DenoiseUniforms) == 64, "DenoiseUniforms layout drifted");
 static_assert(sizeof(BVHNode) == 32, "BVHNode must be two float4 loads");
 static_assert(sizeof(GPUTriangle) == 144, "GPUTriangle must be nine 16B rows");
 static_assert(sizeof(MeshUniforms) == 32, "MeshUniforms layout drifted");
