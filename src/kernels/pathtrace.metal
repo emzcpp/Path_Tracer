@@ -972,6 +972,52 @@ inline float3 spec_atten(thread const SpecCtx& s, float3 a) {
     return float3(spec_reflectance(a, s.lam));
 }
 
+// v1.3 portal helpers — mirror of integrator.h.
+inline bool hit_portal(device const GPUPortal& P, float3 ro, float3 rd,
+                       float t_min, float t_max, thread float& t_out) {
+    const float3 nrm = c3(P.normal);
+    const float denom = dot(nrm, rd);
+    if (denom >= -1e-9f) return false;
+    const float3 c = c3(P.center);
+    const float t = dot(nrm, c - ro) / denom;
+    if (t < t_min || t > t_max) return false;
+    const float3 d = (ro + t * rd) - c;
+    const float3 u = c3(P.u), vv = c3(P.v);
+    const float a = dot(d, u) / dot(u, u);
+    const float b = dot(d, vv) / dot(vv, vv);
+    if (a < -1.0f || a > 1.0f || b < -1.0f || b > 1.0f) return false;
+    t_out = t;
+    return true;
+}
+inline float3 portal_xf_point(device const GPUPortal& P, float3 p) {
+    return float3(dot(c3(P.r0), p) + P.tx, dot(c3(P.r1), p) + P.ty,
+                  dot(c3(P.r2), p) + P.tz);
+}
+inline float3 portal_xf_dir(device const GPUPortal& P, float3 d) {
+    return float3(dot(c3(P.r0), d), dot(c3(P.r1), d), dot(c3(P.r2), d));
+}
+
+// Portals are opaque to shadow rays (either side) — mirror of integrator.h.
+inline bool portal_blocks(device const GPUPortal* portals, uint count,
+                          float3 ro, float3 rd, float t_min, float t_max) {
+    for (uint i = 0u; i < count; ++i) {
+        device const GPUPortal& P = portals[i];
+        const float3 nrm = c3(P.normal);
+        const float denom = dot(nrm, rd);
+        if (fabs(denom) < 1e-9f) continue;
+        const float3 c = c3(P.center);
+        const float t = dot(nrm, c - ro) / denom;
+        if (t < t_min || t > t_max) continue;
+        const float3 d = (ro + t * rd) - c;
+        const float3 u = c3(P.u), vv = c3(P.v);
+        const float a = dot(d, u) / dot(u, u);
+        const float b = dot(d, vv) / dot(vv, vv);
+        if (a < -1.0f || a > 1.0f || b < -1.0f || b > 1.0f) continue;
+        return true;
+    }
+    return false;
+}
+
 // v1.3 homogeneous-medium transmittance — mirror of integrator.h::fog_tr.
 inline float fog_tr(float sigma, float dist) {
     return sigma > 0.0f ? exp(-sigma * dist) : 1.0f;
@@ -1018,7 +1064,9 @@ inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                           constant PassUniforms& U,
                           thread bool& can_nee_out,
                           thread bool& can_nee_light_out,
-                          thread const SpecCtx& sc, float fog_sigma) {
+                          thread const SpecCtx& sc, float fog_sigma,
+                          device const GPUPortal* portals,
+                          uint portal_count) {
         // ---- Session H: next-event estimation toward the environment.
         // Deliberately sample the env distribution (the sun), evaluate the
         // BSDF for that direction, and add the contribution if the shadow
@@ -1041,7 +1089,9 @@ inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                 const float nl = dot(hn, ldir);
                 if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
                     if (!occluded_scene(hp, ldir, INFINITY, spheres, n,
-                                        nodes, tris, MU)) {
+                                        nodes, tris, MU) &&
+                        !portal_blocks(portals, portal_count, hp, ldir,
+                                       1e-3f, INFINITY)) {
                         // MIS weight vs the BSDF sampler (power heuristic).
                         const float w =
                             (pdf_env * pdf_env) /
@@ -1088,7 +1138,9 @@ inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                 const float nl = dot(hn, ldir);
                 if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
                     if (!occluded_scene(hp, ldir, t_light * (1.0f - 1e-3f),
-                                        spheres, n, nodes, tris, MU)) {
+                                        spheres, n, nodes, tris, MU) &&
+                        !portal_blocks(portals, portal_count, hp, ldir,
+                                       1e-3f, t_light * (1.0f - 1e-3f))) {
                         float3 Le = c3(L.emission);
                         if (L.kind == 1u) {
                             // Textured Le at the sampled point — same
@@ -1136,7 +1188,9 @@ inline void sample_medium(float3 p, float3 d, thread PRNG& rng,
                           device const GPULight* lights,
                           constant MeshUniforms& MU, constant PassUniforms& U,
                           float g, float fog_sigma, thread bool& can_nee_out,
-                          thread bool& can_nee_light_out) {
+                          thread bool& can_nee_light_out,
+                          device const GPUPortal* portals,
+                          uint portal_count) {
     const bool can_nee = U.env_nee != 0u && U.env_w != 0u;
     if (can_nee) {
         const float u1 = pcg_next_float(rng);
@@ -1148,7 +1202,9 @@ inline void sample_medium(float3 p, float3 d, thread PRNG& rng,
         if (pdf_env > 1e-12f) {
             const float ph = hg_phase(dot(d, ldir), g);
             if (!occluded_scene(p, ldir, INFINITY, spheres, n, nodes, tris,
-                                MU)) {
+                                MU) &&
+                !portal_blocks(portals, portal_count, p, ldir, 1e-3f,
+                               INFINITY)) {
                 const float w = (pdf_env * pdf_env) /
                                 (pdf_env * pdf_env + ph * ph + 1e-20f);
                 const float3 c =
@@ -1178,7 +1234,9 @@ inline void sample_medium(float3 p, float3 d, thread PRNG& rng,
         if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
             const float ph = hg_phase(dot(d, ldir), g);
             if (!occluded_scene(p, ldir, t_light * (1.0f - 1e-3f), spheres, n,
-                                nodes, tris, MU)) {
+                                nodes, tris, MU) &&
+                !portal_blocks(portals, portal_count, p, ldir, 1e-3f,
+                               t_light * (1.0f - 1e-3f))) {
                 float3 Le = c3(L.emission);
                 if (L.kind == 1u) {
                     const float b0 = 1.0f - bu - bv;
@@ -1201,30 +1259,8 @@ inline void sample_medium(float3 p, float3 d, thread PRNG& rng,
     can_nee_light_out = can_nee_light;
 }
 
-// v1.3 portal helpers — mirror of integrator.h.
-inline bool hit_portal(device const GPUPortal& P, float3 ro, float3 rd,
-                       float t_min, float t_max, thread float& t_out) {
-    const float3 nrm = c3(P.normal);
-    const float denom = dot(nrm, rd);
-    if (denom >= -1e-9f) return false;
-    const float3 c = c3(P.center);
-    const float t = dot(nrm, c - ro) / denom;
-    if (t < t_min || t > t_max) return false;
-    const float3 d = (ro + t * rd) - c;
-    const float3 u = c3(P.u), vv = c3(P.v);
-    const float a = dot(d, u) / dot(u, u);
-    const float b = dot(d, vv) / dot(vv, vv);
-    if (a < -1.0f || a > 1.0f || b < -1.0f || b > 1.0f) return false;
-    t_out = t;
-    return true;
-}
-inline float3 portal_xf_point(device const GPUPortal& P, float3 p) {
-    return float3(dot(c3(P.r0), p) + P.tx, dot(c3(P.r1), p) + P.ty,
-                  dot(c3(P.r2), p) + P.tz);
-}
-inline float3 portal_xf_dir(device const GPUPortal& P, float3 d) {
-    return float3(dot(c3(P.r0), d), dot(c3(P.r1), d), dot(c3(P.r2), d));
-}
+
+
 
 inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     uint n, device const BVHNode* nodes,
@@ -1295,7 +1331,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                 sample_medium(pmed, dir, rng, throughput, radiance, spheres, n,
                               nodes, tris, materials, env_texels, env_row_cdf,
                               env_cond_cdf, lights, MU, U, fog_g, fog_sigma,
-                              v_nee, v_nee_light);
+                              v_nee, v_nee_light, portals, portal_count);
                 float phase_pdf = 0.0f;
                 const float3 d2 = hg_sample(dir, fog_g, pcg_next_float(rng),
                                             pcg_next_float(rng), phase_pdf);
@@ -1325,6 +1361,10 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             const float3 d2 = normalize(portal_xf_dir(portals[phit], rd));
             ro = hp2 + 1e-3f * d2;
             rd = d2;
+            // Delta-chain rule — mirror of integrator.h: through-portal
+            // emitter/env hits keep FULL weight (NEE can't reach them).
+            prev_nee = false;
+            prev_nee_light = false;
             continue;
         }
 
@@ -1390,7 +1430,7 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             sample_direct(hp, hn, mat, rd, rng, throughput, radiance,
                           spheres, n, nodes, tris, materials, env_texels,
                           env_row_cdf, env_cond_cdf, lights, MU, U, v_nee,
-                          v_nee_light, sc, fog_sigma);
+                          v_nee_light, sc, fog_sigma, portals, portal_count);
             prev_nee = v_nee;
             prev_nee_light = v_nee_light;
         }

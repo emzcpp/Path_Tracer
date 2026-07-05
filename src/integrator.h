@@ -289,6 +289,59 @@ inline color clamp_contribution(const color& c, float m) {
 // original order (bit-preserving for the monolithic caller); consumes
 // the same rng draws under the same conditions. The can_nee_* outputs
 // feed the caller's MIS bookkeeping for its continuation ray.
+// v1.3 portal ray-rectangle intersection (front face only) + the rigid
+// transform to the partner. Mirrored in pathtrace.metal.
+inline bool hit_portal(const GPUPortal& P, const Ray& r, float t_min,
+                       float t_max, float& t_out) {
+    const vec3 n(P.normal.x, P.normal.y, P.normal.z);
+    const float denom = dot(n, r.dir);
+    if (denom >= -1e-9f) return false;   // parallel or hitting the back
+    const vec3 c(P.center.x, P.center.y, P.center.z);
+    const float t = dot(n, c - r.origin) / denom;
+    if (t < t_min || t > t_max) return false;
+    const vec3 d = (r.origin + t * r.dir) - c;
+    const vec3 u(P.u.x, P.u.y, P.u.z), vv(P.v.x, P.v.y, P.v.z);
+    const float a = dot(d, u) / dot(u, u);
+    const float b = dot(d, vv) / dot(vv, vv);
+    if (a < -1.0f || a > 1.0f || b < -1.0f || b > 1.0f) return false;
+    t_out = t;
+    return true;
+}
+inline point3 portal_xf_point(const GPUPortal& P, const point3& p) {
+    const vec3 r0(P.r0.x, P.r0.y, P.r0.z), r1(P.r1.x, P.r1.y, P.r1.z),
+        r2(P.r2.x, P.r2.y, P.r2.z);
+    return point3(dot(r0, p) + P.tx, dot(r1, p) + P.ty, dot(r2, p) + P.tz);
+}
+inline vec3 portal_xf_dir(const GPUPortal& P, const vec3& d) {
+    const vec3 r0(P.r0.x, P.r0.y, P.r0.z), r1(P.r1.x, P.r1.y, P.r1.z),
+        r2(P.r2.x, P.r2.y, P.r2.z);
+    return vec3(dot(r0, d), dot(r1, d), dot(r2, d));
+}
+
+// Portals are OPAQUE to shadow rays (either side): a straight lamp->surface
+// line crossing a portal rectangle would have teleported, so counting it is
+// a light leak. Through-portal lighting arrives via BSDF/phase rays at full
+// MIS weight instead (the teleport resets the NEE flags). Mirrored in MSL.
+inline bool portal_blocks(const GPUPortal* portals, int count, const Ray& r,
+                          float t_min, float t_max) {
+    for (int i = 0; i < count; ++i) {
+        const GPUPortal& P = portals[i];
+        const vec3 nrm(P.normal.x, P.normal.y, P.normal.z);
+        const float denom = dot(nrm, r.dir);
+        if (std::fabs(denom) < 1e-9f) continue;
+        const vec3 c(P.center.x, P.center.y, P.center.z);
+        const float t = dot(nrm, c - r.origin) / denom;
+        if (t < t_min || t > t_max) continue;
+        const vec3 d = (r.origin + t * r.dir) - c;
+        const vec3 u(P.u.x, P.u.y, P.u.z), vv(P.v.x, P.v.y, P.v.z);
+        const float a = dot(d, u) / dot(u, u);
+        const float b = dot(d, vv) / dot(vv, vv);
+        if (a < -1.0f || a > 1.0f || b < -1.0f || b > 1.0f) continue;
+        return true;
+    }
+    return false;
+}
+
 // v1.3 homogeneous-medium transmittance along a ray of the given length
 // (Beer-Lambert). sigma == 0 -> 1 (vacuum). dist may be +inf (env light in
 // global fog -> 0), so the sigma > 0 guard also avoids 0*inf = NaN.
@@ -336,7 +389,9 @@ inline void sample_medium(const point3& p, const vec3& d,
                           const EnvLookup& env, const LightsLookup& lights,
                           float g, float fog_sigma, float clamp_indirect,
                           const color& throughput, color& radiance,
-                          bool& can_nee_out, bool& can_nee_light_out) {
+                          bool& can_nee_out, bool& can_nee_light_out,
+                          const GPUPortal* portals = nullptr,
+                          int portal_count = 0) {
     // --- env in-scattering (extinguished in global fog; kept for the same
     // draw pattern as sample_direct and for bounded fog later) ---
     const bool can_nee = env.nee && env.row_cdf != nullptr;
@@ -349,7 +404,9 @@ inline void sample_medium(const point3& p, const vec3& d,
             const float ph = hg_phase(dot(d, ldir), g);
             const Ray shadow(p, ldir);
             if (!world.occluded(shadow, 1e-3f,
-                                std::numeric_limits<float>::infinity())) {
+                                std::numeric_limits<float>::infinity()) &&
+                !portal_blocks(portals, portal_count, shadow, 1e-3f,
+                               std::numeric_limits<float>::infinity())) {
                 const float w = (pdf_env * pdf_env) /
                                 (pdf_env * pdf_env + ph * ph + 1e-20f);
                 const color c = throughput * ph * miss_radiance(env, shadow) *
@@ -379,7 +436,9 @@ inline void sample_medium(const point3& p, const vec3& d,
         if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
             const float ph = hg_phase(dot(d, ldir), g);
             const Ray shadow(p, ldir);
-            if (!world.occluded(shadow, 1e-3f, t_light * (1.0f - 1e-3f))) {
+            if (!world.occluded(shadow, 1e-3f, t_light * (1.0f - 1e-3f)) &&
+                !portal_blocks(portals, portal_count, shadow, 1e-3f,
+                               t_light * (1.0f - 1e-3f))) {
                 color Le(L.emission.x, L.emission.y, L.emission.z);
                 if (L.kind == 1u) {
                     const float b0 = 1.0f - bu - bv;
@@ -410,7 +469,9 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
                           const SpecCtx& sc = SpecCtx{false, 0.0f,
                                                       color(1.0f, 1.0f,
                                                             1.0f)},
-                          float fog_sigma = 0.0f) {
+                          float fog_sigma = 0.0f,
+                          const GPUPortal* portals = nullptr,
+                          int portal_count = 0) {
         // ---- Session H: next-event estimation toward the environment.
         // Deliberately sample the env distribution (the sun), evaluate the
         // BSDF for that direction, and add the contribution if the shadow
@@ -435,6 +496,9 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
                     const Ray shadow(rec.p, ldir);
                     if (!world.occluded(
                             shadow, 1e-3f,
+                            std::numeric_limits<float>::infinity()) &&
+                        !portal_blocks(
+                            portals, portal_count, shadow, 1e-3f,
                             std::numeric_limits<float>::infinity())) {
                         // MIS weight vs the BSDF sampler (power heuristic).
                         const float w =
@@ -483,7 +547,9 @@ inline void sample_direct(const HitRecord& rec, const Ray& ray,
                 if (nl > 1e-6f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)) {
                     const Ray shadow(rec.p, ldir);
                     if (!world.occluded(shadow, 1e-3f,
-                                        t_light * (1.0f - 1e-3f))) {
+                                        t_light * (1.0f - 1e-3f)) &&
+                        !portal_blocks(portals, portal_count, shadow, 1e-3f,
+                                       t_light * (1.0f - 1e-3f))) {
                         color Le(L.emission.x, L.emission.y, L.emission.z);
                         if (L.kind == 1u) {
                             // Textured Le at the sampled point (same
@@ -1144,35 +1210,6 @@ inline void restir_spatial_shade(
     persist.prev_t = rec.t;
 }
 
-// v1.3 portal ray-rectangle intersection (front face only) + the rigid
-// transform to the partner. Mirrored in pathtrace.metal.
-inline bool hit_portal(const GPUPortal& P, const Ray& r, float t_min,
-                       float t_max, float& t_out) {
-    const vec3 n(P.normal.x, P.normal.y, P.normal.z);
-    const float denom = dot(n, r.dir);
-    if (denom >= -1e-9f) return false;   // parallel or hitting the back
-    const vec3 c(P.center.x, P.center.y, P.center.z);
-    const float t = dot(n, c - r.origin) / denom;
-    if (t < t_min || t > t_max) return false;
-    const vec3 d = (r.origin + t * r.dir) - c;
-    const vec3 u(P.u.x, P.u.y, P.u.z), vv(P.v.x, P.v.y, P.v.z);
-    const float a = dot(d, u) / dot(u, u);
-    const float b = dot(d, vv) / dot(vv, vv);
-    if (a < -1.0f || a > 1.0f || b < -1.0f || b > 1.0f) return false;
-    t_out = t;
-    return true;
-}
-inline point3 portal_xf_point(const GPUPortal& P, const point3& p) {
-    const vec3 r0(P.r0.x, P.r0.y, P.r0.z), r1(P.r1.x, P.r1.y, P.r1.z),
-        r2(P.r2.x, P.r2.y, P.r2.z);
-    return point3(dot(r0, p) + P.tx, dot(r1, p) + P.ty, dot(r2, p) + P.tz);
-}
-inline vec3 portal_xf_dir(const GPUPortal& P, const vec3& d) {
-    const vec3 r0(P.r0.x, P.r0.y, P.r0.z), r1(P.r1.x, P.r1.y, P.r1.z),
-        r2(P.r2.x, P.r2.y, P.r2.z);
-    return vec3(dot(r0, d), dot(r1, d), dot(r2, d));
-}
-
 inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                    const EnvLookup& env, const LightsLookup& lights,
                    float clamp_indirect,
@@ -1240,7 +1277,7 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                 bool v_nee = false, v_nee_light = false;
                 sample_medium(pmed, dir, world, rng, env, lights, fog_g,
                               fog_sigma, clamp_indirect, throughput, radiance,
-                              v_nee, v_nee_light);
+                              v_nee, v_nee_light, portals, portal_count);
                 float phase_pdf = 0.0f;
                 const vec3 d2 = hg_sample(dir, fog_g, rng.next_float(),
                                           rng.next_float(), phase_pdf);
@@ -1271,6 +1308,14 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
             const point3 hp2 = portal_xf_point(portals[phit], hp);
             const vec3 d2 = normalize(portal_xf_dir(portals[phit], ray.dir));
             ray = Ray(hp2 + 1e-3f * d2, d2);   // offset off the seam
+            // A teleported ray sees a DIFFERENT image of the scene than
+            // the straight lines NEE sampled at the last vertex, so
+            // emitter/env hits after a jump keep FULL weight — the delta-
+            // chain rule. Without this, every through-portal lamp image is
+            // MIS down-weighted against a sampler that cannot reach it
+            // (measured: -3.4% vs brute on the corridor).
+            prev_nee = false;
+            prev_nee_light = false;
             continue;
         }
 
@@ -1326,7 +1371,7 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
             bool v_nee = false, v_nee_light = false;
             sample_direct(rec, ray, world, rng, env, lights, clamp_indirect,
                           throughput, radiance, v_nee, v_nee_light, sc,
-                          fog_sigma);
+                          fog_sigma, portals, portal_count);
             prev_nee = v_nee;
             prev_nee_light = v_nee_light;
         }
