@@ -172,14 +172,19 @@ inline color eval_bsdf(const Material& mat, const HitRecord& rec,
 // when the continuation ray reaches the environment.
 inline bool scatter(const Material& mat, const Ray& in, const HitRecord& rec,
                     RNG& rng, color& attenuation, Ray& scattered,
-                    float& out_pdf, bool& out_delta) {
+                    float& out_pdf, bool& out_delta,
+                    // v1.2 Stage 2: the effective glass IOR for this path.
+                    // < 0 means "use mat.ior" (RGB pipeline, unchanged); a
+                    // positive value is the wavelength-dependent n(lambda).
+                    float glass_ior = -1.0f) {
     // ---- glass: delta dielectric, unchanged from the original model ----
     out_pdf = 0.0f;
     out_delta = false;
     if (mat.transmission > 0.5f) {
         out_delta = true;
         attenuation = color(1.0f, 1.0f, 1.0f);
-        const float eta = rec.front_face ? 1.0f / mat.ior : mat.ior;
+        const float ior_use = glass_ior > 0.0f ? glass_ior : mat.ior;
+        const float eta = rec.front_face ? 1.0f / ior_use : ior_use;
         const vec3 unit = normalize(in.dir);
         const float cos_theta = std::fmin(dot(-unit, rec.normal), 1.0f);
         const float sin_theta =

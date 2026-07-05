@@ -93,6 +93,16 @@ inline float rgb_to_reflectance(const vec3& rgb0, float l) {
     return (rgb.x * R + rgb.y * G + rgb.z * B) / sum;
 }
 
+// Stage 2: Cauchy wavelength-dependent IOR, n(lambda) = base + B*(1/l^2 -
+// 1/l_mid^2), with lambda in micrometers and l_mid = 0.55 um so n == base
+// at green and B == 0 reduces EXACTLY to the wavelength-independent Stage-1
+// glass. B (dispersion strength) raises n toward the blue end (violet bends
+// most, red least) — the physically correct prism direction.
+inline float ior_lambda(float base, float B, float lam_nm) {
+    const float um = lam_nm * 0.001f;
+    return base + B * (1.0f / (um * um) - 3.30578512f);
+}
+
 }  // namespace spectral
 
 // Per-path spectral context, threaded through trace()/sample_direct() so the

@@ -254,6 +254,7 @@ int main(int argc, char** argv) {
     float model_yaw = 232.0f;    // helmet-facing default
     bool only_model = false;     // mesh + env only (no sphere field)
     bool lights_demo = false;    // add a grid of emissive fixtures (ReSTIR)
+    bool prism_demo = false;     // v1.2: a glass sphere for dispersion
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--offline") == 0) {
@@ -278,6 +279,10 @@ int main(int argc, char** argv) {
             settings.restir = 1;
         } else if (std::strcmp(argv[i], "--spectral") == 0) {
             settings.spectral = 1;
+        } else if (std::strcmp(argv[i], "--prism") == 0) {
+            prism_demo = true;
+            settings.spectral = 1;
+            settings.dispersion_b = 0.08f;
         } else if (std::strcmp(argv[i], "--lights-demo") == 0) {
             lights_demo = true;
         } else if (std::strcmp(argv[i], "--model-height") == 0 && i + 1 < argc) {
@@ -387,6 +392,26 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("lights-demo: %d emissive fixtures added\n", added);
+    }
+    if (prism_demo) {
+        // v1.2 Stage 2 dispersion showcase: a clear glass sphere on a white
+        // floor. Under a bright HDRI sun it acts as a dispersive lens —
+        // rainbow caustic + colored edge fringing. Spectral + dispersion
+        // are already enabled by the flag; add the geometry here.
+        desc.spheres.push_back({point3(0.0f, -1000.0f, 0.0f), 1000.0f,
+                                Material::lambertian(color(0.9f, 0.9f, 0.9f)),
+                                "Floor"});
+        Material glass;
+        glass.base_color = color(1.0f, 1.0f, 1.0f);
+        glass.metallic = 0.0f;
+        glass.roughness = 0.0f;
+        glass.ior = 1.5f;
+        glass.transmission = 1.0f;
+        desc.spheres.push_back(
+            {point3(0.0f, 1.0f, 0.0f), 1.0f, glass, "Glass prism-sphere"});
+        std::printf("prism demo: glass sphere, spectral on, dispersion "
+                    "B=%.3f\n",
+                    settings.dispersion_b);
     }
     if (brute) {
         settings.env_nee = 0;

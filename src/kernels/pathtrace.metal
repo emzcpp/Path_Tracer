@@ -443,14 +443,17 @@ inline float3 eval_bsdf(thread const EvalMat& mat, float3 normal, float3 v,
 inline bool scatter(thread const EvalMat& mat, float3 in_dir, float3 normal,
                     bool front_face, thread PRNG& rng,
                     thread float3& attenuation, thread float3& out_dir,
-                    thread float& out_pdf, thread bool& out_delta) {
+                    thread float& out_pdf, thread bool& out_delta,
+                    float glass_ior) {
     out_pdf = 0.0f;
     out_delta = false;
     // ---- glass: delta dielectric ----
     if (mat.transmission > 0.5f) {
         out_delta = true;
         attenuation = float3(1.0f);
-        const float eta = front_face ? 1.0f / mat.ior : mat.ior;
+        // glass_ior < 0 -> use mat.ior (RGB); else the n(lambda) from trace.
+        const float ior_use = glass_ior > 0.0f ? glass_ior : mat.ior;
+        const float eta = front_face ? 1.0f / ior_use : ior_use;
         const float3 unit = normalize(in_dir);
         const float cos_theta = fmin(dot(-unit, normal), 1.0f);
         const float sin_theta =
@@ -931,6 +934,12 @@ inline float spec_reflectance(float3 rgb0, float l) {
     return (rgb.x * R + rgb.y * G + rgb.z * B) / sum;
 }
 
+// Stage 2 Cauchy IOR — mirror of spectral.h::ior_lambda.
+inline float spec_ior_lambda(float base, float B, float lam_nm) {
+    const float um = lam_nm * 0.001f;
+    return base + B * (1.0f / (um * um) - 3.30578512f);
+}
+
 struct SpecCtx {
     bool on;
     float lam;
@@ -1182,8 +1191,11 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
         float3 attenuation, new_dir;
         float scatter_pdf = 0.0f;
         bool scatter_delta = false;
+        // Stage 2 dispersion: refract this path's wavelength at its own IOR.
+        const float gior =
+            sc.on ? spec_ior_lambda(mat.ior, U.dispersion_b, sc.lam) : -1.0f;
         if (!scatter(mat, rd, hn, front, rng, attenuation, new_dir,
-                     scatter_pdf, scatter_delta)) {
+                     scatter_pdf, scatter_delta, gior)) {
             return radiance;
         }
         throughput *= spec_atten(sc, attenuation);

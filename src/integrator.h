@@ -1030,7 +1030,8 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                    // hit and skips vertex-0 direct (the direct phase
                    // computed it with the same rng draws).
                    const HitRecord* pre = nullptr,
-                   bool skip_v0_direct = false, bool spectral = false) {
+                   bool skip_v0_direct = false, bool spectral = false,
+                   float dispersion_b = 0.0f) {
     color radiance(0.0f);      // light collected so far
     color throughput(1.0f);    // fraction of it that survives back to the eye
     // v1.2 hero-wavelength: sample one lambda per path (one rng draw, here,
@@ -1113,8 +1114,12 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
         Ray scattered;
         float scatter_pdf = 0.0f;
         bool scatter_delta = false;
+        // Stage 2 dispersion: refract this path's wavelength at its own IOR.
+        const float gior =
+            sc.on ? spectral::ior_lambda(rec.mat.ior, dispersion_b, sc.lam)
+                  : -1.0f;
         if (!scatter(rec.mat, ray, rec, rng, attenuation, scattered,
-                     scatter_pdf, scatter_delta)) {
+                     scatter_pdf, scatter_delta, gior)) {
             return radiance;                         // light hit, or absorbed
         }
         throughput *= spec_atten(sc, attenuation);
