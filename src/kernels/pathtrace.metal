@@ -977,6 +977,32 @@ inline float fog_tr(float sigma, float dist) {
     return sigma > 0.0f ? exp(-sigma * dist) : 1.0f;
 }
 
+// Henyey-Greenstein phase (= pdf) + sampler — mirror of integrator.h.
+inline float hg_phase(float ct, float g) {
+    if (fabs(g) < 1e-3f) return 0.25f * (1.0f / 3.14159265358979f);
+    const float d = 1.0f + g * g - 2.0f * g * ct;
+    return 0.25f * (1.0f / 3.14159265358979f) * (1.0f - g * g) /
+           (d * sqrt(fmax(d, 1e-8f)));
+}
+inline float3 hg_sample(float3 d, float g, float u1, float u2,
+                        thread float& pdf) {
+    float ct;
+    if (fabs(g) < 1e-3f) {
+        ct = 1.0f - 2.0f * u1;
+    } else {
+        const float s = (1.0f - g * g) / (1.0f + g - 2.0f * g * u1);
+        ct = (1.0f + g * g - s * s) / (2.0f * g);
+    }
+    ct = fmax(-1.0f, fmin(1.0f, ct));
+    const float st = sqrt(fmax(0.0f, 1.0f - ct * ct));
+    const float phi = 6.28318530717958647692f * u2;
+    float3 t, b;
+    build_onb(d, t, b);
+    const float3 wo = st * cos(phi) * t + st * sin(phi) * b + ct * d;
+    pdf = hg_phase(ct, g);
+    return normalize(wo);
+}
+
 inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
                           float3 rd, thread PRNG& rng, float3 throughput,
                           thread float3& radiance,
@@ -1095,6 +1121,86 @@ inline void sample_direct(float3 hp, float3 hn, thread const EvalMat& mat,
         can_nee_light_out = can_nee_light;
 }
 
+// In-scattering NEE at a medium point — mirror of integrator.h::
+// sample_medium. Same env+area structure/draws as sample_direct, but with
+// the HG phase function in place of the BSDF and no surface cosine.
+inline void sample_medium(float3 p, float3 d, thread PRNG& rng,
+                          float3 throughput, thread float3& radiance,
+                          constant GPUSphere* spheres, uint n,
+                          device const BVHNode* nodes,
+                          device const GPUTriangle* tris,
+                          device const GPUMaterialArgs* materials,
+                          device const float* env_texels,
+                          device const float* env_row_cdf,
+                          device const float* env_cond_cdf,
+                          device const GPULight* lights,
+                          constant MeshUniforms& MU, constant PassUniforms& U,
+                          float g, float fog_sigma, thread bool& can_nee_out,
+                          thread bool& can_nee_light_out) {
+    const bool can_nee = U.env_nee != 0u && U.env_w != 0u;
+    if (can_nee) {
+        const float u1 = pcg_next_float(rng);
+        const float u2 = pcg_next_float(rng);
+        float pdf_env = 0.0f;
+        const float3 ldir =
+            env_sample(env_row_cdf, env_cond_cdf, int(U.env_w), int(U.env_h),
+                       U.env_yaw_norm, u1, u2, pdf_env);
+        if (pdf_env > 1e-12f) {
+            const float ph = hg_phase(dot(d, ldir), g);
+            if (!occluded_scene(p, ldir, INFINITY, spheres, n, nodes, tris,
+                                MU)) {
+                const float w = (pdf_env * pdf_env) /
+                                (pdf_env * pdf_env + ph * ph + 1e-20f);
+                const float3 c =
+                    throughput * ph *
+                    miss_radiance(env_texels, U.env_w, U.env_h,
+                                  U.env_intensity, U.env_yaw_norm, ldir) *
+                    (w / pdf_env) * fog_tr(fog_sigma, INFINITY);
+                radiance += clamp_contribution(c, U.clamp_indirect);
+            }
+        }
+    }
+    can_nee_out = can_nee;
+
+    const bool can_nee_light = U.env_nee != 0u && U.light_count > 0u;
+    if (can_nee_light) {
+        const float us = pcg_next_float(rng);
+        const float u1 = pcg_next_float(rng);
+        const float u2 = pcg_next_float(rng);
+        const int li = light_pick(lights, int(U.light_count), us);
+        device const GPULight& L = lights[li];
+        float pdf_sa = 0.0f, t_light = 0.0f;
+        float bu = 0.0f, bv = 0.0f;
+        const float3 ldir =
+            L.kind == 0u
+                ? sample_sphere_light(L, p, u1, u2, pdf_sa, t_light)
+                : sample_tri_light(L, p, u1, u2, pdf_sa, t_light, bu, bv);
+        if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
+            const float ph = hg_phase(dot(d, ldir), g);
+            if (!occluded_scene(p, ldir, t_light * (1.0f - 1e-3f), spheres, n,
+                                nodes, tris, MU)) {
+                float3 Le = c3(L.emission);
+                if (L.kind == 1u) {
+                    const float b0 = 1.0f - bu - bv;
+                    const float tu = b0 * L.u0 + bu * L.u1 + bv * L.u2;
+                    const float tv = b0 * L.v0 + bu * L.v1 + bv * L.v2;
+                    device const GPUMaterialArgs& LM = materials[L.mat_id];
+                    Le = sample_bilinear(LM.emis, LM.emis_w, LM.emis_h, tu,
+                                         tv) *
+                         MU.emissive_scale;
+                }
+                const float pl = pdf_sa * L.sel_pdf;
+                const float w =
+                    (pl * pl) / (pl * pl + ph * ph + 1e-20f);
+                const float3 c = throughput * ph * Le * (w / pl) *
+                                 fog_tr(fog_sigma, t_light);
+                radiance += clamp_contribution(c, U.clamp_indirect);
+            }
+        }
+    }
+    can_nee_light_out = can_nee_light;
+}
+
 inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     uint n, device const BVHNode* nodes,
                     device const GPUTriangle* tris,
@@ -1112,7 +1218,8 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
                     // direct lighting (the direct phase computed it with
                     // the same rng draws).
                     bool has_pre, thread const HitInfo& pre,
-                    bool skip_v0_direct, bool spectral, float fog_sigma) {
+                    bool skip_v0_direct, bool spectral, float fog_sigma,
+                    float fog_g, float3 fog_albedo) {
     float3 radiance = float3(0.0f);
     float3 throughput = float3(1.0f);
     // v1.2 hero-wavelength: one lambda per path (one rng draw, here, so
@@ -1135,11 +1242,42 @@ inline float3 trace(float3 ro, float3 rd, constant GPUSphere* spheres,
             hit_any = scene_hit_eval(ro, rd, spheres, n, nodes, tris,
                                      materials, tri_mat, tri_light, MU, hi);
         }
-        // v1.3 Stage 1: Beer-Lambert transmittance over this segment —
-        // mirror of integrator.h (miss -> +inf -> 0; guard avoids 0*inf).
+        // v1.3 Stage 2: analytic distance sampling — mirror of
+        // integrator.h. Collision before the surface -> scatter in the
+        // medium (throughput *= albedo, in-scatter NEE, HG continuation);
+        // else reach the surface, throughput unchanged.
         if (fog_sigma > 0.0f) {
-            const float seg_len = hit_any ? hi.t : INFINITY;
-            throughput *= exp(-fog_sigma * seg_len);
+            const float t_surf = hit_any ? hi.t : INFINITY;
+            const float uc = pcg_next_float(rng);
+            const float t_c = -log(fmax(1e-30f, 1.0f - uc)) / fog_sigma;
+            if (t_c < t_surf) {
+                const float3 dir = normalize(rd);
+                const float3 pmed = ro + t_c * dir;
+                throughput *= fog_albedo;
+                bool v_nee = false, v_nee_light = false;
+                sample_medium(pmed, dir, rng, throughput, radiance, spheres, n,
+                              nodes, tris, materials, env_texels, env_row_cdf,
+                              env_cond_cdf, lights, MU, U, fog_g, fog_sigma,
+                              v_nee, v_nee_light);
+                float phase_pdf = 0.0f;
+                const float3 d2 = hg_sample(dir, fog_g, pcg_next_float(rng),
+                                            pcg_next_float(rng), phase_pdf);
+                ro = pmed;
+                rd = d2;
+                prev_pdf = phase_pdf;
+                prev_nee = v_nee;
+                prev_nee_light = v_nee_light;
+                if (depth >= 3u) {
+                    const float pp =
+                        fmin(fmax(throughput.x,
+                                  fmax(throughput.y, throughput.z)),
+                             0.95f);
+                    if (pp <= 0.0f) break;
+                    if (pcg_next_float(rng) > pp) break;
+                    throughput /= pp;
+                }
+                continue;
+            }
         }
         if (!hit_any) {
             // MIS (power heuristic): vertices that ran env NEE weight
@@ -1284,7 +1422,8 @@ kernel void accumulate(device float4* accum            [[buffer(0)]],
                        env_cond_cdf, lights, tri_light, MU, U, rng,
                        U.max_depth, false, no_pre, false,
                        U.spectral != 0u,
-                       U.fog != 0u ? U.fog_sigma : 0.0f);
+                       U.fog != 0u ? U.fog_sigma : 0.0f, U.fog_g,
+                       c3(U.fog_col));
     }
     accum[px] += float4(total, 0.0f);
 }
@@ -2179,7 +2318,7 @@ kernel void indirect_v0(device float4* accum           [[buffer(0)]],
         trace(c3(g.pos), rd, spheres, U.sphere_count, nodes, tris, materials,
               tri_mat, env_texels, env_row_cdf, env_cond_cdf, lights,
               tri_light, MU, U, rng, U.max_depth, true, pre, true, false,
-              0.0f);   // ReSTIR indirect: fog deferred (monolithic path only)
+              0.0f, 0.0f, float3(1.0f));   // ReSTIR indirect: fog deferred
     accum[px] += float4(c, 0.0f);
 }
 

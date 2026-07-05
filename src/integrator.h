@@ -296,6 +296,111 @@ inline float fog_tr(float sigma, float dist) {
     return sigma > 0.0f ? std::exp(-sigma * dist) : 1.0f;
 }
 
+// Henyey-Greenstein phase function value = pdf (normalized over the sphere).
+// ct = cos(angle between the ray's forward direction and the scattered
+// direction). g in [-1,1]: 0 isotropic, >0 forward (god rays), <0 back.
+inline float hg_phase(float ct, float g) {
+    if (std::fabs(g) < 1e-3f) return 0.25f * (1.0f / 3.14159265358979f);
+    const float d = 1.0f + g * g - 2.0f * g * ct;
+    return 0.25f * (1.0f / 3.14159265358979f) * (1.0f - g * g) /
+           (d * std::sqrt(std::fmax(d, 1e-8f)));
+}
+
+// Sample a scattered direction from HG about the forward direction `d`.
+inline vec3 hg_sample(const vec3& d, float g, float u1, float u2,
+                      float& pdf) {
+    float ct;
+    if (std::fabs(g) < 1e-3f) {
+        ct = 1.0f - 2.0f * u1;
+    } else {
+        const float s = (1.0f - g * g) / (1.0f + g - 2.0f * g * u1);
+        ct = (1.0f + g * g - s * s) / (2.0f * g);
+    }
+    ct = std::fmax(-1.0f, std::fmin(1.0f, ct));
+    const float st = std::sqrt(std::fmax(0.0f, 1.0f - ct * ct));
+    const float phi = 6.28318530717958647692f * u2;
+    vec3 t, b;
+    build_onb(d, t, b);
+    const vec3 wo = st * std::cos(phi) * t + st * std::sin(phi) * b + ct * d;
+    pdf = hg_phase(ct, g);
+    return normalize(wo);
+}
+
+// In-scattering NEE at a medium point p (single scatter toward the lights),
+// phase-weighted with MIS vs the HG sampler, shadow ray attenuated by fog.
+// Mirrors sample_direct's env+area structure (same draw pattern) but with
+// the phase function in place of the BSDF and no surface cosine. `d` is the
+// ray's forward (propagation) direction. Sets the MIS flags for the caller.
+inline void sample_medium(const point3& p, const vec3& d,
+                          const Hittable& world, RNG& rng,
+                          const EnvLookup& env, const LightsLookup& lights,
+                          float g, float fog_sigma, float clamp_indirect,
+                          const color& throughput, color& radiance,
+                          bool& can_nee_out, bool& can_nee_light_out) {
+    // --- env in-scattering (extinguished in global fog; kept for the same
+    // draw pattern as sample_direct and for bounded fog later) ---
+    const bool can_nee = env.nee && env.row_cdf != nullptr;
+    if (can_nee) {
+        const float u1 = rng.next_float();
+        const float u2 = rng.next_float();
+        float pdf_env = 0.0f;
+        const vec3 ldir = env_sample(env, u1, u2, pdf_env);
+        if (pdf_env > 1e-12f) {
+            const float ph = hg_phase(dot(d, ldir), g);
+            const Ray shadow(p, ldir);
+            if (!world.occluded(shadow, 1e-3f,
+                                std::numeric_limits<float>::infinity())) {
+                const float w = (pdf_env * pdf_env) /
+                                (pdf_env * pdf_env + ph * ph + 1e-20f);
+                const color c = throughput * ph * miss_radiance(env, shadow) *
+                                (w / pdf_env) *
+                                fog_tr(fog_sigma,
+                                       std::numeric_limits<float>::infinity());
+                radiance += clamp_contribution(c, clamp_indirect);
+            }
+        }
+    }
+    can_nee_out = can_nee;
+
+    // --- area-light in-scattering (this is what fills god rays) ---
+    const bool can_nee_light = env.nee && lights.count > 0;
+    if (can_nee_light) {
+        const float us = rng.next_float();
+        const float u1 = rng.next_float();
+        const float u2 = rng.next_float();
+        const int li = light_pick(lights.lights, lights.count, us);
+        const GPULight& L = lights.lights[li];
+        float pdf_sa = 0.0f, t_light = 0.0f;
+        float bu = 0.0f, bv = 0.0f;
+        const vec3 ldir =
+            L.kind == 0u
+                ? sample_sphere_light(L, p, u1, u2, pdf_sa, t_light)
+                : sample_tri_light(L, p, u1, u2, pdf_sa, t_light, bu, bv);
+        if (pdf_sa > 1e-12f && L.sel_pdf > 0.0f) {
+            const float ph = hg_phase(dot(d, ldir), g);
+            const Ray shadow(p, ldir);
+            if (!world.occluded(shadow, 1e-3f, t_light * (1.0f - 1e-3f))) {
+                color Le(L.emission.x, L.emission.y, L.emission.z);
+                if (L.kind == 1u) {
+                    const float b0 = 1.0f - bu - bv;
+                    const float tu = b0 * L.u0 + bu * L.u1 + bv * L.u2;
+                    const float tv = b0 * L.v0 + bu * L.v1 + bv * L.v2;
+                    const MeshMaterial& mm = lights.mesh->materials[L.mat_id];
+                    Le = sample_bilinear(mm.emissive, tu, tv) *
+                         lights.mesh->emissive_scale;
+                }
+                const float pl = pdf_sa * L.sel_pdf;
+                const float w =
+                    (pl * pl) / (pl * pl + ph * ph + 1e-20f);
+                const color c = throughput * ph * Le * (w / pl) *
+                                fog_tr(fog_sigma, t_light);
+                radiance += clamp_contribution(c, clamp_indirect);
+            }
+        }
+    }
+    can_nee_light_out = can_nee_light;
+}
+
 inline void sample_direct(const HitRecord& rec, const Ray& ray,
                           const Hittable& world, RNG& rng,
                           const EnvLookup& env, const LightsLookup& lights,
@@ -1047,7 +1152,9 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
                    // computed it with the same rng draws).
                    const HitRecord* pre = nullptr,
                    bool skip_v0_direct = false, bool spectral = false,
-                   float dispersion_b = 0.0f, float fog_sigma = 0.0f) {
+                   float dispersion_b = 0.0f, float fog_sigma = 0.0f,
+                   float fog_g = 0.0f,
+                   color fog_albedo = color(1.0f, 1.0f, 1.0f)) {
     color radiance(0.0f);      // light collected so far
     color throughput(1.0f);    // fraction of it that survives back to the eye
     // v1.2 hero-wavelength: sample one lambda per path (one rng draw, here,
@@ -1070,16 +1177,47 @@ inline color trace(Ray ray, const Hittable& world, RNG& rng, int max_depth,
             hit_any = world.hit(ray, 1e-3f,
                                 std::numeric_limits<float>::infinity(), rec);
         }
-        // v1.3 Stage 1: Beer-Lambert transmittance over this vacuum segment
-        // (eye/bounce ray). Applied to the throughput BEFORE this vertex is
-        // shaded, so emission and NEE here are already fog-dimmed. On a miss
-        // the segment is infinite -> transmittance 0 -> the env is
-        // extinguished (correct for global fog). The guard keeps vacuum
-        // byte-identical and avoids 0*inf = NaN.
+        // v1.3 Stage 2: analytic distance sampling (unbiased for the
+        // homogeneous medium). Sample a collision distance; if it lands
+        // before the surface, scatter IN the medium (throughput *= albedo,
+        // in-scatter NEE, HG continuation) and skip surface shading — else
+        // reach the surface with throughput unchanged (the transmittance
+        // cancels the reach-probability). Both backends take the SAME
+        // branch for a given (pixel,pass) since t_c and t_surf are
+        // deterministic, so parity holds.
         if (fog_sigma > 0.0f) {
-            const float seg_len =
+            const float t_surf =
                 hit_any ? rec.t : std::numeric_limits<float>::infinity();
-            throughput = throughput * std::exp(-fog_sigma * seg_len);
+            const float uc = rng.next_float();
+            const float t_c =
+                -std::log(std::fmax(1e-30f, 1.0f - uc)) / fog_sigma;
+            if (t_c < t_surf) {
+                const vec3 dir = normalize(ray.dir);
+                const point3 pmed = ray.origin + t_c * dir;
+                throughput = throughput * fog_albedo;   // sigma_s/sigma_t
+                bool v_nee = false, v_nee_light = false;
+                sample_medium(pmed, dir, world, rng, env, lights, fog_g,
+                              fog_sigma, clamp_indirect, throughput, radiance,
+                              v_nee, v_nee_light);
+                float phase_pdf = 0.0f;
+                const vec3 d2 = hg_sample(dir, fog_g, rng.next_float(),
+                                          rng.next_float(), phase_pdf);
+                ray = Ray(pmed, d2);
+                prev_pdf = phase_pdf;
+                prev_nee = v_nee;
+                prev_nee_light = v_nee_light;
+                if (depth >= 3) {   // Russian roulette (as the surface path)
+                    const float pp = std::fmin(
+                        std::fmax(throughput.x,
+                                  std::fmax(throughput.y, throughput.z)),
+                        0.95f);
+                    if (pp <= 0.0f) break;
+                    if (rng.next_float() > pp) break;
+                    throughput /= pp;
+                }
+                continue;   // scattered in the medium — no surface this step
+            }
+            // reached the surface: throughput unchanged (baked-in cancel)
         }
 
         if (!hit_any) {
